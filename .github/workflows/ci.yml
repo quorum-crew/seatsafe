@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "Run gofmt on:"; echo "$out"; exit 1; fi
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: go build ./...
+
+  cluster-smoke:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start cluster and wait for healthchecks
+        run: docker compose up -d --build --wait --wait-timeout 120
+      - name: Check router
+        run: curl -fsS http://localhost:8080/healthz
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

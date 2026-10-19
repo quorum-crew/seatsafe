@@ -1,0 +1,58 @@
+x-seatsafe: &seatsafe
+  build: .
+  image: seatsafe:dev
+  restart: unless-stopped
+  networks: [seatsafe]
+  healthcheck:
+    test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+    interval: 5s
+    timeout: 2s
+    retries: 10
+
+x-shard1: &shard1 "shard1-node1:8080,shard1-node2:8080,shard1-node3:8080"
+x-shard2: &shard2 "shard2-node1:8080,shard2-node2:8080,shard2-node3:8080"
+x-shard3: &shard3 "shard3-node1:8080,shard3-node2:8080,shard3-node3:8080"
+x-coord:  &coord  "coord-1:8080,coord-2:8080,coord-3:8080"
+
+services:
+  router:
+    <<: *seatsafe
+    command: ["router"]
+    environment: { NODE_ID: router-1 }
+    ports: ["8080:8080"]
+
+  # ---- Shard 1 (Raft group) ----
+  shard1-node1: { <<: *seatsafe, command: ["storage"], environment: { NODE_ID: shard1-node1, SHARD_ID: "1", PEERS: *shard1 } }
+  shard1-node2: { <<: *seatsafe, command: ["storage"], environment: { NODE_ID: shard1-node2, SHARD_ID: "1", PEERS: *shard1 } }
+  shard1-node3: { <<: *seatsafe, command: ["storage"], environment: { NODE_ID: shard1-node3, SHARD_ID: "1", PEERS: *shard1 } }
+  # ---- Shard 2 ----
+  shard2-node1: { <<: *seatsafe, command: ["storage"], environment: { NODE_ID: shard2-node1, SHARD_ID: "2", PEERS: *shard2 } }
+  shard2-node2: { <<: *seatsafe, command: ["storage"], environment: { NODE_ID: shard2-node2, SHARD_ID: "2", PEERS: *shard2 } }
+  shard2-node3: { <<: *seatsafe, command: ["storage"], environment: { NODE_ID: shard2-node3, SHARD_ID: "2", PEERS: *shard2 } }
+  # ---- Shard 3 ----
+  shard3-node1: { <<: *seatsafe, command: ["storage"], environment: { NODE_ID: shard3-node1, SHARD_ID: "3", PEERS: *shard3 } }
+  shard3-node2: { <<: *seatsafe, command: ["storage"], environment: { NODE_ID: shard3-node2, SHARD_ID: "3", PEERS: *shard3 } }
+  shard3-node3: { <<: *seatsafe, command: ["storage"], environment: { NODE_ID: shard3-node3, SHARD_ID: "3", PEERS: *shard3 } }
+  # ---- 2PC coordinator (Raft group) ----
+  coord-1: { <<: *seatsafe, command: ["coordinator"], environment: { NODE_ID: coord-1, PEERS: *coord } }
+  coord-2: { <<: *seatsafe, command: ["coordinator"], environment: { NODE_ID: coord-2, PEERS: *coord } }
+  coord-3: { <<: *seatsafe, command: ["coordinator"], environment: { NODE_ID: coord-3, PEERS: *coord } }
+
+  # ---- Monitoring ----
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    volumes: ["./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["9090:9090"]
+    networks: [seatsafe]
+  grafana:
+    image: grafana/grafana:12.1.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes: ["./deploy/grafana/provisioning:/etc/grafana/provisioning:ro"]
+    ports: ["3000:3000"]
+    networks: [seatsafe]
+    depends_on: [prometheus]
+
+networks:
+  seatsafe: {}
