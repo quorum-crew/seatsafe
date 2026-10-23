@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+package seatsafe.v1;
+
+import "seatsafe/v1/booking.proto";
+import "seatsafe/v1/common.proto";
+
+option go_package = "github.com/quorum-crew/seatsafe/gen/seatsafe/v1;seatsafev1";
+
+// Served by the coordinator Raft group (group 0). Calls go to its leader;
+// a follower answers FAILED_PRECONDITION with the seatsafe-leader trailer.
+service CoordinatorService {
+  // Router -> coordinator: run 2PC for an order whose seats span 2+ shards.
+  //
+  // 1. Log TxnStarted (with participants) so a new leader can finish the order.
+  // 2. Prepare on every participant shard in parallel (300 ms deadline each).
+  // 3. All YES -> log TxnDecided(COMMIT). Any NO or timeout -> TxnDecided(ABORT).
+  //    The first decision applied wins; the coordinator acts on the winner.
+  // 4. Commit/Abort every shard, retrying in the background until each acks.
+  //
+  // Outcome: CONFIRMED, SEAT_UNAVAILABLE (a shard voted NO over a taken or
+  // held seat, with those seats in unavailable_seats), or ABORTED (timeout
+  // or failure). Idempotent on txn_id: a retry returns the stored result
+  // with replayed = true. cross_shard is always true.
+  rpc SubmitOrder(SubmitOrderRequest) returns (BookSeatsResponse);
+
+  // Storage -> coordinator: "what happened to txn X?" Called when a hold
+  // passes hold_expires_at_ms, or a restarted node finds a PREPARED txn.
+  // If no decision exists yet, ABORT is logged first and returned, so the
+  // answer is always final. A COMMIT proposed later loses.
+  rpc GetDecision(GetDecisionRequest) returns (GetDecisionResponse);
+}
+
+// The seats of one order that live on one shard.
+message ShardSeats {
+  uint32 shard_id = 1; // 1-3
+  repeated SeatRef seats = 2;
+}
+
+message SubmitOrderRequest {
+  string txn_id = 1;                    // = the client's request_id
+  string user_id = 2;
+  repeated ShardSeats participants = 3; // seats grouped by shard, filled in by the router, sorted by shard_id
+}
+
+enum Decision {
+  DECISION_UNSPECIFIED = 0;
+  DECISION_COMMIT = 1;
+  DECISION_ABORT = 2;
+}
+
+message GetDecisionRequest {
+  string txn_id = 1;
+}
+
+message GetDecisionResponse {
+  Decision decision = 1;
+}

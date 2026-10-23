@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package seatsafe.v1;
+
+option go_package = "github.com/quorum-crew/seatsafe/gen/seatsafe/v1;seatsafev1";
+
+// Identifies one seat. (event_id, section_id) is the shard key: every seat in
+// a section lives on the same shard.
+message SeatRef {
+  string event_id = 1;   // e.g. "evt-042"
+  string section_id = 2; // e.g. "sec-112"
+  string seat_id = 3;    // e.g. "R12-S7"
+}
+
+enum SeatState {
+  SEAT_STATE_UNSPECIFIED = 0;
+  SEAT_STATE_AVAILABLE = 1;
+  SEAT_STATE_HELD = 2;   // held by a cross-shard order during 2PC prepare
+  SEAT_STATE_BOOKED = 3;
+}
+
+// Business result of a booking. Not an error: a taken seat is a normal answer.
+// gRPC status codes are reserved for infrastructure problems.
+enum BookingOutcome {
+  BOOKING_OUTCOME_UNSPECIFIED = 0;
+  BOOKING_OUTCOME_CONFIRMED = 1;        // every seat booked
+  BOOKING_OUTCOME_SEAT_UNAVAILABLE = 2; // a seat is booked or held (incl. a 2PC NO vote); nothing booked
+  BOOKING_OUTCOME_ABORTED = 3;          // cross-shard order aborted for a timeout or failure, not a seat conflict
+  BOOKING_OUTCOME_INVALID = 4;          // unknown seat, seats from different events, etc.
+}
+
+// Available seats of one section, compact form.
+message SectionAvailability {
+  string event_id = 1;
+  string section_id = 2;
+  repeated string available_seat_ids = 3;
+}

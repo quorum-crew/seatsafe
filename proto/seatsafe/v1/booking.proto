@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package seatsafe.v1;
+
+import "seatsafe/v1/common.proto";
+
+option go_package = "github.com/quorum-crew/seatsafe/gen/seatsafe/v1;seatsafev1";
+
+// Public API, served by the router. The only service clients and the load
+// generator ever call.
+//
+// The router looks up each seat's shard in deploy/shardmap.json:
+//   - all seats on one shard  -> ShardService.Book on that shard's leader
+//   - seats on 2+ shards      -> CoordinatorService.SubmitOrder (2PC)
+service BookingService {
+  // Book one or more seats of one event, all or nothing.
+  // Safe to retry with the same request_id: a retry returns the stored
+  // answer with replayed = true and never books a second time.
+  //
+  // Status codes: OK for every seat outcome (read `outcome`).
+  // INVALID_ARGUMENT for an empty seat list, mixed events, or a missing
+  // request_id (do not retry). UNAVAILABLE / DEADLINE_EXCEEDED: retry with
+  // the same request_id.
+  rpc BookSeats(BookSeatsRequest) returns (BookSeatsResponse);
+
+  // Browse free seats. The router fans out one call per shard that owns a
+  // section of the event and merges the results. May be slightly stale
+  // (followers can answer); the final check always happens at the leader.
+  rpc ListAvailableSeats(ListAvailableSeatsRequest) returns (ListAvailableSeatsResponse);
+}
+
+message BookSeatsRequest {
+  string request_id = 1;      // client-generated UUID, created once per order, reused on retries
+  string user_id = 2;
+  repeated SeatRef seats = 3; // 1..N seats, all with the same event_id, no duplicates
+}
+
+message BookSeatsResponse {
+  string order_id = 1;                    // equals request_id
+  BookingOutcome outcome = 2;
+  repeated SeatRef unavailable_seats = 3; // set when outcome = SEAT_UNAVAILABLE
+  bool replayed = 4;                      // true if this is the stored answer to an earlier try
+  bool cross_shard = 5;                   // true if the order went through 2PC (for metrics)
+}
+
+message ListAvailableSeatsRequest {
+  string event_id = 1;
+  string section_id = 2; // optional: empty = all sections of the event
+}
+
+message ListAvailableSeatsResponse {
+  repeated SectionAvailability sections = 1;
+}
