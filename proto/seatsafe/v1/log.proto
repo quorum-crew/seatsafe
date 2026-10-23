@@ -1,0 +1,133 @@
+syntax = "proto3";
+
+package seatsafe.v1;
+
+import "seatsafe/v1/common.proto";
+import "seatsafe/v1/coordinator.proto";
+
+option go_package = "github.com/quorum-crew/seatsafe/gen/seatsafe/v1;seatsafev1";
+
+// What goes into each Raft log entry. Never sent as an RPC: the leader
+// marshals one of these into each proposed entry, and the state machine's
+// Apply reads it back on every replica.
+//
+// Determinism rule: apply uses only the fields in the command. It never
+// reads time.Now, rand, or Go map iteration order, so every replica that
+// applies the same entries in the same order ends in the same state.
+
+// ---------------------------------------------------------------------------
+// Shard groups (Raft groups 1-3)
+// ---------------------------------------------------------------------------
+
+// One entry in a shard's Raft log. The leader stamps now_ms when it proposes;
+// every replica applies with that value and never reads its own clock.
+message ShardCommand {
+  int64 now_ms = 1;
+  oneof op {
+    BookOp book = 2;       // single-shard order
+    PrepareOp prepare = 3; // 2PC phase 1
+    TxnOp commit = 4;      // 2PC phase 2, also settles a hold after GetDecision = COMMIT
+    TxnOp abort = 5;       // 2PC phase 2, also settles a hold after GetDecision = ABORT
+    GcOp gc = 6;           // drop old req/ and txn/ records
+    SeedOp seed = 7;       // initial seat inventory, loaded through the log
+  }
+}
+
+// Book every seat or none. Apply:
+//   req/{request_id} exists -> return the stored response, replayed = true
+//   all seats AVAILABLE     -> all BOOKED, CONFIRMED
+//   any seat HELD or BOOKED -> no change, SEAT_UNAVAILABLE + those seats
+//   any seat unknown        -> no change, INVALID
+// The response is always stored under req/{request_id}.
+message BookOp {
+  string request_id = 1;
+  string user_id = 2;
+  repeated SeatRef seats = 3;
+}
+
+// Hold this shard's seats for a cross-shard txn. Apply:
+//   txn/{txn_id} PREPARED or COMMITTED -> same YES vote again
+//   txn/{txn_id} ABORTED (tombstone)   -> NO, holds nothing
+//   any seat HELD or BOOKED            -> NO + conflicts (no-wait rule)
+//   otherwise                          -> seats HELD, txn/ = PREPARED, YES
+message PrepareOp {
+  string txn_id = 1;
+  string user_id = 2;
+  repeated SeatRef seats = 3;
+  int64 hold_expires_at_ms = 4; // now_ms + hold TTL, fixed by the leader (no jitter here)
+}
+
+// Commit: PREPARED -> seats BOOKED, txn/ = COMMITTED. Already COMMITTED: no-op.
+// Abort:  PREPARED -> seats AVAILABLE, txn/ = ABORTED. Unknown txn: write an
+//         ABORTED tombstone so a delayed Prepare votes NO. Already ABORTED: no-op.
+message TxnOp {
+  string txn_id = 1;
+}
+
+// Drops req/ records applied before the cutoff and COMMITTED/ABORTED txn/
+// records older than it. PREPARED records are never dropped. On the
+// coordinator, only txns every participant has acked are dropped.
+message GcOp {
+  int64 drop_before_ms = 1;
+}
+
+// Loads initial seat inventory through the Raft log, so seeding is part of
+// the replicated history and survives restarts, rejoins and snapshots.
+// The leader proposes missing chunks from deploy/seed/shard{N}.json when it
+// takes over and the state machine is not fully seeded. Apply:
+//   chunk already applied for this seed_version  -> no-op
+//   seed_version differs from the one applied     -> refused, nothing changes
+//   otherwise                                     -> seats added as AVAILABLE
+// Once all total_chunks are applied the shard is seeded. Until then, Book
+// and Prepare return INVALID and /healthz reports not ready. Seed progress
+// is included in snapshots and never dropped by GC.
+message SeedOp {
+  string seed_version = 1;   // SHA-256 of the seed file
+  uint32 chunk = 2;          // 0-based
+  uint32 total_chunks = 3;
+  repeated SeatRef seats = 4; // ~1,000 seats per chunk
+}
+
+// ---------------------------------------------------------------------------
+// Coordinator group (Raft group 0)
+// ---------------------------------------------------------------------------
+
+message CoordCommand {
+  int64 now_ms = 1;
+  oneof op {
+    TxnStarted started = 2;
+    TxnDecided decided = 3;
+    TxnAcked acked = 4;
+    GcOp gc = 5;
+  }
+}
+
+// Logged before any Prepare is sent. A second TxnStarted for the same txn_id
+// (a retried SubmitOrder) is a no-op; the coordinator then returns the stored
+// result or waits for the decision already in progress.
+message TxnStarted {
+  string txn_id = 1;
+  string user_id = 2;
+  repeated ShardSeats participants = 3; // lets a new leader finish the order
+}
+
+// The first TxnDecided applied for a txn wins; later ones are no-ops.
+// outcome and unavailable_seats are stored with the decision so a retried
+// SubmitOrder, including one that reaches a new leader after failover, can
+// return the exact same answer (SEAT_UNAVAILABLE vs ABORTED and the
+// conflicting seats are not recoverable from the decision alone).
+// A decision logged by GetDecision for a txn with no votes yet uses
+// outcome = ABORTED.
+message TxnDecided {
+  string txn_id = 1;
+  Decision decision = 2;
+  BookingOutcome outcome = 3;             // CONFIRMED for COMMIT; SEAT_UNAVAILABLE or ABORTED for ABORT
+  repeated SeatRef unavailable_seats = 4; // conflicts from the NO votes, when outcome = SEAT_UNAVAILABLE
+}
+
+// A participant confirmed it applied the decision. A txn is GC-eligible only
+// after every participant has acked.
+message TxnAcked {
+  string txn_id = 1;
+  uint32 shard_id = 2;
+}
