@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package seatsafe.v1;
+
+option go_package = "github.com/quorum-crew/seatsafe/gen/seatsafe/v1;seatsafev1";
+
+// Node-to-node Raft traffic inside one group (a shard or the coordinator group).
+service RaftTransport {
+  rpc Send(RaftBatch) returns (RaftAck);
+}
+
+message RaftBatch {
+  uint32 group_id = 1;          // 0 = coordinator, 1-3 = shards
+  uint64 from = 2;              // sender's Raft node ID (1-3)
+  repeated bytes messages = 3;  // each is a marshaled etcd raftpb.Message
+}
+
+message RaftAck {}
+
+// Every storage and coordinator node serves this. Used by the router to find
+// leaders, and by fault-injection tests and dashboards.
+service NodeService {
+  rpc Status(StatusRequest) returns (NodeStatus);
+}
+
+message StatusRequest {}
+
+enum RaftRole {
+  RAFT_ROLE_UNSPECIFIED = 0;
+  RAFT_ROLE_FOLLOWER = 1;
+  RAFT_ROLE_CANDIDATE = 2;
+  RAFT_ROLE_LEADER = 3;
+}
+
+message NodeStatus {
+  string node_id = 1;     // e.g. "shard2-node3"
+  uint32 group_id = 2;
+  RaftRole role = 3;
+  uint64 term = 4;
+  uint64 leader_id = 5;   // 0 = no known leader
+  string leader_addr = 6; // host:port of the leader's gRPC endpoint
+  uint64 commit_index = 7;
+  uint64 applied_index = 8;
+  repeated FollowerProgress followers = 9; // filled by the leader only
+}
+
+message FollowerProgress {
+  uint64 node_id = 1;
+  uint64 match_index = 2;  // highest log index known to be on that follower
+  bool recent_active = 3;  // heard from it within the last election timeout
+}
