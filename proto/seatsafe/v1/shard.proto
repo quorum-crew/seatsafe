@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package seatsafe.v1;
+
+import "seatsafe/v1/booking.proto";
+import "seatsafe/v1/common.proto";
+
+option go_package = "github.com/quorum-crew/seatsafe/gen/seatsafe/v1;seatsafev1";
+
+// Served by storage nodes. Writes go to the shard leader only.
+service ShardService {
+  // Single-shard booking: every seat must belong to this shard.
+  // One Raft entry, so multi-seat orders on one shard are atomic without 2PC.
+  rpc Book(ShardBookRequest) returns (BookSeatsResponse);
+
+  // Read path. Any replica may answer; results may be slightly stale.
+  rpc ListAvailable(ListAvailableSeatsRequest) returns (ListAvailableSeatsResponse);
+}
+
+message ShardBookRequest {
+  string request_id = 1;
+  string user_id = 2;
+  repeated SeatRef seats = 3;
+}
+
+// 2PC participant side, served by storage nodes, called by the coordinator leader.
+// All three calls are idempotent: repeating one returns the same result.
+service ParticipantService {
+  rpc Prepare(PrepareRequest) returns (PrepareResponse);
+  rpc Commit(DecisionRequest) returns (DecisionResponse);
+  rpc Abort(DecisionRequest) returns (DecisionResponse);
+}
+
+message PrepareRequest {
+  string txn_id = 1;
+  string user_id = 2;
+  repeated SeatRef seats = 3; // only this shard's seats
+  int64 hold_ttl_ms = 4;      // how long to hold before asking the coordinator
+}
+
+enum Vote {
+  VOTE_UNSPECIFIED = 0;
+  VOTE_YES = 1; // seats now HELD for txn_id
+  VOTE_NO = 2;  // a seat is booked or held by another txn (no-wait rule)
+}
+
+message PrepareResponse {
+  Vote vote = 1;
+  repeated SeatRef conflicts = 2; // seats that caused a NO
+}
+
+message DecisionRequest {
+  string txn_id = 1;
+}
+
+message DecisionResponse {}

@@ -3,6 +3,7 @@ x-seatsafe: &seatsafe
   image: seatsafe:dev
   restart: unless-stopped
   networks: [seatsafe]
+  volumes: ["./deploy/seed:/seed:ro"]
   healthcheck:
     test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
     interval: 5s

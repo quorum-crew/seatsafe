@@ -21,8 +21,22 @@ jobs:
       - run: go test -race ./...
       - run: go build ./...
 
+  proto:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Regenerate Go code from protos
+        run: ./scripts/proto.sh
+      - name: Check generated code is committed and up to date
+        run: |
+          if [ -n "$(git status --porcelain -- gen)" ]; then
+            git status --short -- gen
+            echo "gen/ is out of date: run ./scripts/proto.sh and commit the result."
+            exit 1
+          fi
+
   cluster-smoke:
-    needs: test
+    needs: [test, proto]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
