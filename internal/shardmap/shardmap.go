@@ -6,8 +6,8 @@
 //
 //	{
 //	  "version": 1,
-//	  "coordinator": { "nodes": ["coord-node1:7000", ...] },
-//	  "shards": [ { "shard_id": 1, "nodes": ["shard1-node1:7000", ...] }, ... ],
+//	  "coordinator": { "nodes": ["coord-1:8080", ...] },
+//	  "shards": [ { "shard_id": 1, "nodes": ["shard1-node1:8080", ...] }, ... ],
 //	  "sections": [ { "event_id": "evt-042", "section_id": "sec-101", "shard_id": 1 }, ... ]
 //	}
 //
