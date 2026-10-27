@@ -1,12 +1,12 @@
 {
   "version": 1,
   "coordinator": {
-    "nodes": ["coord-node1:7000", "coord-node2:7000", "coord-node3:7000"]
+    "nodes": ["coord-1:8080", "coord-2:8080", "coord-3:8080"]
   },
   "shards": [
-    { "shard_id": 1, "nodes": ["shard1-node1:7000", "shard1-node2:7000", "shard1-node3:7000"] },
-    { "shard_id": 2, "nodes": ["shard2-node1:7000", "shard2-node2:7000", "shard2-node3:7000"] },
-    { "shard_id": 3, "nodes": ["shard3-node1:7000", "shard3-node2:7000", "shard3-node3:7000"] }
+    { "shard_id": 1, "nodes": ["shard1-node1:8080", "shard1-node2:8080", "shard1-node3:8080"] },
+    { "shard_id": 2, "nodes": ["shard2-node1:8080", "shard2-node2:8080", "shard2-node3:8080"] },
+    { "shard_id": 3, "nodes": ["shard3-node1:8080", "shard3-node2:8080", "shard3-node3:8080"] }
   ],
   "sections": [
     { "event_id": "evt-042", "section_id": "sec-101", "shard_id": 1 },

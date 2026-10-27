@@ -73,8 +73,9 @@ message GcOp {
 
 // Loads initial seat inventory through the Raft log, so seeding is part of
 // the replicated history and survives restarts, rejoins and snapshots.
-// The leader proposes missing chunks from deploy/seed/shard{N}.json when it
-// takes over and the state machine is not fully seeded. Apply:
+// The leader proposes missing chunks from {SEED_DIR}/shard{N}.json (SEED_DIR
+// defaults to /seed, where docker-compose mounts deploy/seed) when it takes
+// over and the state machine is not fully seeded. Apply:
 //   chunk already applied for this seed_version  -> no-op
 //   seed_version differs from the one applied     -> refused, nothing changes
 //   otherwise                                     -> seats added as AVAILABLE
