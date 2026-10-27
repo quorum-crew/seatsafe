@@ -6,3 +6,7 @@ coverage.*
 .DS_Store
 .idea/
 .vscode/
+
+# Generated dataset (~5 MB), rebuilt with: go run ./cmd/datagen -out deploy
+deploy/shardmap.json
+deploy/seed/*.json
