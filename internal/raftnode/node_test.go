@@ -1,0 +1,234 @@
+package raftnode
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log"
+	"slices"
+	"sync"
+	"testing"
+	"time"
+
+	"go.etcd.io/raft/v3"
+)
+
+// logSM is a fake state machine that records every applied payload in order.
+// Apply returns the entry's position in that order (1-based).
+type logSM struct {
+	mu      sync.Mutex
+	entries []string
+}
+
+func (s *logSM) Apply(_ uint64, data []byte) any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.entries = append(s.entries, string(data))
+	return len(s.entries)
+}
+
+func (s *logSM) Snapshot() ([]byte, error) { return nil, nil }
+func (s *logSM) Restore([]byte) error      { return nil }
+
+func (s *logSM) snapshot() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.entries)
+}
+
+type cluster struct {
+	t     *testing.T
+	net   *Network
+	nodes map[uint64]*Node
+	sms   map[uint64]*logSM
+}
+
+func newCluster(t *testing.T, size int) *cluster {
+	t.Helper()
+	c := &cluster{t: t, net: NewNetwork(), nodes: map[uint64]*Node{}, sms: map[uint64]*logSM{}}
+	var peers []uint64
+	for id := uint64(1); id <= uint64(size); id++ {
+		peers = append(peers, id)
+	}
+	quiet := &raft.DefaultLogger{Logger: log.New(io.Discard, "", 0)}
+	for _, id := range peers {
+		sm := &logSM{}
+		n, err := Start(Config{
+			ID: id, Peers: peers, SM: sm, Transport: c.net,
+			TickInterval: 10 * time.Millisecond, Logger: quiet,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.net.Add(id, n)
+		c.nodes[id], c.sms[id] = n, sm
+	}
+	t.Cleanup(func() {
+		for _, n := range c.nodes {
+			n.Stop()
+		}
+		c.net.Close()
+	})
+	return c
+}
+
+// waitLeader waits until every node not in skip agrees on one leader, and that
+// leader is not in skip either.
+func (c *cluster) waitLeader(skip ...uint64) uint64 {
+	c.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var lead uint64
+		agreed := true
+		for id, n := range c.nodes {
+			if slices.Contains(skip, id) {
+				continue
+			}
+			st := n.Status()
+			if st.Leader == 0 || (lead != 0 && st.Leader != lead) {
+				agreed = false
+				break
+			}
+			lead = st.Leader
+		}
+		if agreed && lead != 0 && !slices.Contains(skip, lead) && c.nodes[lead].Status().IsLeader() {
+			return lead
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	c.t.Fatal("no leader elected within 5s")
+	return 0
+}
+
+// waitApplied waits until every node's state machine holds want entries, then
+// checks that all of them applied the same entries in the same order.
+func (c *cluster) waitApplied(want int) {
+	c.t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		done := true
+		for _, sm := range c.sms {
+			if len(sm.snapshot()) < want {
+				done = false
+			}
+		}
+		if done {
+			break
+		}
+		if time.Now().After(deadline) {
+			for id, sm := range c.sms {
+				c.t.Logf("node %d applied %d entries", id, len(sm.snapshot()))
+			}
+			c.t.Fatalf("not every node applied %d entries within 10s", want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	ref := c.sms[1].snapshot()
+	for id, sm := range c.sms {
+		if got := sm.snapshot(); !slices.Equal(got, ref) {
+			c.t.Fatalf("node %d's applied entries differ from node 1's", id)
+		}
+	}
+}
+
+func propose(t *testing.T, n *Node, data string) int {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res, err := n.Propose(ctx, []byte(data))
+	if err != nil {
+		t.Fatalf("propose %q: %v", data, err)
+	}
+	return res.(int)
+}
+
+func TestElectsLeaderAndReplicates(t *testing.T) {
+	c := newCluster(t, 3)
+	leader := c.nodes[c.waitLeader()]
+
+	// 1,000 concurrent proposals, as a burst of bookings would arrive.
+	const workers, each = 10, 100
+	results := make(chan int, workers*each)
+	var wg sync.WaitGroup
+	for w := range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range each {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				res, err := leader.Propose(ctx, []byte(fmt.Sprintf("w%d-%d", w, i)))
+				cancel()
+				if err != nil {
+					t.Errorf("propose: %v", err) // t.Fatal is not allowed off the test goroutine
+					return
+				}
+				results <- res.(int)
+			}
+		}()
+	}
+	wg.Wait()
+	close(results)
+	if t.Failed() {
+		return
+	}
+
+	// Each proposal must get back its own apply result: positions 1..1000, once each.
+	var got []int
+	for r := range results {
+		got = append(got, r)
+	}
+	slices.Sort(got)
+	for i, r := range got {
+		if r != i+1 {
+			t.Fatalf("results are not exactly 1..%d (position %d holds %d)", workers*each, i, r)
+		}
+	}
+	c.waitApplied(workers * each)
+}
+
+func TestFollowerForwardsProposal(t *testing.T) {
+	c := newCluster(t, 3)
+	lead := c.waitLeader()
+	follower := lead%3 + 1
+	if got := propose(t, c.nodes[follower], "via-follower"); got != 1 {
+		t.Fatalf("result = %d, want 1", got)
+	}
+	c.waitApplied(1)
+}
+
+func TestLeaderFailover(t *testing.T) {
+	c := newCluster(t, 3)
+	old := c.waitLeader()
+	for i := range 10 {
+		propose(t, c.nodes[old], fmt.Sprintf("before-%d", i))
+	}
+
+	// Cut the leader off. The other two elect a new leader and keep going.
+	c.net.Isolate(old)
+	lead := c.waitLeader(old)
+	for i := range 10 {
+		propose(t, c.nodes[lead], fmt.Sprintf("during-%d", i))
+	}
+
+	// Heal: the old leader rejoins, steps down, and catches up.
+	c.net.Heal()
+	c.waitApplied(20)
+	if st := c.nodes[old].Status(); st.IsLeader() && st.Term <= c.nodes[lead].Status().Term {
+		t.Fatalf("old leader %d still thinks it leads in term %d", old, st.Term)
+	}
+}
+
+func TestStartValidatesConfig(t *testing.T) {
+	net := NewNetwork()
+	defer net.Close()
+	for name, cfg := range map[string]Config{
+		"zero ID":         {ID: 0, Peers: []uint64{1}, SM: &logSM{}, Transport: net},
+		"ID not in peers": {ID: 4, Peers: []uint64{1, 2, 3}, SM: &logSM{}, Transport: net},
+		"no SM":           {ID: 1, Peers: []uint64{1}, Transport: net},
+		"no transport":    {ID: 1, Peers: []uint64{1}, SM: &logSM{}},
+	} {
+		if _, err := Start(cfg); err == nil {
+			t.Errorf("%s: Start succeeded, want an error", name)
+		}
+	}
+}
