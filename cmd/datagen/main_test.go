@@ -12,7 +12,7 @@ import (
 
 func defaults() Config {
 	return Config{
-		Shards: 3, NodesPerGroup: 3, Port: 8080,
+		Shards: 3, NodesPerGroup: 3, Port: 7000,
 		ShardHostFmt: "shard%d-node%d", CoordHostFmt: "coord-%d", ChunkSize: seed.DefaultChunkSize,
 		FlashSections: 50, FlashRows: 20, FlashSeatsPerRow: 50,
 		Events: 4, Sections: 12, Rows: 10, SeatsPerRow: 40,
