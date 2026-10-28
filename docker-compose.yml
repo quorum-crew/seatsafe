@@ -10,33 +10,50 @@ x-seatsafe: &seatsafe
     timeout: 2s
     retries: 10
 
-x-shard1: &shard1 "shard1-node1:8080,shard1-node2:8080,shard1-node3:8080"
-x-shard2: &shard2 "shard2-node1:8080,shard2-node2:8080,shard2-node3:8080"
-x-shard3: &shard3 "shard3-node1:8080,shard3-node2:8080,shard3-node3:8080"
-x-coord:  &coord  "coord-1:8080,coord-2:8080,coord-3:8080"
+# Storage nodes report healthy only once their shard has a leader and is
+# seeded, so `docker compose up --wait` waits for a working cluster.
+# Run `go run ./cmd/datagen -out deploy` first, or they never become ready.
+x-storage: &storage
+  <<: *seatsafe
+  command: ["storage"]
+  healthcheck:
+    test: ["CMD", "wget", "-qO-", "http://localhost:8080/readyz"]
+    interval: 2s
+    timeout: 2s
+    retries: 30
+
+# gRPC addresses (port 7000). They must match deploy/shardmap.json exactly:
+# the router matches leader redirects against the shard map's node lists.
+x-shard1: &shard1 "shard1-node1:7000,shard1-node2:7000,shard1-node3:7000"
+x-shard2: &shard2 "shard2-node1:7000,shard2-node2:7000,shard2-node3:7000"
+x-shard3: &shard3 "shard3-node1:7000,shard3-node2:7000,shard3-node3:7000"
+x-coord:  &coord  "coord-1:7000,coord-2:7000,coord-3:7000"
 
 services:
   router:
     <<: *seatsafe
     command: ["router"]
     environment: { NODE_ID: router-1 }
-    ports: ["8080:8080"]
+    # 8080: health and metrics. BookingService listens on 7000 inside Docker and is
+    # published on 17000, because macOS's AirPlay Receiver already holds port 7000.
+    # Clients and the load generator on the host use localhost:17000.
+    ports: ["8080:8080", "17000:7000"]
     # Overrides the shared list, so the seed mount is repeated; adds the shard map.
     volumes: ["./deploy/seed:/seed:ro", "./deploy/shardmap.json:/etc/seatsafe/shardmap.json:ro"]
 
-  # ---- Shard 1 (Raft group) ----
-  shard1-node1: { <<: *seatsafe, command: ["storage"], environment: { NODE_ID: shard1-node1, SHARD_ID: "1", PEERS: *shard1 } }
-  shard1-node2: { <<: *seatsafe, command: ["storage"], environment: { NODE_ID: shard1-node2, SHARD_ID: "1", PEERS: *shard1 } }
-  shard1-node3: { <<: *seatsafe, command: ["storage"], environment: { NODE_ID: shard1-node3, SHARD_ID: "1", PEERS: *shard1 } }
+  # ---- Shard 1 (Raft group 1). Each node keeps its Raft log in its own volume. ----
+  shard1-node1: { <<: *storage, environment: { NODE_ID: shard1-node1, SHARD_ID: "1", PEERS: *shard1 }, volumes: ["./deploy/seed:/seed:ro", "shard1-node1:/data"] }
+  shard1-node2: { <<: *storage, environment: { NODE_ID: shard1-node2, SHARD_ID: "1", PEERS: *shard1 }, volumes: ["./deploy/seed:/seed:ro", "shard1-node2:/data"] }
+  shard1-node3: { <<: *storage, environment: { NODE_ID: shard1-node3, SHARD_ID: "1", PEERS: *shard1 }, volumes: ["./deploy/seed:/seed:ro", "shard1-node3:/data"] }
   # ---- Shard 2 ----
-  shard2-node1: { <<: *seatsafe, command: ["storage"], environment: { NODE_ID: shard2-node1, SHARD_ID: "2", PEERS: *shard2 } }
-  shard2-node2: { <<: *seatsafe, command: ["storage"], environment: { NODE_ID: shard2-node2, SHARD_ID: "2", PEERS: *shard2 } }
-  shard2-node3: { <<: *seatsafe, command: ["storage"], environment: { NODE_ID: shard2-node3, SHARD_ID: "2", PEERS: *shard2 } }
+  shard2-node1: { <<: *storage, environment: { NODE_ID: shard2-node1, SHARD_ID: "2", PEERS: *shard2 }, volumes: ["./deploy/seed:/seed:ro", "shard2-node1:/data"] }
+  shard2-node2: { <<: *storage, environment: { NODE_ID: shard2-node2, SHARD_ID: "2", PEERS: *shard2 }, volumes: ["./deploy/seed:/seed:ro", "shard2-node2:/data"] }
+  shard2-node3: { <<: *storage, environment: { NODE_ID: shard2-node3, SHARD_ID: "2", PEERS: *shard2 }, volumes: ["./deploy/seed:/seed:ro", "shard2-node3:/data"] }
   # ---- Shard 3 ----
-  shard3-node1: { <<: *seatsafe, command: ["storage"], environment: { NODE_ID: shard3-node1, SHARD_ID: "3", PEERS: *shard3 } }
-  shard3-node2: { <<: *seatsafe, command: ["storage"], environment: { NODE_ID: shard3-node2, SHARD_ID: "3", PEERS: *shard3 } }
-  shard3-node3: { <<: *seatsafe, command: ["storage"], environment: { NODE_ID: shard3-node3, SHARD_ID: "3", PEERS: *shard3 } }
-  # ---- 2PC coordinator (Raft group) ----
+  shard3-node1: { <<: *storage, environment: { NODE_ID: shard3-node1, SHARD_ID: "3", PEERS: *shard3 }, volumes: ["./deploy/seed:/seed:ro", "shard3-node1:/data"] }
+  shard3-node2: { <<: *storage, environment: { NODE_ID: shard3-node2, SHARD_ID: "3", PEERS: *shard3 }, volumes: ["./deploy/seed:/seed:ro", "shard3-node2:/data"] }
+  shard3-node3: { <<: *storage, environment: { NODE_ID: shard3-node3, SHARD_ID: "3", PEERS: *shard3 }, volumes: ["./deploy/seed:/seed:ro", "shard3-node3:/data"] }
+  # ---- 2PC coordinator (Raft group 0; still a placeholder) ----
   coord-1: { <<: *seatsafe, command: ["coordinator"], environment: { NODE_ID: coord-1, PEERS: *coord } }
   coord-2: { <<: *seatsafe, command: ["coordinator"], environment: { NODE_ID: coord-2, PEERS: *coord } }
   coord-3: { <<: *seatsafe, command: ["coordinator"], environment: { NODE_ID: coord-3, PEERS: *coord } }
@@ -59,3 +76,15 @@ services:
 
 networks:
   seatsafe: {}
+
+# Raft logs survive `docker compose down`; `docker compose down -v` wipes them.
+volumes:
+  shard1-node1: {}
+  shard1-node2: {}
+  shard1-node3: {}
+  shard2-node1: {}
+  shard2-node2: {}
+  shard2-node3: {}
+  shard3-node1: {}
+  shard3-node2: {}
+  shard3-node3: {}
