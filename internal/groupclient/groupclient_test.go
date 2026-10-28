@@ -241,6 +241,34 @@ func TestStatusLeaderAddrHighestTerm(t *testing.T) {
 	}
 }
 
+// An old leader cut off from the group still says LEADER at term 5; two
+// followers report the new leader at term 6. The term-6 leader wins.
+func TestStaleLeaderLosesToHigherTerm(t *testing.T) {
+	g := newTestGroup(t, 4, Config{})
+	g.nodes[0].set(redirectTo("n3:7000"), role(leaderRole, 5, ""))
+	g.nodes[1].set(nil, role(followerRole, 6, "n3:7000"))
+	g.nodes[2].set(nil, role(followerRole, 6, "n3:7000"))
+	g.nodes[3].set(nil, func() *seatsafev1.NodeStatus { return nil }) // the new leader's Status is slow
+	got, err := g.book(ctxFor(t, time.Second))
+	if err != nil || got != "n3:7000" {
+		t.Fatalf("answered by %q, %v (want the term-6 leader)", got, err)
+	}
+	if g.nodes[0].calls.Load() != 0 {
+		t.Fatal("the stale term-5 leader was tried first")
+	}
+}
+
+// At the same term, a node saying LEADER beats a leader_addr reported for it.
+func TestLeaderRoleWinsAtSameTerm(t *testing.T) {
+	g := newTestGroup(t, 3, Config{})
+	g.nodes[0].set(nil, role(followerRole, 7, "n2:7000")) // stale view at the same term
+	g.nodes[1].set(nil, role(leaderRole, 7, ""))
+	g.nodes[2].set(nil, role(followerRole, 6, ""))
+	if got, err := g.book(ctxFor(t, time.Second)); err != nil || got != "n1:7000" {
+		t.Fatalf("answered by %q, %v", got, err)
+	}
+}
+
 func TestNoStatusTriesNodesInTurn(t *testing.T) {
 	g := newTestGroup(t, 3, Config{})
 	for _, n := range g.nodes {

@@ -328,9 +328,12 @@ func (g *Group) discover(ctx context.Context) string {
 	return cur
 }
 
-// statusRound calls Status on every node in parallel. A node that says it
-// is LEADER wins (highest term first); otherwise the leader_addr reported
-// with the highest term. Ties break on address order so the choice does not
+// statusRound calls Status on every node in parallel and picks the leader
+// of the highest term seen, counting both nodes that say they are LEADER and
+// nodes that report a leader_addr. At that term a node saying LEADER wins
+// over a reported leader_addr. So an old leader cut off from the group,
+// still claiming LEADER at term 5, loses to followers that report a new
+// leader at term 6. Ties break on address order so the choice does not
 // depend on which reply came first.
 func (g *Group) statusRound(ctx context.Context) string {
 	sctx, cancel := context.WithTimeout(ctx, g.cfg.StatusTimeout)
@@ -371,11 +374,11 @@ func (g *Group) statusRound(ctx context.Context) string {
 	}
 	sort.Slice(cands, func(i, j int) bool {
 		a, b := cands[i], cands[j]
-		if a.leader != b.leader {
-			return a.leader
-		}
 		if a.term != b.term {
 			return a.term > b.term
+		}
+		if a.leader != b.leader {
+			return a.leader
 		}
 		return a.addr < b.addr
 	})

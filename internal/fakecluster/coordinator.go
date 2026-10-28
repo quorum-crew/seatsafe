@@ -16,10 +16,12 @@ import (
 
 // Coordinator timings.
 const (
-	PrepareTimeout       = 300 * time.Millisecond // whole prepare phase
-	DecisionFirstTimeout = 200 * time.Millisecond // synchronous first try of each Commit/Abort
-	DecisionRetryTimeout = 2 * time.Second        // each background retry after that
-	HoldTTL              = 5 * time.Second        // hold_ttl_ms sent with Prepare
+	PrepareTimeout = 300 * time.Millisecond // whole prepare phase
+	// Synchronous first try of each Commit/Abort. With the prepare phase it
+	// keeps SubmitOrder under the router's 500 ms attempt deadline.
+	DecisionFirstTimeout = 100 * time.Millisecond
+	DecisionRetryTimeout = 2 * time.Second // each background retry after that
+	HoldTTL              = 5 * time.Second // hold_ttl_ms sent with Prepare
 )
 
 // FakeCoordinator is an in-memory 2PC coordinator group of 3 nodes. Unlike
@@ -153,6 +155,16 @@ type vote struct {
 
 // run executes 2PC for one order. Participants are visited in request
 // order, which the router sorts by shard_id.
+//
+// Outcome rule (the real coordinator should follow it too):
+//
+//	all YES, COMMIT decided        CONFIRMED
+//	any NO with conflicts          SEAT_UNAVAILABLE + the conflicts of every NO, in
+//	                               participant order, even if another shard timed out
+//	anything else                  ABORTED: a timeout, an ABORT decided first by
+//	                               GetDecision, or a NO without conflicts (which can
+//	                               come from an abort tombstone, so it is a failure,
+//	                               not a bad request)
 func (c *FakeCoordinator) run(req *seatsafev1.SubmitOrderRequest) *seatsafev1.BookSeatsResponse {
 	parts := req.GetParticipants()
 	votes := make([]vote, len(parts))
@@ -177,11 +189,9 @@ func (c *FakeCoordinator) run(req *seatsafev1.SubmitOrderRequest) *seatsafev1.Bo
 
 	want := seatsafev1.Decision_DECISION_COMMIT
 	var conflicts []*seatsafev1.SeatRef
-	failed := false
 	for _, v := range votes {
 		switch {
 		case v.err != nil:
-			failed = true
 			want = seatsafev1.Decision_DECISION_ABORT
 		case v.resp.GetVote() != seatsafev1.Vote_VOTE_YES:
 			want = seatsafev1.Decision_DECISION_ABORT
@@ -204,14 +214,13 @@ func (c *FakeCoordinator) run(req *seatsafev1.SubmitOrderRequest) *seatsafev1.Bo
 	case d == seatsafev1.Decision_DECISION_COMMIT:
 		resp.Outcome = seatsafev1.BookingOutcome_BOOKING_OUTCOME_CONFIRMED
 	case len(conflicts) > 0:
+		// Even if another participant timed out: the conflicts are the answer.
 		resp.Outcome = seatsafev1.BookingOutcome_BOOKING_OUTCOME_SEAT_UNAVAILABLE
 		resp.UnavailableSeats = conflicts
-	case failed || want == seatsafev1.Decision_DECISION_COMMIT:
-		// A participant timed out, or GetDecision aborted the txn first.
-		resp.Outcome = seatsafev1.BookingOutcome_BOOKING_OUTCOME_ABORTED
 	default:
-		// Every NO came without conflicts: an unknown seat or an unseeded shard.
-		resp.Outcome = seatsafev1.BookingOutcome_BOOKING_OUTCOME_INVALID
+		// A timeout, GetDecision aborting first, or a NO without conflicts
+		// (an abort tombstone, an unknown seat, an unseeded shard).
+		resp.Outcome = seatsafev1.BookingOutcome_BOOKING_OUTCOME_ABORTED
 	}
 	return resp
 }

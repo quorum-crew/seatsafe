@@ -153,6 +153,16 @@ func TestCoordinator(t *testing.T) {
 		t.Fatal("seat held after the abort decision")
 	}
 
+	// A shard holding an abort tombstone votes NO without conflicts: ABORTED.
+	tomb := seatsafev1.NewParticipantServiceClient(dial(t, c, c.Shards[2].Nodes[0].Addr))
+	if _, err := tomb.Abort(ctx(t), &seatsafev1.DecisionRequest{TxnId: "tomb"}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err = coord.SubmitOrder(ctx(t), order("tomb"))
+	if err != nil || resp.Outcome != seatsafev1.BookingOutcome_BOOKING_OUTCOME_ABORTED || len(resp.UnavailableSeats) != 0 {
+		t.Fatalf("order over a tombstone: %v %v", resp, err)
+	}
+
 	// Concurrent retries of one txn run 2PC once and agree.
 	var wg sync.WaitGroup
 	results := make([]*seatsafev1.BookSeatsResponse, 8)

@@ -385,12 +385,35 @@ func TestCrossShardTimeoutAborts(t *testing.T) {
 	e.checkMachines()
 }
 
-func TestCrossShardUnknownSeat(t *testing.T) {
+func TestCrossShardNoWithoutConflicts(t *testing.T) {
 	e := newEnv(t, fakecluster.SmallDataset)
-	// The section is known, so the router sends it on; the shard votes NO without conflicts.
-	resp := e.mustBook("i1", "alice", flash("sec-101", 4, 1), &seatsafev1.SeatRef{EventId: "evt-flash", SectionId: "sec-102", SeatId: "nope"})
-	wantOutcome(t, resp, invalid, true, false)
-	wantOutcome(t, e.mustBook("i2", "alice", &seatsafev1.SeatRef{EventId: "evt-flash", SectionId: "sec-102", SeatId: "nope"}), invalid, false, false)
+	// The section is known, so the router sends it on; shard 2 votes NO with
+	// no conflicts. That is a failure of the order, not a bad request.
+	nope := &seatsafev1.SeatRef{EventId: "evt-flash", SectionId: "sec-102", SeatId: "nope"}
+	wantOutcome(t, e.mustBook("i1", "alice", flash("sec-101", 4, 1), nope), seatsafev1.BookingOutcome_BOOKING_OUTCOME_ABORTED, true, false)
+	if !e.available("sec-101")["R04-S001"] {
+		t.Fatal("seat held on the shard that voted YES")
+	}
+	// On a single shard the same seat is still INVALID (the shard's own answer).
+	wantOutcome(t, e.mustBook("i2", "alice", nope), invalid, false, false)
+	e.checkMachines()
+}
+
+func TestCrossShardConflictBeatsTimeout(t *testing.T) {
+	e := newEnv(t, fakecluster.SmallDataset)
+	taken := flash("sec-101", 4, 2)
+	wantOutcome(t, e.mustBook("c0", "bob", taken), confirmed, false, false)
+	// Shard 1 votes NO over the taken seat while shard 2 has no leader and times out.
+	e.cluster.Shards[2].SetNoLeader()
+	wantOutcome(t, e.mustBook("c1", "alice", taken, flash("sec-102", 4, 2)), unavailable, true, false, taken)
+	g := e.cluster.Shards[2]
+	before := g.Machine.AppliedIndex()
+	g.SetLeader(0)
+	for deadline := time.Now().Add(3 * time.Second); g.Machine.AppliedIndex() == before; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("background Abort never reached shard 2")
+		}
+	}
 	e.checkMachines()
 }
 

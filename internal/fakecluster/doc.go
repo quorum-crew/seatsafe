@@ -11,7 +11,9 @@
 //   - FakeCoordinator stands in for the coordinator Raft group until it
 //     exists: an in-memory 2PC over the fake shards' ParticipantService
 //     (Prepare in parallel with a 300 ms deadline, Commit if all vote YES,
-//     otherwise Abort), with results stored by txn_id for replays.
+//     otherwise Abort), with results stored by txn_id for replays. A NO with
+//     conflicts gives SEAT_UNAVAILABLE with those conflicts (even if another
+//     shard timed out); a timeout or a NO without conflicts gives ABORTED.
 //   - Cluster wires everything to listeners: bufconn for tests
 //     (NewBufconn), or TCP for cmd/fakecluster.
 package fakecluster
