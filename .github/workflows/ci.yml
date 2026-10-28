@@ -40,6 +40,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Generate dataset (shardmap.json and seed files are gitignored)
+        run: go run ./cmd/datagen -out deploy
       - name: Start cluster and wait for healthchecks
         run: docker compose up -d --build --wait --wait-timeout 120
       - name: Check router

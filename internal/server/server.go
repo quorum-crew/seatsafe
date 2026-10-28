@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -21,6 +22,9 @@ type Info struct {
 	Shard  string
 	Peers  string
 }
+
+// Getenv returns $key, or def if it is unset or empty.
+func Getenv(key, def string) string { return getenv(key, def) }
 
 func getenv(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -39,8 +43,9 @@ func InfoFromEnv(role string) Info {
 	}
 }
 
-// Handler returns the HTTP routes shared by all processes.
-func Handler(info Info) http.Handler {
+// Handler returns the HTTP routes shared by all processes. Each extra
+// function appends its own metrics to /metrics.
+func Handler(info Info, extra ...func(io.Writer)) http.Handler {
 	start := time.Now()
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -53,6 +58,9 @@ func Handler(info Info) http.Handler {
 		fmt.Fprintf(w, "# TYPE seatsafe_up gauge\nseatsafe_up{%s} 1\n", labels)
 		fmt.Fprintf(w, "# TYPE seatsafe_uptime_seconds gauge\nseatsafe_uptime_seconds{%s} %.0f\n",
 			labels, time.Since(start).Seconds())
+		for _, f := range extra {
+			f(w)
+		}
 	})
 	return mux
 }
