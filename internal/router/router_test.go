@@ -466,7 +466,20 @@ func TestContention(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			resp, err := e.book(fmt.Sprintf("c-%04d", i), fmt.Sprintf("user-%d", i), orders[i]...)
+			id, user := fmt.Sprintf("c-%04d", i), fmt.Sprintf("user-%d", i)
+			resp, err := e.book(id, user, orders[i]...)
+			// A timeout means "outcome unknown", not "failed": like a real
+			// client, retry with the same request_id, which replays the
+			// original answer if the order was already applied. Under -race
+			// on a busy CI runner some of the 1,000 orders time out after
+			// their seats were booked; without this they would count as
+			// booked in the shards but never confirmed to a client.
+			for attempt := 0; err != nil && attempt < 10; attempt++ {
+				if c := status.Code(err); c != codes.DeadlineExceeded && c != codes.Unavailable {
+					break
+				}
+				resp, err = e.book(id, user, orders[i]...)
+			}
 			results[i] = result{resp, err}
 		}(i)
 	}
