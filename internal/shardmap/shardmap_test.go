@@ -24,7 +24,7 @@ func TestLoadExample(t *testing.T) {
 	if got := m.EventShards("evt-043"); !reflect.DeepEqual(got, []uint32{2, 3}) {
 		t.Fatalf("EventShards(evt-043) = %v", got)
 	}
-	if got := m.ShardNodes(2); len(got) != 3 || got[0] != "shard2-node1:8080" {
+	if got := m.ShardNodes(2); len(got) != 3 || got[0] != "shard2-node1:7000" {
 		t.Fatalf("ShardNodes(2) = %v", got)
 	}
 	if got := m.CoordinatorNodes(); len(got) != 3 {
@@ -32,7 +32,7 @@ func TestLoadExample(t *testing.T) {
 	}
 	// Returned slices are copies: mutating them must not change the map.
 	m.ShardNodes(2)[0] = "mutated"
-	if m.ShardNodes(2)[0] != "shard2-node1:8080" {
+	if m.ShardNodes(2)[0] != "shard2-node1:7000" {
 		t.Fatal("ShardNodes leaked internal slice")
 	}
 }

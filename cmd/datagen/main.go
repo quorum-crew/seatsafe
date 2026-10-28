@@ -68,7 +68,7 @@ func main() {
 	out := flag.String("out", "deploy", "output directory (shardmap.json and seed/ go here)")
 	flag.IntVar(&c.Shards, "shards", 3, "number of shard Raft groups")
 	flag.IntVar(&c.NodesPerGroup, "nodes", 3, "nodes per Raft group")
-	flag.IntVar(&c.Port, "port", 8080, "gRPC port of every node")
+	flag.IntVar(&c.Port, "port", 7000, "gRPC port of every node")
 	flag.StringVar(&c.ShardHostFmt, "shard-host", "shard%d-node%d", "shard node hostname format (shard id, node index)")
 	flag.StringVar(&c.CoordHostFmt, "coord-host", "coord-%d", "coordinator node hostname format (node index)")
 	flag.IntVar(&c.ChunkSize, "chunk-size", seed.DefaultChunkSize, "seats per SeedOp")
