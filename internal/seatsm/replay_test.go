@@ -11,37 +11,63 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-const (
-	logSeed   = 512
-	logLength = 5000
-)
+// logShape describes a random command log. The zero values of the
+// contention fields keep the original generator (and its random stream).
+type logShape struct {
+	name            string
+	seed            int64
+	n               int
+	sections        int // per event (2 events)
+	seatsPerSection int
 
-// randomLog builds a reproducible mix of every command kind over a small
-// universe (2 events x 3 sections x 60 seats, seeded in 6 chunks), so
-// request_ids, txn_ids and seats collide often.
-func randomLog(seed int64, n int) []*seatsafev1.ShardCommand {
-	r := rand.New(rand.NewSource(seed))
+	// Contention extras.
+	hotSeats     int  // > 0: a quarter of all seat picks come from the first hotSeats seats of a section
+	settleRecent bool // commit/abort mostly target recently prepared txns, so holds get released and rebooked
+}
+
+// smallLog sells out its 360 seats early: most bookings are refused.
+var smallLog = logShape{name: "small", seed: 512, n: 5000, sections: 3, seatsPerSection: 60}
+
+// contendedLog has 5,000 seats with a hot set per section, and settles most
+// prepared txns with a Commit or (more often) an Abort, so seats are held,
+// released and rebooked throughout the log.
+var contendedLog = logShape{name: "contended", seed: 2024, n: 10000, sections: 5, seatsPerSection: 500, hotSeats: 40, settleRecent: true}
+
+// randomLog builds a reproducible mix of every command kind over a universe
+// of 2 events x s.sections x s.seatsPerSection seats (one seed chunk per
+// section), so request_ids, txn_ids and seats collide often.
+func randomLog(s logShape) []*seatsafev1.ShardCommand {
+	r := rand.New(rand.NewSource(s.seed))
 	events := []string{"evt-a", "evt-b"}
-	sections := []string{"sec-1", "sec-2", "sec-3"}
-	const seatsPerSection = 60
+	var sections []string
+	for i := 1; i <= s.sections; i++ {
+		sections = append(sections, fmt.Sprintf("sec-%d", i))
+	}
+	seatsPerSection := s.seatsPerSection
 
 	var chunks [][]*seatsafev1.SeatRef
 	for _, e := range events {
-		for _, s := range sections {
+		for _, sec := range sections {
 			var c []*seatsafev1.SeatRef
 			for i := 0; i < seatsPerSection; i++ {
-				c = append(c, ref(e, s, fmt.Sprintf("R%02d", i)))
+				c = append(c, ref(e, sec, fmt.Sprintf("R%02d", i)))
 			}
 			chunks = append(chunks, c)
 		}
 	}
 	total := uint32(len(chunks))
 
+	pickSeat := func() int {
+		if s.hotSeats > 0 && r.Intn(4) == 0 {
+			return r.Intn(s.hotSeats)
+		}
+		return r.Intn(seatsPerSection)
+	}
 	pickSeats := func() []*seatsafev1.SeatRef {
 		e := events[r.Intn(len(events))]
 		var out []*seatsafev1.SeatRef
 		for k := 1 + r.Intn(3); k > 0; k-- {
-			out = append(out, ref(e, sections[r.Intn(len(sections))], fmt.Sprintf("R%02d", r.Intn(seatsPerSection))))
+			out = append(out, ref(e, sections[r.Intn(len(sections))], fmt.Sprintf("R%02d", pickSeat())))
 		}
 		switch r.Intn(25) {
 		case 0:
@@ -54,27 +80,47 @@ func randomLog(seed int64, n int) []*seatsafev1.ShardCommand {
 		return out
 	}
 
+	var recent []string // txn ids of recent prepares
+	pickTxn := func(i int) string {
+		if s.settleRecent && len(recent) > 0 && r.Intn(5) != 0 {
+			return recent[r.Intn(len(recent))]
+		}
+		return fmt.Sprintf("txn-%d", r.Intn(i/6+20))
+	}
+
+	// Cumulative thresholds out of 100: seed, book, prepare, commit, abort; the rest is gc.
+	cut := [5]int{4, 44, 68, 82, 96}
+	if s.settleRecent {
+		cut = [5]int{4, 44, 66, 74, 96}
+	}
+
 	now := int64(1_000_000)
 	var cmds []*seatsafev1.ShardCommand
-	for i := 0; i < n; i++ {
+	for i := 0; i < s.n; i++ {
 		now += int64(r.Intn(40))
 		var c *seatsafev1.ShardCommand
 		switch p := r.Intn(100); {
-		case p < 4:
+		case p < cut[0]:
 			ch := uint32(r.Intn(int(total)))
 			version := "v1"
 			if r.Intn(5) == 0 {
 				version = "v2"
 			}
 			c = seedCmd(now, version, ch, total, chunks[ch]...)
-		case p < 44:
+		case p < cut[1]:
 			c = bookCmd(now, fmt.Sprintf("req-%d", r.Intn(i/3+20)), pickSeats()...)
-		case p < 68:
-			c = prepCmd(now, fmt.Sprintf("txn-%d", r.Intn(i/6+20)), now+int64(r.Intn(500)), pickSeats()...)
-		case p < 82:
-			c = commitCmd(now, fmt.Sprintf("txn-%d", r.Intn(i/6+20)))
-		case p < 96:
-			c = abortCmd(now, fmt.Sprintf("txn-%d", r.Intn(i/6+20)))
+		case p < cut[2]:
+			id := fmt.Sprintf("txn-%d", r.Intn(i/6+20))
+			c = prepCmd(now, id, now+int64(r.Intn(500)), pickSeats()...)
+			if s.settleRecent {
+				if recent = append(recent, id); len(recent) > 32 {
+					recent = recent[1:]
+				}
+			}
+		case p < cut[3]:
+			c = commitCmd(now, pickTxn(i))
+		case p < cut[4]:
+			c = abortCmd(now, pickTxn(i))
 		default:
 			c = gcCmd(now, now-int64(r.Intn(3000)))
 		}
@@ -109,7 +155,13 @@ func mustSnapshot(t testing.TB, m *Machine) []byte {
 }
 
 func TestReplayDeterminism(t *testing.T) {
-	cmds := randomLog(logSeed, logLength)
+	for _, shape := range []logShape{smallLog, contendedLog} {
+		t.Run(shape.name, func(t *testing.T) { testReplayDeterminism(t, shape) })
+	}
+}
+
+func testReplayDeterminism(t *testing.T, shape logShape) {
+	cmds := randomLog(shape)
 	machines := []*Machine{New(), New(), New()}
 	counts := map[string]int{}
 	for i, c := range cmds {
@@ -137,6 +189,9 @@ func TestReplayDeterminism(t *testing.T) {
 			t.Errorf("random log never produced %s: %v", k, counts)
 		}
 	}
+	if shape.settleRecent && counts["CONFIRMED"] < 1000 {
+		t.Errorf("contended log confirmed only %d bookings: %v", counts["CONFIRMED"], counts)
+	}
 	t.Logf("result mix: %v", counts)
 }
 
@@ -157,9 +212,17 @@ func resultKind(r Result) string {
 // No seat is ever sold twice: after every command the invariants hold, and a
 // seat once BOOKED by an owner stays BOOKED by that owner.
 func TestNoDoubleBooking(t *testing.T) {
+	for _, shape := range []logShape{smallLog, contendedLog} {
+		t.Run(shape.name, func(t *testing.T) { testNoDoubleBooking(t, shape) })
+	}
+}
+
+func testNoDoubleBooking(t *testing.T, shape logShape) {
 	m := New()
 	bookedBy := map[seatKey]string{}
-	for i, c := range randomLog(logSeed, logLength) {
+	heldBy := map[seatKey]string{} // last txn that held the seat
+	rebooked := 0                  // seats held by one txn, released, then booked by another owner
+	for i, c := range randomLog(shape) {
 		res := m.Apply(uint64(i+1), c)
 		if err := m.CheckInvariants(); err != nil {
 			t.Fatalf("command %d: %v", i, err)
@@ -179,7 +242,13 @@ func TestNoDoubleBooking(t *testing.T) {
 				if was && (st.state != booked || st.owner != prev) {
 					t.Fatalf("command %d: seat %s booked by %q is now %v by %q", i, k, prev, st.state, st.owner)
 				}
-				if st.state == booked {
+				switch st.state {
+				case held:
+					heldBy[k] = st.owner
+				case booked:
+					if !was && heldBy[k] != "" && heldBy[k] != st.owner {
+						rebooked++
+					}
 					bookedBy[k] = st.owner
 				}
 			}
@@ -188,10 +257,14 @@ func TestNoDoubleBooking(t *testing.T) {
 	if len(bookedBy) == 0 {
 		t.Fatal("random log booked nothing")
 	}
+	if shape.settleRecent && rebooked < 100 {
+		t.Errorf("only %d seats were released and rebooked", rebooked)
+	}
+	t.Logf("%d seats booked, %d of them after another txn's hold was released", len(bookedBy), rebooked)
 }
 
 func TestSnapshotRestoreMidLog(t *testing.T) {
-	cmds := randomLog(logSeed, logLength)
+	cmds := randomLog(smallLog)
 	const cut = 2500
 	a := New()
 	for i, c := range cmds[:cut] {
@@ -285,7 +358,7 @@ func TestRestoreRejectsBadSnapshots(t *testing.T) {
 
 func TestConcurrentReads(t *testing.T) {
 	m := New()
-	cmds := randomLog(logSeed, logLength)
+	cmds := randomLog(smallLog)
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	for g := 0; g < 4; g++ {
