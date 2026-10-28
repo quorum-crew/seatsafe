@@ -9,5 +9,6 @@ coverage.*
 
 # Generated dataset (~5 MB), rebuilt with: go run ./cmd/datagen -out deploy
 deploy/shardmap.json
+deploy/shardmap.local.json
 deploy/seed/*.json
 .proto-out.*

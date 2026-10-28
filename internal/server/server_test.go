@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -9,13 +10,16 @@ import (
 )
 
 func TestHealthAndMetrics(t *testing.T) {
-	ts := httptest.NewServer(Handler(Info{Role: "storage", NodeID: "shard1-node1", Shard: "1"}))
+	extra := func(w io.Writer) { fmt.Fprintln(w, "extra_metric 7") }
+	ts := httptest.NewServer(Handler(Info{Role: "storage", NodeID: "shard1-node1", Shard: "1"}, extra))
 	defer ts.Close()
 
 	for path, want := range map[string]string{
-		"/healthz": "ok role=storage",
-		"/metrics": `seatsafe_up{role="storage",node="shard1-node1",shard="1"} 1`,
+		"/healthz":  "ok role=storage",
+		"/metrics":  `seatsafe_up{role="storage",node="shard1-node1",shard="1"} 1`,
+		"/metrics#": "\nextra_metric 7\n",
 	} {
+		path = strings.TrimSuffix(path, "#")
 		resp, err := http.Get(ts.URL + path)
 		if err != nil {
 			t.Fatal(err)
