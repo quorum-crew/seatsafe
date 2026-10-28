@@ -21,6 +21,8 @@ services:
     command: ["router"]
     environment: { NODE_ID: router-1 }
     ports: ["8080:8080"]
+    # Overrides the shared list, so the seed mount is repeated; adds the shard map.
+    volumes: ["./deploy/seed:/seed:ro", "./deploy/shardmap.json:/etc/seatsafe/shardmap.json:ro"]
 
   # ---- Shard 1 (Raft group) ----
   shard1-node1: { <<: *seatsafe, command: ["storage"], environment: { NODE_ID: shard1-node1, SHARD_ID: "1", PEERS: *shard1 } }
