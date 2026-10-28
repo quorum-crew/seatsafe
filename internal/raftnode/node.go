@@ -7,6 +7,7 @@
 package raftnode
 
 import (
+	"cmp"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -35,6 +36,16 @@ type StateMachine interface {
 	Restore(data []byte) error
 }
 
+// LogStore persists what Raft needs to survive a restart. raftstore.Pebble
+// implements it.
+type LogStore interface {
+	// Save durably writes one Ready's HardState, entries and snapshot, in one
+	// batch with one fsync.
+	Save(hs raftpb.HardState, ents []raftpb.Entry, snap raftpb.Snapshot) error
+	// Load returns everything saved so far; empty for a fresh store.
+	Load() (raftpb.HardState, raftpb.Snapshot, []raftpb.Entry, error)
+}
+
 // Transport delivers outgoing Raft messages to peers. Send must not block for
 // long. It may drop messages; Raft retransmits.
 type Transport interface {
@@ -47,6 +58,7 @@ type Config struct {
 	Peers     []uint64 // every member's ID, including ID
 	SM        StateMachine
 	Transport Transport
+	Store     LogStore // nil = keep the log in memory only (tests)
 
 	TickInterval   time.Duration // default 100ms
 	ElectionTicks  int           // default 10, so elections after ~1s
@@ -65,6 +77,17 @@ type Status struct {
 	Role    raft.StateType
 	Commit  uint64
 	Applied uint64
+
+	// Followers is filled on the leader only: how far each follower's log
+	// has caught up. Used for replication-lag metrics.
+	Followers []FollowerProgress
+}
+
+// FollowerProgress is the leader's view of one follower.
+type FollowerProgress struct {
+	ID           uint64
+	Match        uint64 // highest log index known to be on that follower
+	RecentActive bool   // heard from within the last election timeout
 }
 
 // IsLeader reports whether the node was leader when the status was taken.
@@ -85,8 +108,10 @@ type Node struct {
 	stopOnce sync.Once
 }
 
-// Start creates a new member of a fresh group and starts its loop.
-// (Restarting from persisted state arrives with Pebble on Day 3.)
+// Start starts a group member. If cfg.Store already holds a log, the node
+// restarts from it: the state machine is rebuilt by replaying the snapshot and
+// committed entries, so it must start out empty. Otherwise it joins a fresh
+// group of cfg.Peers.
 func Start(cfg Config) (*Node, error) {
 	switch {
 	case cfg.ID == 0:
@@ -132,9 +157,51 @@ func Start(cfg Config) (*Node, error) {
 		stop:    make(chan struct{}),
 		done:    make(chan struct{}),
 	}
-	n.raft = raft.StartNode(rc, peers)
+	restart, err := n.loadState(rc)
+	if err != nil {
+		return nil, err
+	}
+	if restart {
+		n.raft = raft.RestartNode(rc)
+	} else {
+		n.raft = raft.StartNode(rc, peers)
+	}
 	go n.run()
 	return n, nil
+}
+
+// loadState fills the in-memory Raft storage from cfg.Store and reports
+// whether there was anything to restart from.
+func (n *Node) loadState(rc *raft.Config) (bool, error) {
+	if n.cfg.Store == nil {
+		return false, nil
+	}
+	hs, snap, ents, err := n.cfg.Store.Load()
+	if err != nil {
+		return false, err
+	}
+	if raft.IsEmptyHardState(hs) && raft.IsEmptySnap(snap) && len(ents) == 0 {
+		return false, nil
+	}
+	if !raft.IsEmptySnap(snap) {
+		if err := n.storage.ApplySnapshot(snap); err != nil {
+			return false, fmt.Errorf("raftnode: load snapshot: %w", err)
+		}
+		if err := n.cfg.SM.Restore(snap.Data); err != nil {
+			return false, fmt.Errorf("raftnode: restore state machine: %w", err)
+		}
+		n.applied.Store(snap.Metadata.Index)
+	}
+	if err := n.storage.SetHardState(hs); err != nil {
+		return false, fmt.Errorf("raftnode: load hard state: %w", err)
+	}
+	if err := n.storage.Append(ents); err != nil {
+		return false, fmt.Errorf("raftnode: load entries: %w", err)
+	}
+	// The state machine starts empty (or at the snapshot), so ask Raft to
+	// hand back every committed entry after it.
+	rc.Applied = snap.Metadata.Index
+	return true, nil
 }
 
 func (n *Node) run() {
@@ -162,8 +229,13 @@ func (n *Node) run() {
 
 // handleReady follows the etcd raft contract: persist, then send, then apply.
 func (n *Node) handleReady(rd raft.Ready) error {
-	// 1. Persist. Day 3 writes entries + HardState (+ snapshot) to Pebble in
-	//    one batch with Sync: true before this point.
+	// 1. Persist: one durable batch (one fsync), then the in-memory copy
+	//    Raft reads from.
+	if n.cfg.Store != nil {
+		if err := n.cfg.Store.Save(rd.HardState, rd.Entries, rd.Snapshot); err != nil {
+			return fmt.Errorf("persist: %w", err)
+		}
+	}
 	if !raft.IsEmptySnap(rd.Snapshot) {
 		if err := n.storage.ApplySnapshot(rd.Snapshot); err != nil {
 			return fmt.Errorf("apply snapshot to storage: %w", err)
@@ -251,10 +323,19 @@ func (n *Node) Step(ctx context.Context, m raftpb.Message) error {
 // ReportUnreachable tells Raft that sending to a peer failed.
 func (n *Node) ReportUnreachable(id uint64) { n.raft.ReportUnreachable(id) }
 
+// ReportSnapshot tells Raft whether sending a snapshot to a peer succeeded.
+func (n *Node) ReportSnapshot(id uint64, ok bool) {
+	status := raft.SnapshotFinish
+	if !ok {
+		status = raft.SnapshotFailure
+	}
+	n.raft.ReportSnapshot(id, status)
+}
+
 // Status returns the node's current view of the group.
 func (n *Node) Status() Status {
 	st := n.raft.Status()
-	return Status{
+	out := Status{
 		ID:      n.cfg.ID,
 		Leader:  st.Lead,
 		Term:    st.Term,
@@ -262,6 +343,13 @@ func (n *Node) Status() Status {
 		Commit:  st.Commit,
 		Applied: n.applied.Load(),
 	}
+	for id, pr := range st.Progress {
+		if id != n.cfg.ID {
+			out.Followers = append(out.Followers, FollowerProgress{ID: id, Match: pr.Match, RecentActive: pr.RecentActive})
+		}
+	}
+	slices.SortFunc(out.Followers, func(a, b FollowerProgress) int { return cmp.Compare(a.ID, b.ID) })
+	return out
 }
 
 // Stop stops the node and waits for its loop to exit. Safe to call twice.

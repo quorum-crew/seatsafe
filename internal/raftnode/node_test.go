@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/quorum-crew/seatsafe/internal/raftstore"
 	"go.etcd.io/raft/v3"
 )
 
@@ -37,39 +38,83 @@ func (s *logSM) snapshot() []string {
 }
 
 type cluster struct {
-	t     *testing.T
-	net   *Network
-	nodes map[uint64]*Node
-	sms   map[uint64]*logSM
+	t       *testing.T
+	net     *Network
+	peers   []uint64
+	durable bool
+	nodes   map[uint64]*Node
+	sms     map[uint64]*logSM
+	dirs    map[uint64]string
+	stores  map[uint64]*raftstore.Pebble
 }
 
-func newCluster(t *testing.T, size int) *cluster {
+// newCluster starts size nodes that keep their logs in memory only.
+func newCluster(t *testing.T, size int) *cluster { return startCluster(t, size, false) }
+
+// newDurableCluster starts size nodes that persist their logs in Pebble, so
+// they can be stopped and restarted.
+func newDurableCluster(t *testing.T, size int) *cluster { return startCluster(t, size, true) }
+
+func startCluster(t *testing.T, size int, durable bool) *cluster {
 	t.Helper()
-	c := &cluster{t: t, net: NewNetwork(), nodes: map[uint64]*Node{}, sms: map[uint64]*logSM{}}
-	var peers []uint64
-	for id := uint64(1); id <= uint64(size); id++ {
-		peers = append(peers, id)
+	c := &cluster{
+		t: t, net: NewNetwork(), durable: durable,
+		nodes: map[uint64]*Node{}, sms: map[uint64]*logSM{},
+		dirs: map[uint64]string{}, stores: map[uint64]*raftstore.Pebble{},
 	}
-	quiet := &raft.DefaultLogger{Logger: log.New(io.Discard, "", 0)}
-	for _, id := range peers {
-		sm := &logSM{}
-		n, err := Start(Config{
-			ID: id, Peers: peers, SM: sm, Transport: c.net,
-			TickInterval: 10 * time.Millisecond, Logger: quiet,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		c.net.Add(id, n)
-		c.nodes[id], c.sms[id] = n, sm
+	for id := uint64(1); id <= uint64(size); id++ {
+		c.peers = append(c.peers, id)
+		c.dirs[id] = t.TempDir()
+	}
+	for _, id := range c.peers {
+		c.start(id)
 	}
 	t.Cleanup(func() {
-		for _, n := range c.nodes {
-			n.Stop()
+		for id := range c.nodes {
+			c.stop(id)
 		}
 		c.net.Close()
 	})
 	return c
+}
+
+var quiet = &raft.DefaultLogger{Logger: log.New(io.Discard, "", 0)}
+
+// start starts (or restarts) node id with an empty state machine.
+func (c *cluster) start(id uint64) {
+	c.t.Helper()
+	cfg := Config{
+		ID: id, Peers: c.peers, SM: &logSM{}, Transport: c.net,
+		TickInterval: 10 * time.Millisecond, Logger: quiet,
+	}
+	if c.durable {
+		st, err := raftstore.Open(c.dirs[id])
+		if err != nil {
+			c.t.Fatal(err)
+		}
+		cfg.Store = st
+		c.stores[id] = st
+	}
+	n, err := Start(cfg)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	c.net.Add(id, n)
+	c.nodes[id], c.sms[id] = n, cfg.SM.(*logSM)
+}
+
+// stop stops node id, as a crash or restart would, and closes its store.
+func (c *cluster) stop(id uint64) {
+	c.t.Helper()
+	c.nodes[id].Stop()
+	if st := c.stores[id]; st != nil {
+		if err := st.Close(); err != nil {
+			c.t.Fatal(err)
+		}
+		delete(c.stores, id)
+	}
+	delete(c.nodes, id)
+	delete(c.sms, id)
 }
 
 // waitLeader waits until every node not in skip agrees on one leader, and that
@@ -123,10 +168,13 @@ func (c *cluster) waitApplied(want int) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	ref := c.sms[1].snapshot()
+	var ref []string
 	for id, sm := range c.sms {
-		if got := sm.snapshot(); !slices.Equal(got, ref) {
-			c.t.Fatalf("node %d's applied entries differ from node 1's", id)
+		got := sm.snapshot()
+		if ref == nil {
+			ref = got
+		} else if !slices.Equal(got, ref) {
+			c.t.Fatalf("node %d's applied entries differ from another node's", id)
 		}
 	}
 }
