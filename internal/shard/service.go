@@ -155,7 +155,7 @@ func (s *Service) write(ctx context.Context, now time.Time, cmd *seatsafev1.Shar
 		return seatsm.Result{}, status.Error(codes.DeadlineExceeded, "timed out; retry with the same id")
 	case errors.Is(err, context.Canceled):
 		return seatsm.Result{}, status.Error(codes.Canceled, "canceled")
-	case errors.Is(err, raft.ErrProposalDropped), errors.Is(err, raftnode.ErrStopped):
+	case errors.Is(err, raft.ErrProposalDropped), errors.Is(err, raftnode.ErrLeadershipLost), errors.Is(err, raftnode.ErrStopped):
 		return seatsm.Result{}, status.Errorf(codes.Unavailable, "%v; retry with the same id", err)
 	default:
 		return seatsm.Result{}, status.Errorf(codes.Internal, "propose: %v", err)
