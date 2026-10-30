@@ -1,8 +1,10 @@
 // Package raftstore persists a Raft node's log, HardState and snapshot in
 // Pebble, so a node that crashes or restarts comes back with its log intact.
 //
-// Every Save is one Pebble batch committed with Sync, so each Raft Ready costs
-// exactly one fsync no matter how many entries it carries (group commit).
+// Every Save is one Pebble batch. It is fsynced only when Raft needs it to be
+// durable (new entries, a term or vote change, or a snapshot), so a Ready
+// costs at most one fsync no matter how many entries it carries (group
+// commit), and commit-index-only updates cost none.
 package raftstore
 
 import (
@@ -43,17 +45,26 @@ type Pebble struct {
 
 // Open opens (or creates) the store in dir.
 func Open(dir string) (*Pebble, error) {
-	db, err := pebble.Open(dir, &pebble.Options{Logger: quietLogger{}})
+	return open(dir, &pebble.Options{Logger: quietLogger{}})
+}
+
+func open(dir string, opts *pebble.Options) (*Pebble, error) {
+	db, err := pebble.Open(dir, opts)
 	if err != nil {
 		return nil, fmt.Errorf("raftstore: open %s: %w", dir, err)
 	}
 	return &Pebble{db: db}, nil
 }
 
-// Save durably writes one Ready's HardState, new entries and snapshot in a
-// single batch with one fsync. Empty arguments are skipped; if there is
-// nothing to write, no fsync happens.
-func (p *Pebble) Save(hs raftpb.HardState, ents []raftpb.Entry, snap raftpb.Snapshot) error {
+// Save writes one Ready's HardState, new entries and snapshot in a single
+// batch. Empty arguments are skipped, and an empty batch writes nothing.
+//
+// mustSync is raft.Ready.MustSync: true when the term, vote or new entries
+// must be durable before messages go out. The batch is then fsynced; so is
+// any batch carrying a snapshot. Otherwise (for example a HardState whose
+// only change is the commit index, which Raft can recompute after a crash)
+// the batch is committed without an fsync.
+func (p *Pebble) Save(hs raftpb.HardState, ents []raftpb.Entry, snap raftpb.Snapshot, mustSync bool) error {
 	b := p.db.NewBatch()
 	defer b.Close()
 
@@ -100,7 +111,10 @@ func (p *Pebble) Save(hs raftpb.HardState, ents []raftpb.Entry, snap raftpb.Snap
 	if b.Empty() {
 		return nil
 	}
-	return b.Commit(pebble.Sync)
+	if mustSync || !raft.IsEmptySnap(snap) {
+		return b.Commit(pebble.Sync)
+	}
+	return b.Commit(pebble.NoSync)
 }
 
 // Load returns everything saved, for restarting a node. A fresh store returns
