@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"testing"
+	"time"
 
 	"github.com/quorum-crew/seatsafe/internal/seed"
 )
@@ -50,5 +51,40 @@ func TestSeedFileAdapter(t *testing.T) {
 	}
 	if _, err := seedLoader(3)(); err == nil {
 		t.Fatal("loading a missing shard file succeeded")
+	}
+}
+
+func TestRaftTimingFromEnv(t *testing.T) {
+	got, err := raftTimingFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != (raftTiming{tick: 100 * time.Millisecond, election: 10, heartbeat: 1}) {
+		t.Fatalf("defaults: %+v", got)
+	}
+
+	t.Setenv("RAFT_TICK_MS", "50")
+	t.Setenv("RAFT_ELECTION_TICKS", "6")
+	t.Setenv("RAFT_HEARTBEAT_TICKS", "2")
+	got, err = raftTimingFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != (raftTiming{tick: 50 * time.Millisecond, election: 6, heartbeat: 2}) {
+		t.Fatalf("from env: %+v", got)
+	}
+
+	for _, bad := range []struct{ key, val string }{
+		{"RAFT_TICK_MS", "0"},
+		{"RAFT_TICK_MS", "fast"},
+		{"RAFT_ELECTION_TICKS", "-3"},
+		{"RAFT_ELECTION_TICKS", "2"}, // not greater than the heartbeat (2)
+	} {
+		t.Run(bad.key+"="+bad.val, func(t *testing.T) {
+			t.Setenv(bad.key, bad.val)
+			if _, err := raftTimingFromEnv(); err == nil {
+				t.Fatalf("%s=%q was accepted", bad.key, bad.val)
+			}
+		})
 	}
 }
