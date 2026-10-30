@@ -417,3 +417,52 @@ func TestBookFailsFastWhenLeaderIsDeposed(t *testing.T) {
 	}
 	c.waitIdentical()
 }
+
+func TestTransientSeedErrors(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{raftnode.ErrLeadershipLost, true},
+		{raft.ErrProposalDropped, true},
+		{context.DeadlineExceeded, true},
+		{fmt.Errorf("wrapped: %w", context.DeadlineExceeded), true},
+		{context.Canceled, false}, // shutting down: Run exits on ctx anyway
+		{raftnode.ErrStopped, false},
+		{fmt.Errorf("disk full"), false},
+	} {
+		if got := transient(tc.err); got != tc.want {
+			t.Errorf("transient(%v) = %v, want %v", tc.err, got, tc.want)
+		}
+	}
+}
+
+// A seed proposal that times out (#16) must be retried at the normal
+// interval, not after Backoff. Every proposal here times out (1 ns), but the
+// entries still commit in the background, so a seeder that keeps retrying
+// finishes; one that backs off for an hour does not.
+func TestSeederRetriesTimedOutChunksWithoutBackoff(t *testing.T) {
+	nw := raftnode.NewNetwork()
+	sm := seatsm.New()
+	n, err := raftnode.Start(raftnode.Config{ID: 1, Peers: []uint64{1}, SM: Applier{SM: sm}, Transport: nw,
+		TickInterval: 10 * time.Millisecond, Logger: quiet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nw.Add(1, n)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() { cancel(); n.Stop(); nw.Close() })
+
+	src := fakeSeed{version: "v1", chunks: 3}
+	go (&Seeder{Node: n, SM: sm, Load: func() (SeedSource, error) { return src, nil }, Logf: func(string, ...any) {},
+		Interval: 5 * time.Millisecond, Backoff: time.Hour, ChunkTimeout: time.Nanosecond}).Run(ctx)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !Seeded(sm) {
+		if time.Now().After(deadline) {
+			_, applied, total, _ := sm.SeedStatus()
+			t.Fatalf("not seeded after 5s (%d/%d chunks): the seeder backed off after a timed-out proposal", applied, total)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

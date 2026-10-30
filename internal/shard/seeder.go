@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"go.etcd.io/raft/v3"
 	"google.golang.org/protobuf/proto"
 
 	seatsafev1 "github.com/quorum-crew/seatsafe/gen/seatsafe/v1"
@@ -32,11 +33,23 @@ type Seeder struct {
 	Load func() (SeedSource, error)
 	Logf func(format string, args ...any)
 
-	Interval time.Duration // how often to check; default 500ms
-	Backoff  time.Duration // wait after a failed attempt; default 10s
+	Interval     time.Duration // how often to check; default 500ms
+	Backoff      time.Duration // wait after a real failure; default 10s
+	ChunkTimeout time.Duration // per-chunk proposal timeout; default 5s
 }
 
-var errNotLeader = errors.New("lost leadership")
+// errRetrySoon marks a failure that only means "not now": this node is not
+// (or is no longer) the leader, or a proposal was dropped or timed out while
+// leadership moved. Run retries at the normal interval, not after Backoff.
+var errRetrySoon = errors.New("will retry")
+
+// transient reports whether a Propose error is a leadership hiccup rather
+// than a real problem with the seed.
+func transient(err error) bool {
+	return errors.Is(err, raftnode.ErrLeadershipLost) ||
+		errors.Is(err, raft.ErrProposalDropped) ||
+		errors.Is(err, context.DeadlineExceeded)
+}
 
 // Run seeds until the shard is seeded or ctx is done.
 func (s *Seeder) Run(ctx context.Context) {
@@ -80,7 +93,7 @@ func (s *Seeder) Run(ctx context.Context) {
 		}
 		if err := s.proposeMissing(ctx, src); err != nil {
 			s.Logf("seed: %v", err)
-			if !errors.Is(err, errNotLeader) {
+			if !errors.Is(err, errRetrySoon) {
 				wait = backoff
 			}
 		}
@@ -90,9 +103,13 @@ func (s *Seeder) Run(ctx context.Context) {
 // proposeMissing proposes every chunk the state machine still lacks.
 func (s *Seeder) proposeMissing(ctx context.Context, src SeedSource) error {
 	total := src.TotalChunks()
+	timeout := s.ChunkTimeout
+	if timeout == 0 {
+		timeout = 5 * time.Second
+	}
 	for {
 		if !s.Node.Status().IsLeader() {
-			return errNotLeader
+			return fmt.Errorf("not the leader: %w", errRetrySoon)
 		}
 		chunk, ok := s.SM.NextMissingChunk()
 		if !ok {
@@ -113,11 +130,12 @@ func (s *Seeder) proposeMissing(ctx context.Context, src SeedSource) error {
 		if err != nil {
 			return err
 		}
-		pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		pctx, cancel := context.WithTimeout(ctx, timeout)
 		res, err := s.Node.Propose(pctx, data)
 		cancel()
-		if errors.Is(err, raftnode.ErrLeadershipLost) {
-			return errNotLeader // the next leader carries on from NextMissingChunk
+		if transient(err) {
+			// Whoever is leader next carries on from NextMissingChunk.
+			return fmt.Errorf("propose chunk %d: %v: %w", chunk, err, errRetrySoon)
 		}
 		if err != nil {
 			return fmt.Errorf("propose chunk %d: %w", chunk, err)
