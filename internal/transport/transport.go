@@ -9,6 +9,7 @@ package transport
 import (
 	"context"
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -161,20 +162,30 @@ type peer struct {
 
 func (p *peer) run() {
 	defer p.wg.Done()
+	var carry *raftpb.Message // a snapshot held back to go in its own batch
 	for {
 		var first raftpb.Message
-		select {
-		case first = <-p.queue:
-		case <-p.stop:
-			return
+		if carry != nil {
+			first, carry = *carry, nil
+		} else {
+			select {
+			case first = <-p.queue:
+			case <-p.stop:
+				return
+			}
 		}
-		// Batch whatever else is already queued, up to maxBatchSize.
+		// Batch whatever else is already queued, up to maxBatchSize. A
+		// snapshot (MsgSnap, possibly megabytes) always travels alone.
 		batch := []raftpb.Message{first}
 		size := first.Size()
 	more:
-		for size < maxBatchSize {
+		for first.Type != raftpb.MsgSnap && size < maxBatchSize {
 			select {
 			case m := <-p.queue:
+				if m.Type == raftpb.MsgSnap {
+					carry = &m
+					break more
+				}
 				batch = append(batch, m)
 				size += m.Size()
 			default:
@@ -185,10 +196,25 @@ func (p *peer) run() {
 	}
 }
 
+// fitsInOneCall reports whether a message can be sent in one RaftBatch
+// within the gRPC message limit, leaving room for the batch's own framing.
+func fitsInOneCall(m raftpb.Message) bool { return m.Size() <= MaxMsgSize-64<<10 }
+
 func (p *peer) send(batch []raftpb.Message) {
 	req := &seatsafev1.RaftBatch{GroupId: p.t.groupID, From: p.t.self}
 	hasSnap := false
 	for i := range batch {
+		if !fitsInOneCall(batch[i]) {
+			// Only a snapshot can get this big (other messages are capped at
+			// MaxSizePerMsg). Sending it would fail the whole call, so report
+			// it instead; Raft retries later.
+			log.Printf("transport: dropping %v to peer %d: %d bytes exceeds the %d byte gRPC limit",
+				batch[i].Type, p.id, batch[i].Size(), MaxMsgSize)
+			if batch[i].Type == raftpb.MsgSnap {
+				p.t.reportSnapshot(p.id, false)
+			}
+			continue
+		}
 		data, err := batch[i].Marshal()
 		if err != nil {
 			continue
@@ -198,6 +224,9 @@ func (p *peer) send(batch []raftpb.Message) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
 	defer cancel()
+	if len(req.Messages) == 0 {
+		return
+	}
 	_, err := p.client.Send(ctx, req)
 	if err != nil {
 		p.t.reportUnreachable(p.id)

@@ -31,6 +31,9 @@ var (
 
 const entryPrefix = 'e'
 
+// entriesEnd is the exclusive upper bound of every entry key.
+var entriesEnd = []byte{entryPrefix + 1}
+
 func entryKey(index uint64) []byte {
 	k := make([]byte, 9)
 	k[0] = entryPrefix
@@ -76,8 +79,11 @@ func (p *Pebble) Save(hs raftpb.HardState, ents []raftpb.Entry, snap raftpb.Snap
 		if err := b.Set(keySnapshot, data, nil); err != nil {
 			return err
 		}
-		// The snapshot replaces every entry up to and including its index.
-		if err := b.DeleteRange(entryKey(0), entryKey(snap.Metadata.Index+1), nil); err != nil {
+		// A snapshot received from the leader replaces the whole log, like
+		// MemoryStorage.ApplySnapshot: entries after its index may conflict
+		// with the leader's log, so they go too. Any entries in this Ready
+		// come after the snapshot and are written below.
+		if err := b.DeleteRange(entryKey(0), entriesEnd, nil); err != nil {
 			return err
 		}
 	}
@@ -115,6 +121,27 @@ func (p *Pebble) Save(hs raftpb.HardState, ents []raftpb.Entry, snap raftpb.Snap
 		return b.Commit(pebble.Sync)
 	}
 	return b.Commit(pebble.NoSync)
+}
+
+// SaveSnapshot durably stores a snapshot this node took of its own state and
+// drops entries up to and including compactTo (0 = none). Unlike a snapshot
+// received in Save, entries after it are kept: they are this node's own log.
+func (p *Pebble) SaveSnapshot(snap raftpb.Snapshot, compactTo uint64) error {
+	data, err := snap.Marshal()
+	if err != nil {
+		return err
+	}
+	b := p.db.NewBatch()
+	defer b.Close()
+	if err := b.Set(keySnapshot, data, nil); err != nil {
+		return err
+	}
+	if compactTo > 0 {
+		if err := b.DeleteRange(entryKey(0), entryKey(compactTo+1), nil); err != nil {
+			return err
+		}
+	}
+	return b.Commit(pebble.Sync)
 }
 
 // Load returns everything saved, for restarting a node. A fresh store returns

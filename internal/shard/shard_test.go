@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/quorum-crew/seatsafe/internal/raftnode"
 	"github.com/quorum-crew/seatsafe/internal/raftstore"
 	"github.com/quorum-crew/seatsafe/internal/seatsm"
+	"github.com/quorum-crew/seatsafe/internal/transport"
 )
 
 // fakeSeed is a seed file whose chunk i is section sec-<i> with 10 seats.
@@ -58,17 +60,23 @@ type shard struct {
 	t       *testing.T
 	src     SeedSource
 	durable bool
-	net     *raftnode.Network
-	addrs   map[uint64]string
-	dirs    map[uint64]string
-	nodes   map[uint64]*storageNode
+	// snapEvery sets SnapshotEntries on every node (0 = raftnode's default).
+	snapEvery uint64
+	net       *raftnode.Network
+	addrs     map[uint64]string
+	dirs      map[uint64]string
+	nodes     map[uint64]*storageNode
 }
 
 var ids = []uint64{1, 2, 3}
 
 func startShard(t *testing.T, src SeedSource, durable bool) *shard {
+	return startShardWith(t, src, durable, 0)
+}
+
+func startShardWith(t *testing.T, src SeedSource, durable bool, snapEvery uint64) *shard {
 	t.Helper()
-	c := &shard{t: t, src: src, durable: durable, net: raftnode.NewNetwork(),
+	c := &shard{t: t, src: src, durable: durable, snapEvery: snapEvery, net: raftnode.NewNetwork(),
 		addrs: map[uint64]string{}, dirs: map[uint64]string{}, nodes: map[uint64]*storageNode{}}
 	for _, id := range ids {
 		lis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -97,7 +105,8 @@ func (c *shard) start(id uint64) {
 	c.t.Helper()
 	sm := seatsm.New()
 	cfg := raftnode.Config{ID: id, Peers: ids, SM: Applier{SM: sm}, Transport: c.net,
-		TickInterval: 10 * time.Millisecond, Logger: quiet}
+		TickInterval: 10 * time.Millisecond, Logger: quiet,
+		SnapshotEntries: c.snapEvery, CatchUpEntries: c.snapEvery / 2}
 	var store *raftstore.Pebble
 	if c.durable {
 		var err error
@@ -526,5 +535,78 @@ func TestCollectorRunsOnlyOnLeader(t *testing.T) {
 	run(lead.node)
 	if r := book(t, lead.addr, "req-1", "alice", a); r.Replayed {
 		t.Fatalf("the leader's collector did not drop req-1: %v", r)
+	}
+}
+
+// A full restart of a shard that has snapshotted: every node restores seatsm
+// from its snapshot plus the entries after it, and ends byte-identical to
+// before, idempotency included (#11).
+func TestRestartFromSnapshot(t *testing.T) {
+	c := startShardWith(t, fakeSeed{version: "v1", chunks: 3}, true, 10)
+	c.waitSeeded()
+	_, lead := c.leader()
+	for i := range 25 {
+		book(t, lead.addr, fmt.Sprintf("req-%d", i), "alice", seat(i%3, i%10))
+	}
+	before := c.waitIdentical()
+	for id, n := range c.nodes {
+		if n.node.Status().SnapshotIndex == 0 {
+			t.Fatalf("node %d never snapshotted", id)
+		}
+	}
+
+	for _, id := range ids {
+		c.stop(id)
+	}
+	for _, id := range ids {
+		c.start(id)
+	}
+	c.waitSeeded()
+	if after := c.waitIdentical(); !bytes.Equal(after, before) {
+		t.Fatal("seat state after restarting from snapshots differs from before")
+	}
+	_, lead = c.leader()
+	if r := book(t, lead.addr, "req-0", "alice", seat(0, 0)); !r.Replayed {
+		t.Fatalf("retry after restart: %v, want replayed", r)
+	}
+}
+
+// A snapshot of a realistically full shard must fit through the transport's
+// 16 MiB gRPC limit with room to spare. The largest real shard has 23,400
+// seats; this uses 25,000 plus 20,000 remembered requests (#11).
+func TestRealisticSnapshotFitsGRPCLimit(t *testing.T) {
+	sm := seatsm.New()
+	index := uint64(0)
+	apply := func(cmd *seatsafev1.ShardCommand) seatsm.Result {
+		index++
+		cmd.NowMs = int64(index)
+		return sm.Apply(index, cmd)
+	}
+	const sections, seatsPer = 25, 1000
+	for c := range sections {
+		var seats []*seatsafev1.SeatRef
+		for n := range seatsPer {
+			seats = append(seats, &seatsafev1.SeatRef{EventId: "evt-flash", SectionId: fmt.Sprintf("sec-%03d", 100+c),
+				SeatId: fmt.Sprintf("R%02d-S%03d", 1+n/50, 1+n%50)})
+		}
+		if r := apply(&seatsafev1.ShardCommand{Op: &seatsafev1.ShardCommand_Seed{Seed: &seatsafev1.SeedOp{
+			SeedVersion: strings.Repeat("a", 64), Chunk: uint32(c), TotalChunks: sections, Seats: seats}}}); r.Err != nil {
+			t.Fatal(r.Err)
+		}
+	}
+	for i := range 20000 { // 20,000 bookings, every one remembered for dedup
+		s := &seatsafev1.SeatRef{EventId: "evt-flash", SectionId: fmt.Sprintf("sec-%03d", 100+i%sections),
+			SeatId: fmt.Sprintf("R%02d-S%03d", 1+(i/sections)%20, 1+(i/sections/20)%50)}
+		apply(&seatsafev1.ShardCommand{Op: &seatsafev1.ShardCommand_Book{Book: &seatsafev1.BookOp{
+			RequestId: fmt.Sprintf("00000000-0000-4000-8000-%012d", i), UserId: fmt.Sprintf("user-%d", i), Seats: []*seatsafev1.SeatRef{s}}}})
+	}
+	data, err := sm.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const limit = transport.MaxMsgSize - 64<<10
+	t.Logf("snapshot of %d seats + 20,000 requests: %.1f MiB (limit %.1f MiB)", sections*seatsPer, float64(len(data))/(1<<20), float64(limit)/(1<<20))
+	if len(data) > limit/2 {
+		t.Fatalf("snapshot is %d bytes, more than half the %d byte limit: the limit or the format needs revisiting", len(data), limit)
 	}
 }

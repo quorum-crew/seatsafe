@@ -1,17 +1,20 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"go.etcd.io/raft/v3"
+	"go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
@@ -213,5 +216,114 @@ func TestRejectsWrongGroup(t *testing.T) {
 	_, err = seatsafev1.NewRaftTransportClient(conn).Send(context.Background(), &seatsafev1.RaftBatch{GroupId: 2, From: 1})
 	if err == nil {
 		t.Fatal("a batch for group 2 was accepted by a group 1 node")
+	}
+}
+
+// bigSM's snapshot carries a few MB of padding, like a seeded seatsm shard.
+type bigSM struct {
+	recordSM
+	restores int
+}
+
+func (s *bigSM) Snapshot() ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pad := make([]byte, 3<<20)
+	return append([]byte(strings.Join(s.entries, "\n")+"\x00"), pad...), nil
+}
+
+func (s *bigSM) Restore(data []byte) error {
+	i := bytes.IndexByte(data, 0)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.entries = nil
+	if i > 0 {
+		s.entries = strings.Split(string(data[:i]), "\n")
+	}
+	s.restores++
+	return nil
+}
+
+// A follower that falls behind the compacted log catches up from a
+// multi-megabyte snapshot sent over real gRPC (#11). The snapshot travels in
+// its own RaftBatch.
+func TestSnapshotOverGRPC(t *testing.T) {
+	const group = 1
+	ids := []uint64{1, 2, 3}
+	addrs := map[uint64]string{}
+	lis := map[uint64]net.Listener{}
+	for _, id := range ids {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		lis[id], addrs[id] = l, l.Addr().String()
+	}
+	quiet := &raft.DefaultLogger{Logger: log.New(io.Discard, "", 0)}
+	nodes, sms, servers := map[uint64]*raftnode.Node{}, map[uint64]*bigSM{}, map[uint64]*grpc.Server{}
+	trs := map[uint64]*Transport{}
+	for _, id := range ids {
+		tr, err := New(group, id, addrs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sm := &bigSM{}
+		n, err := raftnode.Start(raftnode.Config{ID: id, Peers: ids, SM: sm, Transport: tr,
+			TickInterval: 20 * time.Millisecond, Logger: quiet, SnapshotEntries: 20, CatchUpEntries: 5})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tr.SetNode(n)
+		gs := grpc.NewServer(grpc.MaxRecvMsgSize(MaxMsgSize))
+		tr.Register(gs)
+		go gs.Serve(lis[id])
+		nodes[id], sms[id], servers[id], trs[id] = n, sm, gs, tr
+	}
+	defer func() {
+		for _, id := range ids {
+			servers[id].Stop()
+			nodes[id].Stop()
+			trs[id].Close()
+		}
+	}()
+	members := map[uint64]*member{}
+	for _, id := range ids {
+		members[id] = &member{node: nodes[id], sm: &sms[id].recordSM, up: true}
+	}
+	lead := waitLeader(t, members)
+	follower := lead%3 + 1
+
+	// Cut the follower off by stopping its gRPC server, then write enough
+	// for the leader to compact past it.
+	servers[follower].Stop()
+	for i := range 60 {
+		propose(t, nodes[lead], fmt.Sprintf("e-%d", i))
+	}
+	l, err := net.Listen("tcp", addrs[follower])
+	if err != nil {
+		t.Fatal(err)
+	}
+	gs := grpc.NewServer(grpc.MaxRecvMsgSize(MaxMsgSize))
+	trs[follower].Register(gs)
+	go gs.Serve(l)
+	servers[follower] = gs
+
+	waitSame(t, members, 60)
+	sms[follower].mu.Lock()
+	restores := sms[follower].restores
+	sms[follower].mu.Unlock()
+	if restores == 0 {
+		t.Fatal("follower caught up without a snapshot; the test did not exercise MsgSnap over gRPC")
+	}
+}
+
+func TestOversizedMessageDoesNotFit(t *testing.T) {
+	small := raftpb.Message{Type: raftpb.MsgSnap, Snapshot: &raftpb.Snapshot{Data: make([]byte, 1<<20)}}
+	huge := raftpb.Message{Type: raftpb.MsgSnap, Snapshot: &raftpb.Snapshot{Data: make([]byte, MaxMsgSize)}}
+	if !fitsInOneCall(small) {
+		t.Error("a 1 MiB snapshot should fit in one call")
+	}
+	if fitsInOneCall(huge) {
+		t.Error("a snapshot at the gRPC limit must be reported, not sent")
 	}
 }

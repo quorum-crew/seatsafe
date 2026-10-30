@@ -10,6 +10,8 @@
 //	HTTP_ADDR  health and metrics listen address (default :8080)
 //	DATA_DIR   Pebble directory for the Raft log (default /data)
 //	SEED_DIR   directory holding shard{N}.json (default /seed)
+//	RAFT_SNAPSHOT_ENTRIES  applied entries between snapshots (default 10000)
+//	RAFT_CATCHUP_ENTRIES   entries kept before a snapshot for catch-up (default 5000)
 package main
 
 import (
@@ -70,11 +72,20 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	snapEvery, err := positiveIntEnv("RAFT_SNAPSHOT_ENTRIES", raftnode.DefaultSnapshotEntries)
+	if err != nil {
+		return err
+	}
+	catchUp, err := positiveIntEnv("RAFT_CATCHUP_ENTRIES", raftnode.DefaultCatchUpEntries)
+	if err != nil {
+		return err
+	}
 
 	sm := seatsm.New()
 	node, err := raftnode.Start(raftnode.Config{
 		ID: raftID, Peers: ids, SM: shard.Applier{SM: sm}, Transport: tr, Store: store,
 		TickInterval: timing.tick, ElectionTicks: timing.election, HeartbeatTicks: timing.heartbeat,
+		SnapshotEntries: uint64(snapEvery), CatchUpEntries: uint64(catchUp),
 	})
 	if err != nil {
 		return err
@@ -122,8 +133,8 @@ func run() error {
 	go (&shard.Seeder{Node: node, SM: sm, Load: seedLoader(uint32(shardID)), Logf: log.Printf}).Run(ctx)
 	go (&shard.Collector{Node: node, Logf: log.Printf}).Run(ctx)
 
-	log.Printf("storage %s: shard %d, raft id %d, peers %v, raft tick %v, election %d ticks, heartbeat %d ticks",
-		info.NodeID, shardID, raftID, addrs, timing.tick, timing.election, timing.heartbeat)
+	log.Printf("storage %s: shard %d, raft id %d, peers %v, raft tick %v, election %d ticks, heartbeat %d ticks, snapshot every %d entries keeping %d",
+		info.NodeID, shardID, raftID, addrs, timing.tick, timing.election, timing.heartbeat, snapEvery, catchUp)
 	<-ctx.Done()
 
 	log.Printf("storage %s: shutting down", info.NodeID)

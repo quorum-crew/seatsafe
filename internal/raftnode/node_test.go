@@ -2,6 +2,7 @@ package raftnode
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -17,19 +18,43 @@ import (
 // logSM is a fake state machine that records every applied payload in order.
 // Apply returns the entry's position in that order (1-based).
 type logSM struct {
-	mu      sync.Mutex
-	entries []string
+	mu       sync.Mutex
+	entries  []string
+	applies  int // Apply calls since this SM was created
+	restores int // Restore calls since this SM was created
 }
 
 func (s *logSM) Apply(_ uint64, data []byte) any {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.entries = append(s.entries, string(data))
+	s.applies++
 	return len(s.entries)
 }
 
-func (s *logSM) Snapshot() ([]byte, error) { return nil, nil }
-func (s *logSM) Restore([]byte) error      { return nil }
+func (s *logSM) Snapshot() ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return json.Marshal(s.entries)
+}
+
+func (s *logSM) Restore(data []byte) error {
+	var entries []string
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.entries = entries
+	s.restores++
+	return nil
+}
+
+func (s *logSM) counts() (applies, restores int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.applies, s.restores
+}
 
 func (s *logSM) snapshot() []string {
 	s.mu.Lock()
@@ -42,10 +67,12 @@ type cluster struct {
 	net     *Network
 	peers   []uint64
 	durable bool
-	nodes   map[uint64]*Node
-	sms     map[uint64]*logSM
-	dirs    map[uint64]string
-	stores  map[uint64]*raftstore.Pebble
+	// Snapshot settings for every node (0 = raftnode's defaults).
+	snapEvery, catchUp uint64
+	nodes              map[uint64]*Node
+	sms                map[uint64]*logSM
+	dirs               map[uint64]string
+	stores             map[uint64]*raftstore.Pebble
 }
 
 // newCluster starts size nodes that keep their logs in memory only.
@@ -56,9 +83,15 @@ func newCluster(t *testing.T, size int) *cluster { return startCluster(t, size, 
 func newDurableCluster(t *testing.T, size int) *cluster { return startCluster(t, size, true) }
 
 func startCluster(t *testing.T, size int, durable bool) *cluster {
+	return startClusterWith(t, size, durable, 0, 0)
+}
+
+// startClusterWith also sets how often nodes snapshot and how many entries
+// they keep before a snapshot.
+func startClusterWith(t *testing.T, size int, durable bool, snapEvery, catchUp uint64) *cluster {
 	t.Helper()
 	c := &cluster{
-		t: t, net: NewNetwork(), durable: durable,
+		t: t, net: NewNetwork(), durable: durable, snapEvery: snapEvery, catchUp: catchUp,
 		nodes: map[uint64]*Node{}, sms: map[uint64]*logSM{},
 		dirs: map[uint64]string{}, stores: map[uint64]*raftstore.Pebble{},
 	}
@@ -86,6 +119,7 @@ func (c *cluster) start(id uint64) {
 	cfg := Config{
 		ID: id, Peers: c.peers, SM: &logSM{}, Transport: c.net,
 		TickInterval: 10 * time.Millisecond, Logger: quiet,
+		SnapshotEntries: c.snapEvery, CatchUpEntries: c.catchUp,
 	}
 	if c.durable {
 		st, err := raftstore.Open(c.dirs[id])

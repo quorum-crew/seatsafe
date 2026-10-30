@@ -43,8 +43,13 @@ type LogStore interface {
 	// mustSync is raft.Ready.MustSync: when true (and whenever there is a
 	// snapshot) the batch must be durable (fsynced) before Save returns.
 	Save(hs raftpb.HardState, ents []raftpb.Entry, snap raftpb.Snapshot, mustSync bool) error
-	// Load returns everything saved so far; empty for a fresh store.
+	// Load returns everything saved so far; empty for a fresh store. Entries
+	// are only those after the snapshot.
 	Load() (raftpb.HardState, raftpb.Snapshot, []raftpb.Entry, error)
+	// SaveSnapshot durably stores a snapshot this node took of its own state
+	// and drops log entries up to and including compactTo (0 = keep all).
+	// Entries after the snapshot are kept.
+	SaveSnapshot(snap raftpb.Snapshot, compactTo uint64) error
 }
 
 // Transport delivers outgoing Raft messages to peers. Send must not block for
@@ -65,7 +70,21 @@ type Config struct {
 	ElectionTicks  int           // default 10, so elections after ~1s
 	HeartbeatTicks int           // default 1
 	Logger         raft.Logger   // default: etcd raft's logger
+
+	// SnapshotEntries is how many entries may be applied after the last
+	// snapshot before the node takes a new one and compacts its log.
+	SnapshotEntries uint64 // default DefaultSnapshotEntries
+	// CatchUpEntries is how many entries before the snapshot are kept after
+	// compaction, so a follower that is only slightly behind can catch up
+	// from the log instead of needing the whole snapshot.
+	CatchUpEntries uint64 // default DefaultCatchUpEntries
 }
+
+// Snapshot defaults (design doc: snapshot every 10,000 applied entries).
+const (
+	DefaultSnapshotEntries = 10000
+	DefaultCatchUpEntries  = 5000
+)
 
 // ErrStopped is returned for calls on a node that has been stopped.
 var ErrStopped = errors.New("raftnode: stopped")
@@ -83,8 +102,10 @@ type Status struct {
 	Term      uint64
 	Role      raft.StateType
 	LastIndex uint64 // index of the last entry in this node's log
-	Commit    uint64
-	Applied   uint64
+	// SnapshotIndex is the index of this node's newest snapshot (0 = none).
+	SnapshotIndex uint64
+	Commit        uint64
+	Applied       uint64
 
 	// Followers is filled on the leader only: how far each follower's log
 	// has caught up. Used for replication-lag metrics.
@@ -114,6 +135,10 @@ type Node struct {
 	// Owned by the run loop: the leader and role from the last SoftState.
 	lead     uint64
 	isLeader bool
+	// Owned by the run loop: the current membership (for snapshot metadata)
+	// and the index of the newest snapshot.
+	confState raftpb.ConfState
+	snapIndex uint64
 
 	stop     chan struct{}
 	done     chan struct{}
@@ -143,6 +168,12 @@ func Start(cfg Config) (*Node, error) {
 	}
 	if cfg.HeartbeatTicks == 0 {
 		cfg.HeartbeatTicks = 1
+	}
+	if cfg.SnapshotEntries == 0 {
+		cfg.SnapshotEntries = DefaultSnapshotEntries
+	}
+	if cfg.CatchUpEntries == 0 {
+		cfg.CatchUpEntries = DefaultCatchUpEntries
 	}
 
 	storage := raft.NewMemoryStorage()
@@ -203,6 +234,7 @@ func (n *Node) loadState(rc *raft.Config) (bool, error) {
 			return false, fmt.Errorf("raftnode: restore state machine: %w", err)
 		}
 		n.applied.Store(snap.Metadata.Index)
+		n.confState, n.snapIndex = snap.Metadata.ConfState, snap.Metadata.Index
 	}
 	if err := n.storage.SetHardState(hs); err != nil {
 		return false, fmt.Errorf("raftnode: load hard state: %w", err)
@@ -257,6 +289,7 @@ func (n *Node) handleReady(rd raft.Ready) error {
 			return fmt.Errorf("restore state machine: %w", err)
 		}
 		n.applied.Store(rd.Snapshot.Metadata.Index)
+		n.confState, n.snapIndex = rd.Snapshot.Metadata.ConfState, rd.Snapshot.Metadata.Index
 	}
 	if !raft.IsEmptyHardState(rd.HardState) {
 		if err := n.storage.SetHardState(rd.HardState); err != nil {
@@ -289,23 +322,68 @@ func (n *Node) handleReady(rd raft.Ready) error {
 			if err := cc.Unmarshal(e.Data); err != nil {
 				return fmt.Errorf("entry %d: conf change: %w", e.Index, err)
 			}
-			n.raft.ApplyConfChange(cc)
+			n.confState = *n.raft.ApplyConfChange(cc)
 		case raftpb.EntryConfChangeV2:
 			var cc raftpb.ConfChangeV2
 			if err := cc.Unmarshal(e.Data); err != nil {
 				return fmt.Errorf("entry %d: conf change v2: %w", e.Index, err)
 			}
-			n.raft.ApplyConfChange(cc)
+			n.confState = *n.raft.ApplyConfChange(cc)
 		}
 		n.applied.Store(e.Index)
 	}
 
-	// 4. A leadership change after applying, so results committed in this
+	// 4. Snapshot and compact once enough entries have been applied.
+	if err := n.maybeSnapshot(); err != nil {
+		return fmt.Errorf("snapshot: %w", err)
+	}
+
+	// 5. A leadership change after applying, so results committed in this
 	//    Ready still reach their callers: anything still waiting may never
 	//    commit, so fail it now instead of letting it wait for its deadline.
 	if n.leadershipChanged(rd.SoftState) {
 		n.failPending(ErrLeadershipLost)
 	}
+	return nil
+}
+
+// maybeSnapshot takes a snapshot of the state machine at the applied index
+// once SnapshotEntries entries have been applied since the last one, stores
+// it, and compacts the log, keeping CatchUpEntries entries before it. It
+// runs on the Raft loop right after applying, so the state machine and the
+// applied index match exactly.
+func (n *Node) maybeSnapshot() error {
+	applied := n.applied.Load()
+	if applied-n.snapIndex < n.cfg.SnapshotEntries {
+		return nil
+	}
+	data, err := n.cfg.SM.Snapshot()
+	if err != nil {
+		return err
+	}
+	snap, err := n.storage.CreateSnapshot(applied, &n.confState, data)
+	if errors.Is(err, raft.ErrSnapOutOfDate) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var compactTo uint64
+	if applied > n.cfg.CatchUpEntries {
+		compactTo = applied - n.cfg.CatchUpEntries
+	}
+	// Durable first: only then may entries be dropped.
+	if n.cfg.Store != nil {
+		if err := n.cfg.Store.SaveSnapshot(snap, compactTo); err != nil {
+			return err
+		}
+	}
+	if compactTo > 0 {
+		if err := n.storage.Compact(compactTo); err != nil && !errors.Is(err, raft.ErrCompacted) {
+			return err
+		}
+	}
+	n.snapIndex = applied
 	return nil
 }
 
@@ -379,6 +457,9 @@ func (n *Node) Status() Status {
 	}
 	if last, err := n.storage.LastIndex(); err == nil {
 		out.LastIndex = last
+	}
+	if snap, err := n.storage.Snapshot(); err == nil {
+		out.SnapshotIndex = snap.Metadata.Index
 	}
 	for id, pr := range st.Progress {
 		if id != n.cfg.ID {
