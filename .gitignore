@@ -14,4 +14,4 @@ deploy/seed/*.json
 .proto-out.*
 
 # Load generator output
-results/
+/results/
