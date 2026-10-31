@@ -39,9 +39,10 @@ type StateMachine interface {
 // LogStore persists what Raft needs to survive a restart. raftstore.Pebble
 // implements it.
 type LogStore interface {
-	// Save durably writes one Ready's HardState, entries and snapshot, in one
-	// batch with one fsync.
-	Save(hs raftpb.HardState, ents []raftpb.Entry, snap raftpb.Snapshot) error
+	// Save writes one Ready's HardState, entries and snapshot in one batch.
+	// mustSync is raft.Ready.MustSync: when true (and whenever there is a
+	// snapshot) the batch must be durable (fsynced) before Save returns.
+	Save(hs raftpb.HardState, ents []raftpb.Entry, snap raftpb.Snapshot, mustSync bool) error
 	// Load returns everything saved so far; empty for a fresh store.
 	Load() (raftpb.HardState, raftpb.Snapshot, []raftpb.Entry, error)
 }
@@ -69,14 +70,21 @@ type Config struct {
 // ErrStopped is returned for calls on a node that has been stopped.
 var ErrStopped = errors.New("raftnode: stopped")
 
+// ErrLeadershipLost is returned by Propose when the group's leader changed (or
+// this node stopped being leader) before the proposal was applied here. The
+// entry may or may not commit later, so callers retry with the same request ID
+// and let the state machine's dedup sort it out.
+var ErrLeadershipLost = errors.New("raftnode: leadership changed before the proposal was applied")
+
 // Status is a point-in-time view of the node.
 type Status struct {
-	ID      uint64
-	Leader  uint64 // 0 = no known leader
-	Term    uint64
-	Role    raft.StateType
-	Commit  uint64
-	Applied uint64
+	ID        uint64
+	Leader    uint64 // 0 = no known leader
+	Term      uint64
+	Role      raft.StateType
+	LastIndex uint64 // index of the last entry in this node's log
+	Commit    uint64
+	Applied   uint64
 
 	// Followers is filled on the leader only: how far each follower's log
 	// has caught up. Used for replication-lag metrics.
@@ -101,7 +109,11 @@ type Node struct {
 	applied atomic.Uint64
 
 	mu      sync.Mutex
-	waiters map[uint64]chan any
+	waiters map[uint64]chan outcome
+
+	// Owned by the run loop: the leader and role from the last SoftState.
+	lead     uint64
+	isLeader bool
 
 	stop     chan struct{}
 	done     chan struct{}
@@ -153,7 +165,7 @@ func Start(cfg Config) (*Node, error) {
 	n := &Node{
 		cfg:     cfg,
 		storage: storage,
-		waiters: make(map[uint64]chan any),
+		waiters: make(map[uint64]chan outcome),
 		stop:    make(chan struct{}),
 		done:    make(chan struct{}),
 	}
@@ -229,10 +241,11 @@ func (n *Node) run() {
 
 // handleReady follows the etcd raft contract: persist, then send, then apply.
 func (n *Node) handleReady(rd raft.Ready) error {
-	// 1. Persist: one durable batch (one fsync), then the in-memory copy
-	//    Raft reads from.
+	// 1. Persist: one batch, fsynced when rd.MustSync (new entries, a term
+	//    or vote change) or a snapshot needs it, then the in-memory copy Raft
+	//    reads from.
 	if n.cfg.Store != nil {
-		if err := n.cfg.Store.Save(rd.HardState, rd.Entries, rd.Snapshot); err != nil {
+		if err := n.cfg.Store.Save(rd.HardState, rd.Entries, rd.Snapshot, rd.MustSync); err != nil {
 			return fmt.Errorf("persist: %w", err)
 		}
 	}
@@ -286,15 +299,36 @@ func (n *Node) handleReady(rd raft.Ready) error {
 		}
 		n.applied.Store(e.Index)
 	}
+
+	// 4. A leadership change after applying, so results committed in this
+	//    Ready still reach their callers: anything still waiting may never
+	//    commit, so fail it now instead of letting it wait for its deadline.
+	if n.leadershipChanged(rd.SoftState) {
+		n.failPending(ErrLeadershipLost)
+	}
 	return nil
+}
+
+// leadershipChanged records a SoftState change and reports whether pending
+// proposals should be failed: the known leader changed, or this node stopped
+// being leader.
+func (n *Node) leadershipChanged(ss *raft.SoftState) bool {
+	if ss == nil {
+		return false
+	}
+	wasLeader := n.isLeader
+	changed := ss.Lead != n.lead || (wasLeader && ss.RaftState != raft.StateLeader)
+	n.lead, n.isLeader = ss.Lead, ss.RaftState == raft.StateLeader
+	return changed
 }
 
 // Propose appends data to the log and waits until this node has applied it,
 // returning the result of StateMachine.Apply.
 //
-// If leadership changes, an entry can be lost before it commits; Propose then
-// waits until ctx is done. Callers retry with the same request ID, and the
-// state machine's dedup makes the retry safe.
+// If the leader changes before the entry is applied here, Propose returns
+// ErrLeadershipLost right away rather than waiting for ctx: the entry may
+// have been lost. Callers retry with the same request ID, and the state
+// machine's dedup makes the retry safe.
 func (n *Node) Propose(ctx context.Context, data []byte) (any, error) {
 	id, ch := n.register()
 	defer n.forget(id)
@@ -306,8 +340,8 @@ func (n *Node) Propose(ctx context.Context, data []byte) (any, error) {
 		return nil, err // e.g. raft.ErrProposalDropped when there is no leader
 	}
 	select {
-	case res := <-ch:
-		return res, nil
+	case out := <-ch:
+		return out.val, out.err
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-n.stop:
@@ -343,6 +377,9 @@ func (n *Node) Status() Status {
 		Commit:  st.Commit,
 		Applied: n.applied.Load(),
 	}
+	if last, err := n.storage.LastIndex(); err == nil {
+		out.LastIndex = last
+	}
 	for id, pr := range st.Progress {
 		if id != n.cfg.ID {
 			out.Followers = append(out.Followers, FollowerProgress{ID: id, Match: pr.Match, RecentActive: pr.RecentActive})
@@ -361,8 +398,14 @@ func (n *Node) Stop() {
 // register picks a random proposal ID. IDs only need to be unique among the
 // proposals currently waiting on this node; 64 random bits make a clash with
 // an older entry still in the log vanishingly unlikely.
-func (n *Node) register() (uint64, chan any) {
-	ch := make(chan any, 1)
+// outcome is what a waiting Propose receives: the apply result, or an error.
+type outcome struct {
+	val any
+	err error
+}
+
+func (n *Node) register() (uint64, chan outcome) {
+	ch := make(chan outcome, 1)
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	for {
@@ -386,7 +429,17 @@ func (n *Node) deliver(id uint64, res any) {
 	delete(n.waiters, id)
 	n.mu.Unlock()
 	if ok {
-		ch <- res // buffered, never blocks
+		ch <- outcome{val: res} // buffered, never blocks
+	}
+}
+
+// failPending fails every proposal still waiting on this node.
+func (n *Node) failPending(err error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for id, ch := range n.waiters {
+		ch <- outcome{err: err} // buffered, never blocks
+		delete(n.waiters, id)
 	}
 }
 

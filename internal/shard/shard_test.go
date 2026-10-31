@@ -372,3 +372,159 @@ func TestSeederRefusesDifferentSeed(t *testing.T) {
 		t.Fatalf("seed status = %s done=%v, want v1 done", version, done)
 	}
 }
+
+// An RPC with no client deadline must not hang when the leader it reached is
+// deposed before the write commits (#10): it gets UNAVAILABLE promptly, and a
+// retry with the same request_id on the new leader is safe.
+func TestBookFailsFastWhenLeaderIsDeposed(t *testing.T) {
+	c := startShard(t, fakeSeed{version: "v1", chunks: 1}, false)
+	c.waitSeeded()
+	oldID, old := c.leader()
+	client := seatsafev1.NewShardServiceClient(conn(t, old.addr))
+
+	c.net.Isolate(oldID) // its Raft traffic is cut; gRPC to it still works
+	errc := make(chan error, 1)
+	go func() {
+		_, err := client.Book(context.Background(), // no deadline
+			&seatsafev1.ShardBookRequest{RequestId: "req-1", UserId: "alice", Seats: []*seatsafev1.SeatRef{seat(0, 1)}})
+		errc <- err
+	}()
+	select {
+	case err := <-errc:
+		if status.Code(err) != codes.Unavailable {
+			t.Fatalf("Book on a deposed leader returned %v, want UNAVAILABLE", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Book with no deadline is still hanging after the leader was deposed")
+	}
+
+	c.net.Heal()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, lead := c.leader()
+		resp, err := seatsafev1.NewShardServiceClient(conn(t, lead.addr)).Book(ctx5(t),
+			&seatsafev1.ShardBookRequest{RequestId: "req-1", UserId: "alice", Seats: []*seatsafev1.SeatRef{seat(0, 1)}})
+		if err == nil {
+			if resp.Outcome != seatsafev1.BookingOutcome_BOOKING_OUTCOME_CONFIRMED {
+				t.Fatalf("retry of req-1: %v", resp)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("retry of req-1 kept failing: %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	c.waitIdentical()
+}
+
+func TestTransientSeedErrors(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{raftnode.ErrLeadershipLost, true},
+		{raft.ErrProposalDropped, true},
+		{context.DeadlineExceeded, true},
+		{fmt.Errorf("wrapped: %w", context.DeadlineExceeded), true},
+		{context.Canceled, false}, // shutting down: Run exits on ctx anyway
+		{raftnode.ErrStopped, false},
+		{fmt.Errorf("disk full"), false},
+	} {
+		if got := transient(tc.err); got != tc.want {
+			t.Errorf("transient(%v) = %v, want %v", tc.err, got, tc.want)
+		}
+	}
+}
+
+// A seed proposal that times out (#16) must be retried at the normal
+// interval, not after Backoff. Every proposal here times out (1 ns), but the
+// entries still commit in the background, so a seeder that keeps retrying
+// finishes; one that backs off for an hour does not.
+func TestSeederRetriesTimedOutChunksWithoutBackoff(t *testing.T) {
+	nw := raftnode.NewNetwork()
+	sm := seatsm.New()
+	n, err := raftnode.Start(raftnode.Config{ID: 1, Peers: []uint64{1}, SM: Applier{SM: sm}, Transport: nw,
+		TickInterval: 10 * time.Millisecond, Logger: quiet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nw.Add(1, n)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() { cancel(); n.Stop(); nw.Close() })
+
+	src := fakeSeed{version: "v1", chunks: 3}
+	go (&Seeder{Node: n, SM: sm, Load: func() (SeedSource, error) { return src, nil }, Logf: func(string, ...any) {},
+		Interval: 5 * time.Millisecond, Backoff: time.Hour, ChunkTimeout: time.Nanosecond}).Run(ctx)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !Seeded(sm) {
+		if time.Now().After(deadline) {
+			_, applied, total, _ := sm.SeedStatus()
+			t.Fatalf("not seeded after 5s (%d/%d chunks): the seeder backed off after a timed-out proposal", applied, total)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// collectAt runs one GC round as if the leader's clock read now+ahead.
+func collectAt(t *testing.T, n *raftnode.Node, ahead time.Duration) {
+	t.Helper()
+	c := &Collector{Node: n, now: func() time.Time { return time.Now().Add(ahead) }}
+	if err := c.collect(context.Background(), 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Records younger than the retention survive a GC round; older ones are
+// dropped on every replica, so a very late retry is no longer recognized (#12).
+func TestCollectorDropsRecordsOlderThanRetention(t *testing.T) {
+	c := startShard(t, fakeSeed{version: "v1", chunks: 1}, false)
+	c.waitSeeded()
+	_, lead := c.leader()
+	a := seat(0, 1)
+	book(t, lead.addr, "req-old", "alice", a)
+
+	collectAt(t, lead.node, 5*time.Minute) // within the 10 min retention
+	if r := book(t, lead.addr, "req-old", "alice", a); !r.Replayed {
+		t.Fatalf("5 min later the retry was not replayed: %v", r)
+	}
+
+	collectAt(t, lead.node, 11*time.Minute) // past the retention
+	r := book(t, lead.addr, "req-old", "alice", a)
+	if r.Replayed || r.Outcome != seatsafev1.BookingOutcome_BOOKING_OUTCOME_SEAT_UNAVAILABLE {
+		t.Fatalf("11 min later req-old should be forgotten (seat still booked, no replay): %v", r)
+	}
+	c.waitIdentical() // every replica dropped the same records
+	if err := lead.sm.CheckInvariants(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Only the leader proposes GcOps: a collector on a follower changes nothing,
+// while the leader's Run loop collects on its interval.
+func TestCollectorRunsOnlyOnLeader(t *testing.T) {
+	c := startShard(t, fakeSeed{version: "v1", chunks: 1}, false)
+	c.waitSeeded()
+	leadID, lead := c.leader()
+	follower := c.nodes[leadID%3+1]
+	a := seat(0, 2)
+	book(t, lead.addr, "req-1", "alice", a)
+
+	run := func(n *raftnode.Node) {
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer cancel()
+		(&Collector{Node: n, Logf: t.Logf, Interval: 10 * time.Millisecond,
+			now: func() time.Time { return time.Now().Add(time.Hour) }}).Run(ctx)
+	}
+
+	run(follower.node)
+	if r := book(t, lead.addr, "req-1", "alice", a); !r.Replayed {
+		t.Fatalf("a follower's collector dropped records: %v", r)
+	}
+
+	run(lead.node)
+	if r := book(t, lead.addr, "req-1", "alice", a); r.Replayed {
+		t.Fatalf("the leader's collector did not drop req-1: %v", r)
+	}
+}
