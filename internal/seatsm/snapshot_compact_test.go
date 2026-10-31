@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"math/rand"
+	"os"
 	"strings"
 	"testing"
 
@@ -55,14 +56,25 @@ func wantRoundTrip(t *testing.T, m *Machine) {
 	}
 }
 
+// fullSnapshotTests reports whether to run the slow versions of these tests.
+// The race detector makes them cost more than the rest of the package, so
+// -race runs a smaller set unless SEATSM_FULL_SNAPSHOT_TESTS is set.
+func fullSnapshotTests() bool {
+	return !raceEnabled || os.Getenv("SEATSM_FULL_SNAPSHOT_TESTS") != ""
+}
+
 func TestCompactRoundTrip(t *testing.T) {
-	for _, shape := range []logShape{smallLog, contendedLog} {
+	shapes, states := []logShape{smallLog}, stateShapes[:2]
+	if fullSnapshotTests() {
+		shapes, states = []logShape{smallLog, contendedLog}, stateShapes[:3]
+	}
+	for _, shape := range shapes {
 		cmds := randomLog(shape)
 		for _, n := range []int{0, 1, 3, len(cmds) / 10, len(cmds) / 2, len(cmds)} {
 			wantRoundTrip(t, machineAfter(cmds, n))
 		}
 	}
-	for _, s := range stateShapes[:3] {
+	for _, s := range states {
 		wantRoundTrip(t, buildState(t, s))
 	}
 }
@@ -354,7 +366,11 @@ func TestRestoreSurvivesDamage(t *testing.T) {
 		t.Error("a truncated body was accepted")
 	}
 	r := rand.New(rand.NewSource(11))
-	for range 20000 {
+	corruptions := 1000
+	if fullSnapshotTests() {
+		corruptions = 20000
+	}
+	for range corruptions {
 		b := bytes.Clone(body)
 		for range 1 + r.Intn(3) {
 			b[r.Intn(len(b))] = byte(r.Intn(256))
