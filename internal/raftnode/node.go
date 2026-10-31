@@ -39,9 +39,10 @@ type StateMachine interface {
 // LogStore persists what Raft needs to survive a restart. raftstore.Pebble
 // implements it.
 type LogStore interface {
-	// Save durably writes one Ready's HardState, entries and snapshot, in one
-	// batch with one fsync.
-	Save(hs raftpb.HardState, ents []raftpb.Entry, snap raftpb.Snapshot) error
+	// Save writes one Ready's HardState, entries and snapshot in one batch.
+	// mustSync is raft.Ready.MustSync: when true (and whenever there is a
+	// snapshot) the batch must be durable (fsynced) before Save returns.
+	Save(hs raftpb.HardState, ents []raftpb.Entry, snap raftpb.Snapshot, mustSync bool) error
 	// Load returns everything saved so far; empty for a fresh store.
 	Load() (raftpb.HardState, raftpb.Snapshot, []raftpb.Entry, error)
 }
@@ -239,10 +240,11 @@ func (n *Node) run() {
 
 // handleReady follows the etcd raft contract: persist, then send, then apply.
 func (n *Node) handleReady(rd raft.Ready) error {
-	// 1. Persist: one durable batch (one fsync), then the in-memory copy
-	//    Raft reads from.
+	// 1. Persist: one batch, fsynced when rd.MustSync (new entries, a term
+	//    or vote change) or a snapshot needs it, then the in-memory copy Raft
+	//    reads from.
 	if n.cfg.Store != nil {
-		if err := n.cfg.Store.Save(rd.HardState, rd.Entries, rd.Snapshot); err != nil {
+		if err := n.cfg.Store.Save(rd.HardState, rd.Entries, rd.Snapshot, rd.MustSync); err != nil {
 			return fmt.Errorf("persist: %w", err)
 		}
 	}
