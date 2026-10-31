@@ -118,6 +118,7 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	go (&shard.Seeder{Node: node, SM: sm, Load: seedLoader(uint32(shardID)), Logf: log.Printf}).Run(ctx)
+	go (&shard.Collector{Node: node, Logf: log.Printf}).Run(ctx)
 
 	log.Printf("storage %s: shard %d, raft id %d, peers %v, raft tick %v, election %d ticks, heartbeat %d ticks",
 		info.NodeID, shardID, raftID, addrs, timing.tick, timing.election, timing.heartbeat)
