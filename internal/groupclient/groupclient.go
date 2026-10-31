@@ -8,13 +8,16 @@
 //	FAILED_PRECONDITION + usable       switch to the leader named in the
 //	trailer, first time in this Call   "seatsafe-leader" trailer and retry
 //	                                   there at once
-//	FAILED_PRECONDITION + usable       treated as not leader: rediscover and
-//	trailer, after that redirect       retry with backoff, as below
-//	FAILED_PRECONDITION without a      returned as is, no discovery and no
-//	usable trailer                     retry: the node answered that the
-//	                                   request contradicts its log (a usable
-//	                                   trailer names another node of the
-//	                                   group; "no known leader" is UNAVAILABLE)
+//	FAILED_PRECONDITION + unusable     treated as not leader: rediscover and
+//	trailer (unknown node or the       retry with backoff, as below
+//	node itself), or a usable
+//	trailer after that redirect
+//	FAILED_PRECONDITION with no        returned as is, no discovery and no
+//	leader trailer                     retry: the node answered that the
+//	                                   request contradicts its log (only a
+//	                                   node that is not the leader sets the
+//	                                   trailer; "no known leader" is
+//	                                   UNAVAILABLE)
 //	UNAVAILABLE, connection errors,    ask every node for NodeService.Status
 //	attempt DEADLINE_EXCEEDED          in parallel, adopt the leader they
 //	                                   report, and retry with backoff
@@ -88,7 +91,7 @@ type Metrics struct {
 // Retry reasons.
 const (
 	ReasonRedirect     = "redirect"        // FAILED_PRECONDITION with a leader trailer
-	ReasonNotLeader    = "not_leader"      // FAILED_PRECONDITION with a usable trailer after this Call already redirected
+	ReasonNotLeader    = "not_leader"      // FAILED_PRECONDITION with an unusable trailer, or a usable one after this Call already redirected
 	ReasonUnavailable  = "unavailable"     // UNAVAILABLE or a connection error
 	ReasonAttemptTimer = "attempt_timeout" // the attempt's own deadline passed
 )
@@ -198,13 +201,12 @@ func (g *Group) Call(ctx context.Context, rpc RPC) error {
 			g.markFailed(start)
 			return ctxError(ctx)
 		case code == codes.FailedPrecondition:
-			hint := g.usableHint(trailer, target)
-			if hint == "" {
+			if len(trailer.Get(LeaderTrailer)) == 0 {
 				// Not a leadership problem: the node refused the request.
 				g.markAnswered()
 				return err
 			}
-			if !redirected {
+			if hint := g.usableHint(trailer, target); hint != "" && !redirected {
 				redirected = true
 				g.markFailed(start)
 				g.m.Retries.Inc(g.name, ReasonRedirect)

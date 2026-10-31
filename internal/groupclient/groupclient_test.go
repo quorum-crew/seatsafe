@@ -212,22 +212,29 @@ func TestSecondRedirectFallsBackToDiscovery(t *testing.T) {
 }
 
 func TestUnusableTrailer(t *testing.T) {
-	// A trailer naming an unknown node or the node itself is no redirect: the
-	// answer goes back to the caller, with no discovery and no retry.
+	// A trailer naming an unknown node or the node itself is no redirect, but
+	// it still says the node is not the leader: rediscover and retry.
 	for _, hint := range []string{"stranger:7000", "n0:7000"} {
 		g := newTestGroup(t, 2, Config{})
-		g.nodes[0].set(redirectTo(hint), role(leaderRole, 1, ""))
-		if _, err := g.book(ctxFor(t, time.Second)); status.Code(err) != codes.FailedPrecondition {
-			t.Fatalf("%s: got %v", hint, err)
+		g.nodes[0].set(func(ctx context.Context) error {
+			g.nodes[1].set(nil, role(leaderRole, 2, "")) // leadership moves as n0 refuses
+			return redirectTo(hint)(ctx)
+		}, role(leaderRole, 1, ""))
+		got, err := g.book(ctxFor(t, time.Second))
+		if err != nil || got != "n1:7000" {
+			t.Fatalf("%s: answered by %q, %v (want the rediscovered leader)", hint, got, err)
 		}
-		if g.nodes[0].calls.Load() != 1 || g.nodes[1].calls.Load() != 0 {
-			t.Fatalf("%s: calls n0=%d n1=%d, want 1 and 0", hint, g.nodes[0].calls.Load(), g.nodes[1].calls.Load())
+		if g.nodes[0].calls.Load() != 1 || g.nodes[1].calls.Load() != 1 {
+			t.Fatalf("%s: calls n0=%d n1=%d, want 1 and 1", hint, g.nodes[0].calls.Load(), g.nodes[1].calls.Load())
 		}
-		if g.m.Retries.Value("g", ReasonRedirect) != 0 || g.m.Retries.Value("g", ReasonNotLeader) != 0 {
-			t.Fatalf("%s: trailer followed or retried", hint)
+		if g.m.Retries.Value("g", ReasonRedirect) != 0 || g.m.Retries.Value("g", ReasonNotLeader) != 1 {
+			t.Fatalf("%s: redirect %v, not_leader %v, want 0 and 1", hint, g.m.Retries.Value("g", ReasonRedirect), g.m.Retries.Value("g", ReasonNotLeader))
 		}
-		if g.nodes[0].stats.Load() != 1 || g.nodes[1].stats.Load() != 1 {
-			t.Fatalf("%s: status calls n0=%d n1=%d, want only the first discovery", hint, g.nodes[0].stats.Load(), g.nodes[1].stats.Load())
+		if g.nodes[0].stats.Load() != 2 || g.nodes[1].stats.Load() != 2 {
+			t.Fatalf("%s: status calls n0=%d n1=%d, want a second discovery round", hint, g.nodes[0].stats.Load(), g.nodes[1].stats.Load())
+		}
+		if g.Leader() != "n1:7000" || g.m.LeaderRecovery.Count("g") != 1 {
+			t.Fatalf("%s: leader %q, recovery count %d", hint, g.Leader(), g.m.LeaderRecovery.Count("g"))
 		}
 	}
 }
