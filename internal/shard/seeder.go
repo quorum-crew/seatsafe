@@ -116,6 +116,9 @@ func (s *Seeder) proposeMissing(ctx context.Context, src SeedSource) error {
 		pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		res, err := s.Node.Propose(pctx, data)
 		cancel()
+		if errors.Is(err, raftnode.ErrLeadershipLost) {
+			return errNotLeader // the next leader carries on from NextMissingChunk
+		}
 		if err != nil {
 			return fmt.Errorf("propose chunk %d: %w", chunk, err)
 		}

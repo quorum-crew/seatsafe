@@ -372,3 +372,48 @@ func TestSeederRefusesDifferentSeed(t *testing.T) {
 		t.Fatalf("seed status = %s done=%v, want v1 done", version, done)
 	}
 }
+
+// An RPC with no client deadline must not hang when the leader it reached is
+// deposed before the write commits (#10): it gets UNAVAILABLE promptly, and a
+// retry with the same request_id on the new leader is safe.
+func TestBookFailsFastWhenLeaderIsDeposed(t *testing.T) {
+	c := startShard(t, fakeSeed{version: "v1", chunks: 1}, false)
+	c.waitSeeded()
+	oldID, old := c.leader()
+	client := seatsafev1.NewShardServiceClient(conn(t, old.addr))
+
+	c.net.Isolate(oldID) // its Raft traffic is cut; gRPC to it still works
+	errc := make(chan error, 1)
+	go func() {
+		_, err := client.Book(context.Background(), // no deadline
+			&seatsafev1.ShardBookRequest{RequestId: "req-1", UserId: "alice", Seats: []*seatsafev1.SeatRef{seat(0, 1)}})
+		errc <- err
+	}()
+	select {
+	case err := <-errc:
+		if status.Code(err) != codes.Unavailable {
+			t.Fatalf("Book on a deposed leader returned %v, want UNAVAILABLE", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Book with no deadline is still hanging after the leader was deposed")
+	}
+
+	c.net.Heal()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, lead := c.leader()
+		resp, err := seatsafev1.NewShardServiceClient(conn(t, lead.addr)).Book(ctx5(t),
+			&seatsafev1.ShardBookRequest{RequestId: "req-1", UserId: "alice", Seats: []*seatsafev1.SeatRef{seat(0, 1)}})
+		if err == nil {
+			if resp.Outcome != seatsafev1.BookingOutcome_BOOKING_OUTCOME_CONFIRMED {
+				t.Fatalf("retry of req-1: %v", resp)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("retry of req-1 kept failing: %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	c.waitIdentical()
+}

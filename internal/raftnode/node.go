@@ -69,6 +69,12 @@ type Config struct {
 // ErrStopped is returned for calls on a node that has been stopped.
 var ErrStopped = errors.New("raftnode: stopped")
 
+// ErrLeadershipLost is returned by Propose when the group's leader changed (or
+// this node stopped being leader) before the proposal was applied here. The
+// entry may or may not commit later, so callers retry with the same request ID
+// and let the state machine's dedup sort it out.
+var ErrLeadershipLost = errors.New("raftnode: leadership changed before the proposal was applied")
+
 // Status is a point-in-time view of the node.
 type Status struct {
 	ID      uint64
@@ -101,7 +107,11 @@ type Node struct {
 	applied atomic.Uint64
 
 	mu      sync.Mutex
-	waiters map[uint64]chan any
+	waiters map[uint64]chan outcome
+
+	// Owned by the run loop: the leader and role from the last SoftState.
+	lead     uint64
+	isLeader bool
 
 	stop     chan struct{}
 	done     chan struct{}
@@ -153,7 +163,7 @@ func Start(cfg Config) (*Node, error) {
 	n := &Node{
 		cfg:     cfg,
 		storage: storage,
-		waiters: make(map[uint64]chan any),
+		waiters: make(map[uint64]chan outcome),
 		stop:    make(chan struct{}),
 		done:    make(chan struct{}),
 	}
@@ -286,15 +296,36 @@ func (n *Node) handleReady(rd raft.Ready) error {
 		}
 		n.applied.Store(e.Index)
 	}
+
+	// 4. A leadership change after applying, so results committed in this
+	//    Ready still reach their callers: anything still waiting may never
+	//    commit, so fail it now instead of letting it wait for its deadline.
+	if n.leadershipChanged(rd.SoftState) {
+		n.failPending(ErrLeadershipLost)
+	}
 	return nil
+}
+
+// leadershipChanged records a SoftState change and reports whether pending
+// proposals should be failed: the known leader changed, or this node stopped
+// being leader.
+func (n *Node) leadershipChanged(ss *raft.SoftState) bool {
+	if ss == nil {
+		return false
+	}
+	wasLeader := n.isLeader
+	changed := ss.Lead != n.lead || (wasLeader && ss.RaftState != raft.StateLeader)
+	n.lead, n.isLeader = ss.Lead, ss.RaftState == raft.StateLeader
+	return changed
 }
 
 // Propose appends data to the log and waits until this node has applied it,
 // returning the result of StateMachine.Apply.
 //
-// If leadership changes, an entry can be lost before it commits; Propose then
-// waits until ctx is done. Callers retry with the same request ID, and the
-// state machine's dedup makes the retry safe.
+// If the leader changes before the entry is applied here, Propose returns
+// ErrLeadershipLost right away rather than waiting for ctx: the entry may
+// have been lost. Callers retry with the same request ID, and the state
+// machine's dedup makes the retry safe.
 func (n *Node) Propose(ctx context.Context, data []byte) (any, error) {
 	id, ch := n.register()
 	defer n.forget(id)
@@ -306,8 +337,8 @@ func (n *Node) Propose(ctx context.Context, data []byte) (any, error) {
 		return nil, err // e.g. raft.ErrProposalDropped when there is no leader
 	}
 	select {
-	case res := <-ch:
-		return res, nil
+	case out := <-ch:
+		return out.val, out.err
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-n.stop:
@@ -361,8 +392,14 @@ func (n *Node) Stop() {
 // register picks a random proposal ID. IDs only need to be unique among the
 // proposals currently waiting on this node; 64 random bits make a clash with
 // an older entry still in the log vanishingly unlikely.
-func (n *Node) register() (uint64, chan any) {
-	ch := make(chan any, 1)
+// outcome is what a waiting Propose receives: the apply result, or an error.
+type outcome struct {
+	val any
+	err error
+}
+
+func (n *Node) register() (uint64, chan outcome) {
+	ch := make(chan outcome, 1)
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	for {
@@ -386,7 +423,17 @@ func (n *Node) deliver(id uint64, res any) {
 	delete(n.waiters, id)
 	n.mu.Unlock()
 	if ok {
-		ch <- res // buffered, never blocks
+		ch <- outcome{val: res} // buffered, never blocks
+	}
+}
+
+// failPending fails every proposal still waiting on this node.
+func (n *Node) failPending(err error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for id, ch := range n.waiters {
+		ch <- outcome{err: err} // buffered, never blocks
+		delete(n.waiters, id)
 	}
 }
 
