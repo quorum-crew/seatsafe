@@ -65,9 +65,15 @@ func run() error {
 	}
 	defer tr.Close()
 
+	timing, err := raftTimingFromEnv()
+	if err != nil {
+		return err
+	}
+
 	sm := seatsm.New()
 	node, err := raftnode.Start(raftnode.Config{
 		ID: raftID, Peers: ids, SM: shard.Applier{SM: sm}, Transport: tr, Store: store,
+		TickInterval: timing.tick, ElectionTicks: timing.election, HeartbeatTicks: timing.heartbeat,
 	})
 	if err != nil {
 		return err
@@ -113,7 +119,8 @@ func run() error {
 	defer stop()
 	go (&shard.Seeder{Node: node, SM: sm, Load: seedLoader(uint32(shardID)), Logf: log.Printf}).Run(ctx)
 
-	log.Printf("storage %s: shard %d, raft id %d, peers %v", info.NodeID, shardID, raftID, addrs)
+	log.Printf("storage %s: shard %d, raft id %d, peers %v, raft tick %v, election %d ticks, heartbeat %d ticks",
+		info.NodeID, shardID, raftID, addrs, timing.tick, timing.election, timing.heartbeat)
 	<-ctx.Done()
 
 	log.Printf("storage %s: shutting down", info.NodeID)
@@ -151,6 +158,49 @@ func parsePeers(nodeID, peers string) (self uint64, ids []uint64, addrs map[uint
 		return 0, nil, nil, fmt.Errorf("NODE_ID %q is not a host in PEERS %q", nodeID, peers)
 	}
 	return self, ids, addrs, nil
+}
+
+// raftTiming is the Raft clock: how often the node ticks, and how many ticks
+// make an election timeout and a heartbeat interval.
+type raftTiming struct {
+	tick      time.Duration
+	election  int
+	heartbeat int
+}
+
+// raftTimingFromEnv reads RAFT_TICK_MS, RAFT_ELECTION_TICKS and
+// RAFT_HEARTBEAT_TICKS. Unset variables keep raftnode's defaults (100 ms, 10
+// ticks, 1 tick). etcd/raft requires the election timeout to be longer than
+// the heartbeat interval.
+func raftTimingFromEnv() (raftTiming, error) {
+	tickMS, err := positiveIntEnv("RAFT_TICK_MS", 100)
+	if err != nil {
+		return raftTiming{}, err
+	}
+	election, err := positiveIntEnv("RAFT_ELECTION_TICKS", 10)
+	if err != nil {
+		return raftTiming{}, err
+	}
+	heartbeat, err := positiveIntEnv("RAFT_HEARTBEAT_TICKS", 1)
+	if err != nil {
+		return raftTiming{}, err
+	}
+	if election <= heartbeat {
+		return raftTiming{}, fmt.Errorf("RAFT_ELECTION_TICKS (%d) must be greater than RAFT_HEARTBEAT_TICKS (%d)", election, heartbeat)
+	}
+	return raftTiming{tick: time.Duration(tickMS) * time.Millisecond, election: election, heartbeat: heartbeat}, nil
+}
+
+func positiveIntEnv(key string, def int) (int, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("%s must be a positive whole number, got %q", key, v)
+	}
+	return n, nil
 }
 
 func getenv(key, def string) string {
