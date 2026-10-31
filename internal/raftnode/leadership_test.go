@@ -3,10 +3,12 @@ package raftnode
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"go.etcd.io/raft/v3"
+	"go.etcd.io/raft/v3/raftpb"
 )
 
 // proposeAsync proposes with no deadline, as an RPC from a client without one
@@ -94,4 +96,121 @@ func TestCommittedResultsSurviveLeaderChange(t *testing.T) {
 	}
 	c.net.Heal()
 	c.waitApplied(21)
+}
+
+// electionGate is a LogStore that stands in for a slow fsync. Once armed, it
+// holds the Save of the Ready that makes its node leader until a proposal is
+// waiting on that node: Status already says leader there, so this is what a
+// client that proposes the moment it sees a new leader runs into.
+type electionGate struct {
+	recordingStore
+	node   atomic.Pointer[Node]
+	armed  *atomic.Bool
+	result chan error
+}
+
+func (g *electionGate) Save(hs raftpb.HardState, ents []raftpb.Entry, snap raftpb.Snapshot, mustSync bool) error {
+	n := g.node.Load()
+	if n != nil && len(ents) > 0 && n.Status().IsLeader() && g.armed.CompareAndSwap(true, false) {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, err := n.Propose(ctx, []byte("first-proposal-to-the-new-leader"))
+			g.result <- err
+		}()
+		for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+			n.mu.Lock()
+			waiting := len(n.waiters)
+			n.mu.Unlock()
+			if waiting > 0 {
+				break
+			}
+		}
+	}
+	return g.recordingStore.Save(hs, ents, snap, mustSync)
+}
+
+// A node that wins an election has lost nothing. A proposal that reaches it
+// while the Ready carrying its leadership is still being persisted must commit,
+// not fail with ErrLeadershipLost.
+func TestProposalDuringElectionIsNotFailed(t *testing.T) {
+	net := NewNetwork()
+	t.Cleanup(net.Close)
+	peers := []uint64{1, 2, 3}
+	armed := &atomic.Bool{}
+	result := make(chan error, 1)
+	nodes := map[uint64]*Node{}
+	for _, id := range peers {
+		g := &electionGate{armed: armed, result: result}
+		n, err := Start(Config{ID: id, Peers: peers, SM: &logSM{}, Transport: net, Store: g,
+			TickInterval: 10 * time.Millisecond, Logger: quiet})
+		if err != nil {
+			t.Fatal(err)
+		}
+		g.node.Store(n)
+		net.Add(id, n)
+		nodes[id] = n
+		t.Cleanup(n.Stop)
+	}
+	c := &cluster{t: t, nodes: nodes}
+
+	for round := range 10 {
+		old := c.waitLeader()
+		net.Isolate(old)
+		armed.Store(true) // the isolated leader appends nothing, so only a new leader can trip this
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Fatalf("election %d: proposal to the new leader failed: %v", round, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("election %d: no new leader saved its first entry", round)
+		}
+		net.Heal()
+	}
+}
+
+// What a SoftState update does to a proposal waiting on the node, for every
+// transition. Only winning an election with no known leader leaves it waiting.
+func TestLeadershipTransitions(t *testing.T) {
+	const self, other, third = 1, 2, 3
+	for _, tc := range []struct {
+		name     string
+		lead     uint64
+		isLeader bool
+		ss       *raft.SoftState
+		fails    bool
+	}{
+		{name: "no SoftState", lead: other},
+		{name: "candidate with no leader", ss: &raft.SoftState{RaftState: raft.StateCandidate}},
+		{name: "none to self", ss: &raft.SoftState{Lead: self, RaftState: raft.StateLeader}},
+		{name: "old leader to self", lead: other, ss: &raft.SoftState{Lead: self, RaftState: raft.StateLeader}, fails: true},
+		{name: "none to other", ss: &raft.SoftState{Lead: other, RaftState: raft.StateFollower}, fails: true},
+		{name: "known leader to none", lead: other, ss: &raft.SoftState{RaftState: raft.StateCandidate}, fails: true},
+		{name: "known leader to another", lead: other, ss: &raft.SoftState{Lead: third, RaftState: raft.StateFollower}, fails: true},
+		{name: "self steps down to none", lead: self, isLeader: true, ss: &raft.SoftState{RaftState: raft.StateFollower}, fails: true},
+		{name: "self deposed by other", lead: self, isLeader: true, ss: &raft.SoftState{Lead: other, RaftState: raft.StateFollower}, fails: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			n := &Node{cfg: Config{ID: self}, storage: raft.NewMemoryStorage(), waiters: map[uint64]chan outcome{},
+				lead: tc.lead, isLeader: tc.isLeader}
+			_, ch := n.register()
+			if err := n.handleReady(raft.Ready{SoftState: tc.ss}); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case out := <-ch:
+				if !tc.fails {
+					t.Fatalf("waiter failed with %v, want it left waiting", out.err)
+				}
+				if !errors.Is(out.err, ErrLeadershipLost) {
+					t.Fatalf("waiter got %v, want ErrLeadershipLost", out.err)
+				}
+			default:
+				if tc.fails {
+					t.Fatal("waiter left waiting, want ErrLeadershipLost")
+				}
+			}
+		})
+	}
 }
