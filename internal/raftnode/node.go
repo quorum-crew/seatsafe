@@ -78,12 +78,13 @@ var ErrLeadershipLost = errors.New("raftnode: leadership changed before the prop
 
 // Status is a point-in-time view of the node.
 type Status struct {
-	ID      uint64
-	Leader  uint64 // 0 = no known leader
-	Term    uint64
-	Role    raft.StateType
-	Commit  uint64
-	Applied uint64
+	ID        uint64
+	Leader    uint64 // 0 = no known leader
+	Term      uint64
+	Role      raft.StateType
+	LastIndex uint64 // index of the last entry in this node's log
+	Commit    uint64
+	Applied   uint64
 
 	// Followers is filled on the leader only: how far each follower's log
 	// has caught up. Used for replication-lag metrics.
@@ -375,6 +376,9 @@ func (n *Node) Status() Status {
 		Role:    st.RaftState,
 		Commit:  st.Commit,
 		Applied: n.applied.Load(),
+	}
+	if last, err := n.storage.LastIndex(); err == nil {
+		out.LastIndex = last
 	}
 	for id, pr := range st.Progress {
 		if id != n.cfg.ID {

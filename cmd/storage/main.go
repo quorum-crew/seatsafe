@@ -28,6 +28,7 @@ import (
 
 	"google.golang.org/grpc"
 
+	"github.com/quorum-crew/seatsafe/internal/raftmetrics"
 	"github.com/quorum-crew/seatsafe/internal/raftnode"
 	"github.com/quorum-crew/seatsafe/internal/raftstore"
 	"github.com/quorum-crew/seatsafe/internal/seatsm"
@@ -96,9 +97,10 @@ func run() error {
 		}
 	}()
 
-	// HTTP: /healthz (process is up), /readyz (leader known and shard seeded), /metrics.
+	// HTTP: /healthz (process is up), /readyz (leader known and shard seeded),
+	// /metrics (including Raft role, log positions and, on the leader, follower lag).
 	mux := http.NewServeMux()
-	mux.Handle("/", server.Handler(info))
+	mux.Handle("/", server.Handler(info, raftmetrics.Writer(strconv.FormatUint(shardID, 10), info.NodeID, node, raftmetrics.NamesFromAddrs(addrs))))
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
 		st := node.Status()
 		_, applied, total, seeded := sm.SeedStatus()
