@@ -1,0 +1,28 @@
+# Benchmark override, used by scripts/bench.sh on top of docker-compose.yml.
+#
+# RAFT_SNAPSHOT_ENTRIES keeps snapshots from stalling the Raft loop during runs,
+# until snapshots move off the loop (a #26 follow-up). Nodes only read it once
+# #26 is merged; before that no snapshots are taken at all.
+#
+# Seeding 1M seats takes longer than the default health check allows, so these
+# services get 10 minutes to report ready.
+x-bench-env: &bench-env
+  RAFT_SNAPSHOT_ENTRIES: "1000000"
+
+x-ready: &ready
+  healthcheck:
+    test: ["CMD", "wget", "-qO-", "http://localhost:8080/readyz"]
+    interval: 2s
+    timeout: 2s
+    retries: 300
+
+services:
+  shard1-node1: { <<: *ready, environment: *bench-env }
+  shard1-node2: { <<: *ready, environment: *bench-env }
+  shard1-node3: { <<: *ready, environment: *bench-env }
+  shard2-node1: { <<: *ready, environment: *bench-env }
+  shard2-node2: { <<: *ready, environment: *bench-env }
+  shard2-node3: { <<: *ready, environment: *bench-env }
+  shard3-node1: { <<: *ready, environment: *bench-env }
+  shard3-node2: { <<: *ready, environment: *bench-env }
+  shard3-node3: { <<: *ready, environment: *bench-env }

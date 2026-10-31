@@ -12,3 +12,6 @@ deploy/shardmap.json
 deploy/shardmap.local.json
 deploy/seed/*.json
 .proto-out.*
+
+# Load generator output
+results/

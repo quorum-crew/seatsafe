@@ -3,6 +3,7 @@ module github.com/quorum-crew/seatsafe
 go 1.24
 
 require (
+	github.com/HdrHistogram/hdrhistogram-go v1.1.2
 	github.com/cockroachdb/pebble v1.1.5
 	go.etcd.io/raft/v3 v3.6.0
 	google.golang.org/grpc v1.72.0
