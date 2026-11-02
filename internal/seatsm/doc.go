@@ -67,8 +67,8 @@
 //
 // # Snapshots
 //
-// Snapshot encodes every piece of state above plus AppliedIndex as one
-// format version byte followed by JSON whose lists are sorted by key.
-// Restore validates the snapshot, including CheckInvariants, and replaces
-// all state.
+// Snapshot encodes every piece of state above plus AppliedIndex as one format
+// version byte followed by the compact binary format, whose lists are sorted
+// by key (snapshot_compact.go). Restore also reads the older JSON format. It
+// validates the snapshot, including CheckInvariants, and replaces all state.
 package seatsm
