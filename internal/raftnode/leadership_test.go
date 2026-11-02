@@ -192,9 +192,9 @@ func TestLeadershipTransitions(t *testing.T) {
 		{name: "self deposed by other", lead: self, isLeader: true, ss: &raft.SoftState{Lead: other, RaftState: raft.StateFollower}, fails: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			n := &Node{cfg: Config{ID: self}, storage: raft.NewMemoryStorage(), waiters: map[uint64]chan outcome{},
+			n := &Node{cfg: Config{ID: self}, storage: raft.NewMemoryStorage(), waiters: map[uint64]waiter{},
 				lead: tc.lead, isLeader: tc.isLeader}
-			_, ch := n.register()
+			_, ch := n.register(nil)
 			if err := n.handleReady(raft.Ready{SoftState: tc.ss}); err != nil {
 				t.Fatal(err)
 			}
@@ -212,5 +212,62 @@ func TestLeadershipTransitions(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// With no known leader, Propose fails at once instead of waiting inside etcd
+// raft until a leader appears (#27).
+func TestProposeWithNoLeaderFailsFast(t *testing.T) {
+	c := newCluster(t, 3)
+	old := c.waitLeader()
+	c.net.Isolate(old)
+	deadline := time.Now().Add(5 * time.Second)
+	for c.nodes[old].Status().Leader != raft.None {
+		if time.Now().After(deadline) {
+			t.Fatal("isolated leader never gave up leadership")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	errc := proposeAsync(c.nodes[old], "no-leader")
+	if err := waitErr(t, errc, time.Second); !errors.Is(err, raft.ErrProposalDropped) {
+		t.Fatalf("Propose with no leader returned %v, want raft.ErrProposalDropped", err)
+	}
+}
+
+// A proposal already blocked inside raft.Propose (the leader went away just
+// after the check) is released by failPending (#27).
+func TestFailPendingReleasesBlockedPropose(t *testing.T) {
+	c := newCluster(t, 3)
+	old := c.waitLeader()
+	n := c.nodes[old]
+	c.net.Isolate(old)
+	deadline := time.Now().Add(5 * time.Second)
+	for n.Status().Leader != raft.None {
+		if time.Now().After(deadline) {
+			t.Fatal("isolated leader never gave up leadership")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	errc := make(chan error, 1)
+	go func() {
+		_, err := n.propose(context.Background(), []byte("blocked"), false)
+		errc <- err
+	}()
+	// Wait until it is registered (and so about to block in raft.Propose).
+	for deadline := time.Now().Add(time.Second); ; time.Sleep(time.Millisecond) {
+		n.mu.Lock()
+		waiting := len(n.waiters)
+		n.mu.Unlock()
+		if waiting > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("proposal never registered")
+		}
+	}
+	time.Sleep(50 * time.Millisecond) // let it reach raft.Propose
+	n.failPending(ErrLeadershipLost)
+	if err := waitErr(t, errc, time.Second); !errors.Is(err, ErrLeadershipLost) {
+		t.Fatalf("blocked proposal returned %v, want ErrLeadershipLost", err)
 	}
 }
