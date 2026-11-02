@@ -3,11 +3,13 @@ package shard
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -66,6 +68,7 @@ type shard struct {
 	addrs     map[uint64]string
 	dirs      map[uint64]string
 	nodes     map[uint64]*storageNode
+	lis       map[uint64]net.Listener // bound in startShard, until the node's first start
 }
 
 var ids = []uint64{1, 2, 3}
@@ -77,14 +80,13 @@ func startShard(t *testing.T, src SeedSource, durable bool) *shard {
 func startShardWith(t *testing.T, src SeedSource, durable bool, snapEvery uint64) *shard {
 	t.Helper()
 	c := &shard{t: t, src: src, durable: durable, snapEvery: snapEvery, net: raftnode.NewNetwork(),
-		addrs: map[uint64]string{}, dirs: map[uint64]string{}, nodes: map[uint64]*storageNode{}}
+		addrs: map[uint64]string{}, dirs: map[uint64]string{}, nodes: map[uint64]*storageNode{}, lis: map[uint64]net.Listener{}}
 	for _, id := range ids {
 		lis, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
-		c.addrs[id] = lis.Addr().String()
-		lis.Close() // the port is reused when the node starts
+		c.lis[id], c.addrs[id] = lis, lis.Addr().String() // stays open, so the port stays ours
 		c.dirs[id] = t.TempDir()
 	}
 	for _, id := range ids {
@@ -120,9 +122,11 @@ func (c *shard) start(id uint64) {
 		c.t.Fatal(err)
 	}
 	c.net.Add(id, n)
-	lis, err := net.Listen("tcp", c.addrs[id])
-	if err != nil {
-		c.t.Fatal(err)
+	lis, first := c.lis[id]
+	if first {
+		delete(c.lis, id)
+	} else {
+		lis = c.rebind(c.addrs[id])
 	}
 	gs := grpc.NewServer()
 	NewService(n, sm, c.addrs).Register(gs)
@@ -132,6 +136,24 @@ func (c *shard) start(id uint64) {
 	go (&Seeder{Node: n, SM: sm, Interval: 10 * time.Millisecond,
 		Load: func() (SeedSource, error) { return src, nil }, Logf: func(string, ...any) {}}).Run(ctx)
 	c.nodes[id] = &storageNode{node: n, sm: sm, store: store, gs: gs, addr: c.addrs[id], stop: cancel}
+}
+
+// rebind listens on addr again when a node restarts. Peers know the address,
+// so it must stay the same, but something else on the machine may hold the
+// freed port for a moment.
+func (c *shard) rebind(addr string) net.Listener {
+	c.t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		lis, err := net.Listen("tcp", addr)
+		if err == nil {
+			return lis
+		}
+		if !errors.Is(err, syscall.EADDRINUSE) || time.Now().After(deadline) {
+			c.t.Fatalf("restart: cannot rebind %s: %v", addr, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 func (c *shard) stop(id uint64) {

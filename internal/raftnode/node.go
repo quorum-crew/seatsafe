@@ -390,12 +390,19 @@ func (n *Node) maybeSnapshot() error {
 // leadershipChanged records a SoftState change and reports whether pending
 // proposals should be failed: the known leader changed, or this node stopped
 // being leader.
+//
+// Winning an election with no known leader is not a change: Status reports
+// leader before this Ready is persisted, so a proposal may already be waiting
+// here, accepted by this node as leader. Anything forwarded to the old leader
+// failed when that leader went away, and a proposal made with no known leader
+// was blocked in raft.Propose until now.
 func (n *Node) leadershipChanged(ss *raft.SoftState) bool {
 	if ss == nil {
 		return false
 	}
 	wasLeader := n.isLeader
-	changed := ss.Lead != n.lead || (wasLeader && ss.RaftState != raft.StateLeader)
+	gained := n.lead == raft.None && ss.Lead == n.cfg.ID
+	changed := (ss.Lead != n.lead && !gained) || (wasLeader && ss.RaftState != raft.StateLeader)
 	n.lead, n.isLeader = ss.Lead, ss.RaftState == raft.StateLeader
 	return changed
 }
