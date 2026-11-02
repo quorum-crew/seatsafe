@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"sync"
 
 	"github.com/cockroachdb/pebble"
 	"go.etcd.io/raft/v3"
@@ -45,12 +46,17 @@ func entryKey(index uint64) []byte {
 type Pebble struct {
 	db *pebble.DB
 
+	// mu serializes Save (the Raft loop) and SaveSnapshot (the apply
+	// goroutine).
+	mu sync.Mutex
 	// lastIndex is the index of the last entry on disk (or of the snapshot
 	// if there are no entries after it). Loaded on open and kept current by
 	// Save, so Save only writes a range deletion when new entries really
-	// truncate a conflicting tail. Save and SaveSnapshot are only called
-	// from the node's Raft loop, so no lock is needed.
+	// truncate a conflicting tail.
 	lastIndex uint64
+	// snapIndex is the index of the stored snapshot, so SaveSnapshot can
+	// ignore a snapshot older than one received from the leader meanwhile.
+	snapIndex uint64
 }
 
 // Open opens (or creates) the store in dir.
@@ -64,32 +70,32 @@ func open(dir string, opts *pebble.Options) (*Pebble, error) {
 		return nil, fmt.Errorf("raftstore: open %s: %w", dir, err)
 	}
 	p := &Pebble{db: db}
-	if p.lastIndex, err = p.loadLastIndex(); err != nil {
+	if p.lastIndex, p.snapIndex, err = p.loadIndexes(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("raftstore: open %s: %w", dir, err)
 	}
 	return p, nil
 }
 
-// loadLastIndex returns the index of the last entry on disk, or the
-// snapshot's index if no entry follows it, or 0 for a fresh store.
-func (p *Pebble) loadLastIndex() (uint64, error) {
+// loadIndexes returns the index of the last entry on disk (or the snapshot's
+// index if no entry follows it) and the snapshot's index; 0 for a fresh store.
+func (p *Pebble) loadIndexes() (last, snapIndex uint64, err error) {
 	var snap raftpb.Snapshot
 	if err := p.get(keySnapshot, snap.Unmarshal); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	it, err := p.db.NewIter(&pebble.IterOptions{LowerBound: entryKey(0), UpperBound: []byte{entryPrefix + 1}})
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer it.Close()
-	last := snap.Metadata.Index
+	last = snap.Metadata.Index
 	if it.Last() {
 		if i := binary.BigEndian.Uint64(it.Key()[1:]); i > last {
 			last = i
 		}
 	}
-	return last, it.Error()
+	return last, snap.Metadata.Index, it.Error()
 }
 
 // Save writes one Ready's HardState, new entries and snapshot in a single
@@ -101,6 +107,8 @@ func (p *Pebble) loadLastIndex() (uint64, error) {
 // only change is the commit index, which Raft can recompute after a crash)
 // the batch is committed without an fsync.
 func (p *Pebble) Save(hs raftpb.HardState, ents []raftpb.Entry, snap raftpb.Snapshot, mustSync bool) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	b := p.db.NewBatch()
 	defer b.Close()
 
@@ -121,8 +129,8 @@ func (p *Pebble) Save(hs raftpb.HardState, ents []raftpb.Entry, snap raftpb.Snap
 		}
 	}
 	newLast := p.lastIndex
-	if !raft.IsEmptySnap(snap) && snap.Metadata.Index > newLast {
-		newLast = snap.Metadata.Index
+	if !raft.IsEmptySnap(snap) {
+		newLast = snap.Metadata.Index // every entry was deleted above
 	}
 	if len(ents) > 0 {
 		for i := range ents {
@@ -168,13 +176,25 @@ func (p *Pebble) Save(hs raftpb.HardState, ents []raftpb.Entry, snap raftpb.Snap
 		return err
 	}
 	p.lastIndex = newLast
+	if !raft.IsEmptySnap(snap) {
+		p.snapIndex = snap.Metadata.Index
+	}
 	return nil
 }
 
 // SaveSnapshot durably stores a snapshot this node took of its own state and
 // drops entries up to and including compactTo (0 = none). Unlike a snapshot
 // received in Save, entries after it are kept: they are this node's own log.
+//
+// It runs on the node's apply goroutine while the Raft loop keeps saving. If
+// the loop already stored a newer snapshot from the leader, this one is
+// stale and is ignored: writing it would roll the snapshot back.
 func (p *Pebble) SaveSnapshot(snap raftpb.Snapshot, compactTo uint64) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if snap.Metadata.Index <= p.snapIndex {
+		return nil
+	}
 	data, err := snap.Marshal()
 	if err != nil {
 		return err
@@ -189,7 +209,11 @@ func (p *Pebble) SaveSnapshot(snap raftpb.Snapshot, compactTo uint64) error {
 			return err
 		}
 	}
-	return b.Commit(pebble.Sync)
+	if err := b.Commit(pebble.Sync); err != nil {
+		return err
+	}
+	p.snapIndex = snap.Metadata.Index
+	return nil
 }
 
 // Load returns everything saved, for restarting a node. A fresh store returns

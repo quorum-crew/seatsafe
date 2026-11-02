@@ -342,3 +342,44 @@ func TestConflictingTailDroppedAfterReopen(t *testing.T) {
 		}
 	}
 }
+
+// The node takes its own snapshots on the apply goroutine while the Raft loop
+// keeps saving. If the loop stores a newer snapshot from the leader first,
+// the node's older one must not roll it back, before or after a reopen.
+func TestOlderOwnSnapshotIgnored(t *testing.T) {
+	dir := t.TempDir()
+	p, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Save(raftpb.HardState{Term: 1, Commit: 10}, entries(1, 1, 10), raftpb.Snapshot{}, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Save(raftpb.HardState{Term: 2, Commit: 50}, nil, snapAt(50, "leader"), true); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.SaveSnapshot(snapAt(8, "own"), 5); err != nil {
+		t.Fatal(err)
+	}
+	check := func(when string) {
+		t.Helper()
+		_, snap, _, err := p.Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if snap.Metadata.Index != 50 || string(snap.Data) != "leader" {
+			t.Fatalf("%s: snapshot = index %d data %q, want the leader's at 50", when, snap.Metadata.Index, snap.Data)
+		}
+	}
+	check("before reopen")
+	p.Close()
+
+	if p, err = Open(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	if err := p.SaveSnapshot(snapAt(40, "own"), 0); err != nil {
+		t.Fatal(err)
+	}
+	check("after reopen")
+}
