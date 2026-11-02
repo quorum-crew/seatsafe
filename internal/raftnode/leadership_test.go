@@ -195,7 +195,7 @@ func TestLeadershipTransitions(t *testing.T) {
 			n := &Node{cfg: Config{ID: self}, storage: raft.NewMemoryStorage(), waiters: map[uint64]chan outcome{},
 				lead: tc.lead, isLeader: tc.isLeader}
 			_, ch := n.register()
-			if err := n.handleReady(raft.Ready{SoftState: tc.ss}); err != nil {
+			if err := n.apply(applyBatch{softState: tc.ss}); err != nil {
 				t.Fatal(err)
 			}
 			select {

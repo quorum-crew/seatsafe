@@ -1,7 +1,9 @@
 package raftnode
 
 import (
+	"context"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -111,4 +113,74 @@ func TestRestartAfterReceivingSnapshot(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	c.waitApplied(111)
+}
+
+// slowSnapSM stands in for a big state machine: at benchmark scale seatsm
+// takes about 2 s to encode an 83 MiB snapshot.
+type slowSnapSM struct {
+	logSM
+	slow atomic.Bool
+}
+
+func (s *slowSnapSM) Snapshot() ([]byte, error) {
+	if s.slow.Load() {
+		time.Sleep(time.Second)
+	}
+	return s.logSM.Snapshot()
+}
+
+// Taking a snapshot must not stop the Raft loop. The leader's snapshots here
+// take ten election timeouts; if they ran on the loop, it would send no
+// heartbeats meanwhile and the followers would elect someone else.
+func TestSlowSnapshotKeepsLeader(t *testing.T) {
+	net := NewNetwork()
+	t.Cleanup(net.Close)
+	peers := []uint64{1, 2, 3}
+	nodes := map[uint64]*Node{}
+	sms := map[uint64]*slowSnapSM{}
+	for _, id := range peers {
+		sms[id] = &slowSnapSM{}
+		n, err := Start(Config{ID: id, Peers: peers, SM: sms[id], Transport: net,
+			TickInterval: 10 * time.Millisecond, Logger: quiet, SnapshotEntries: 20, CatchUpEntries: 5})
+		if err != nil {
+			t.Fatal(err)
+		}
+		net.Add(id, n)
+		nodes[id] = n
+		t.Cleanup(n.Stop)
+	}
+	c := &cluster{t: t, nodes: nodes}
+	lead := c.waitLeader()
+	term := nodes[lead].Status().Term
+	sms[lead].slow.Store(true)
+
+	// Entry 20 or so triggers a snapshot on every node. Proposals keep
+	// committing while it runs; their results wait for the apply goroutine.
+	errc := make(chan error, 40)
+	for i := range 40 {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_, err := nodes[lead].Propose(ctx, []byte(fmt.Sprintf("e-%d", i)))
+			errc <- err
+		}()
+	}
+	deadline := time.Now().Add(2500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		for id, n := range nodes {
+			st := n.Status()
+			if st.Term != term || st.Leader != lead {
+				t.Fatalf("node %d: term %d leader %d during a snapshot, want term %d leader %d", id, st.Term, st.Leader, term, lead)
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	for range 40 {
+		if err := <-errc; err != nil {
+			t.Fatalf("proposal failed: %v", err)
+		}
+	}
+	if st := nodes[lead].Status(); st.SnapshotIndex == 0 {
+		t.Fatal("no snapshot was taken")
+	}
 }
