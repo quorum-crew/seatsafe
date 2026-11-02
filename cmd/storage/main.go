@@ -10,8 +10,13 @@
 //	HTTP_ADDR  health and metrics listen address (default :8080)
 //	DATA_DIR   Pebble directory for the Raft log (default /data)
 //	SEED_DIR   directory holding shard{N}.json (default /seed)
+//	RAFT_TICK_MS           Raft tick interval in milliseconds (default 100)
+//	RAFT_ELECTION_TICKS    ticks without a leader before an election (default 10)
+//	RAFT_HEARTBEAT_TICKS   ticks between leader heartbeats (default 1)
 //	RAFT_SNAPSHOT_ENTRIES  applied entries between snapshots (default 10000)
 //	RAFT_CATCHUP_ENTRIES   entries kept before a snapshot for catch-up (default 5000)
+//	GC_RETENTION_MS        how long finished request and txn records are kept
+//	                       for dedup before GC drops them (default 120000, 2 min)
 package main
 
 import (
@@ -80,6 +85,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	retentionMS, err := positiveIntEnv("GC_RETENTION_MS", int(shard.DefaultGCRetention/time.Millisecond))
+	if err != nil {
+		return err
+	}
+	retention := time.Duration(retentionMS) * time.Millisecond
 
 	sm := seatsm.New()
 	node, err := raftnode.Start(raftnode.Config{
@@ -131,10 +141,10 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	go (&shard.Seeder{Node: node, SM: sm, Load: seedLoader(uint32(shardID)), Logf: log.Printf}).Run(ctx)
-	go (&shard.Collector{Node: node, Logf: log.Printf}).Run(ctx)
+	go (&shard.Collector{Node: node, Logf: log.Printf, Retention: retention}).Run(ctx)
 
-	log.Printf("storage %s: shard %d, raft id %d, peers %v, raft tick %v, election %d ticks, heartbeat %d ticks, snapshot every %d entries keeping %d",
-		info.NodeID, shardID, raftID, addrs, timing.tick, timing.election, timing.heartbeat, snapEvery, catchUp)
+	log.Printf("storage %s: shard %d, raft id %d, peers %v, raft tick %v, election %d ticks, heartbeat %d ticks, snapshot every %d entries keeping %d, gc retention %v",
+		info.NodeID, shardID, raftID, addrs, timing.tick, timing.election, timing.heartbeat, snapEvery, catchUp, retention)
 	<-ctx.Done()
 
 	log.Printf("storage %s: shutting down", info.NodeID)

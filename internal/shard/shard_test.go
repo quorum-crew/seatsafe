@@ -516,15 +516,15 @@ func TestCollectorDropsRecordsOlderThanRetention(t *testing.T) {
 	a := seat(0, 1)
 	book(t, lead.addr, "req-old", "alice", a)
 
-	collectAt(t, lead.node, 5*time.Minute) // within the 10 min retention
+	collectAt(t, lead.node, time.Minute) // within the 2 min retention
 	if r := book(t, lead.addr, "req-old", "alice", a); !r.Replayed {
-		t.Fatalf("5 min later the retry was not replayed: %v", r)
+		t.Fatalf("1 min later the retry was not replayed: %v", r)
 	}
 
-	collectAt(t, lead.node, 11*time.Minute) // past the retention
+	collectAt(t, lead.node, 3*time.Minute) // past the retention
 	r := book(t, lead.addr, "req-old", "alice", a)
 	if r.Replayed || r.Outcome != seatsafev1.BookingOutcome_BOOKING_OUTCOME_SEAT_UNAVAILABLE {
-		t.Fatalf("11 min later req-old should be forgotten (seat still booked, no replay): %v", r)
+		t.Fatalf("3 min later req-old should be forgotten (seat still booked, no replay): %v", r)
 	}
 	c.waitIdentical() // every replica dropped the same records
 	if err := lead.sm.CheckInvariants(); err != nil {
@@ -593,10 +593,15 @@ func TestRestartFromSnapshot(t *testing.T) {
 	}
 }
 
-// A snapshot of a realistically full shard must fit through the transport's
-// 16 MiB gRPC limit with room to spare. The largest real shard has 23,400
-// seats; this uses 25,000 plus 20,000 remembered requests (#11).
-func TestRealisticSnapshotFitsGRPCLimit(t *testing.T) {
+// A shard at benchmark scale: 25,000 seats (the largest real shard has 23,400)
+// and 480,000 requests still remembered for dedup, about what a peak run
+// leaves inside the retention window. Its snapshot is far over the 16 MiB
+// gRPC limit (about 83 MiB), which is why snapshots are streamed in chunks
+// and taken off the Raft loop. The snapshot must restore to the same state.
+func TestBenchmarkScaleSnapshotRoundTrip(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds a 480,000-request state machine")
+	}
 	sm := seatsm.New()
 	index := uint64(0)
 	apply := func(cmd *seatsafev1.ShardCommand) seatsm.Result {
@@ -604,7 +609,7 @@ func TestRealisticSnapshotFitsGRPCLimit(t *testing.T) {
 		cmd.NowMs = int64(index)
 		return sm.Apply(index, cmd)
 	}
-	const sections, seatsPer = 25, 1000
+	const sections, seatsPer, requests = 25, 1000, 480000
 	for c := range sections {
 		var seats []*seatsafev1.SeatRef
 		for n := range seatsPer {
@@ -616,19 +621,37 @@ func TestRealisticSnapshotFitsGRPCLimit(t *testing.T) {
 			t.Fatal(r.Err)
 		}
 	}
-	for i := range 20000 { // 20,000 bookings, every one remembered for dedup
+	for i := range requests { // most lose the race for a seat; every one is remembered
 		s := &seatsafev1.SeatRef{EventId: "evt-flash", SectionId: fmt.Sprintf("sec-%03d", 100+i%sections),
 			SeatId: fmt.Sprintf("R%02d-S%03d", 1+(i/sections)%20, 1+(i/sections/20)%50)}
 		apply(&seatsafev1.ShardCommand{Op: &seatsafev1.ShardCommand_Book{Book: &seatsafev1.BookOp{
 			RequestId: fmt.Sprintf("00000000-0000-4000-8000-%012d", i), UserId: fmt.Sprintf("user-%d", i), Seats: []*seatsafev1.SeatRef{s}}}})
 	}
+	start := time.Now()
 	data, err := sm.Snapshot()
 	if err != nil {
 		t.Fatal(err)
 	}
-	const limit = transport.MaxMsgSize - 64<<10
-	t.Logf("snapshot of %d seats + 20,000 requests: %.1f MiB (limit %.1f MiB)", sections*seatsPer, float64(len(data))/(1<<20), float64(limit)/(1<<20))
-	if len(data) > limit/2 {
-		t.Fatalf("snapshot is %d bytes, more than half the %d byte limit: the limit or the format needs revisiting", len(data), limit)
+	encode := time.Since(start)
+
+	restored := seatsm.New()
+	start = time.Now()
+	if err := restored.Restore(data); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("snapshot of %d seats + %d requests: %.1f MiB, encode %v, restore %v",
+		sections*seatsPer, requests, float64(len(data))/(1<<20), encode.Round(time.Millisecond), time.Since(start).Round(time.Millisecond))
+	if len(data) <= transport.MaxMsgSize {
+		t.Logf("note: snapshot fits in one gRPC message; this test no longer covers the over-limit case")
+	}
+	if err := restored.CheckInvariants(); err != nil {
+		t.Fatal(err)
+	}
+	again, err := restored.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(again, data) {
+		t.Fatal("restored state machine snapshots differently from the original")
 	}
 }
