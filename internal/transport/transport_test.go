@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"go.etcd.io/raft/v3"
-	"go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
@@ -219,16 +218,18 @@ func TestRejectsWrongGroup(t *testing.T) {
 	}
 }
 
-// bigSM's snapshot carries a few MB of padding, like a seeded seatsm shard.
+// bigSM's snapshot carries pad bytes of padding, like a seatsm shard after a
+// long benchmark (83 MiB at 480,000 requests).
 type bigSM struct {
 	recordSM
+	pad      int
 	restores int
 }
 
 func (s *bigSM) Snapshot() ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	pad := make([]byte, 3<<20)
+	pad := make([]byte, s.pad)
 	return append([]byte(strings.Join(s.entries, "\n")+"\x00"), pad...), nil
 }
 
@@ -244,9 +245,9 @@ func (s *bigSM) Restore(data []byte) error {
 	return nil
 }
 
-// A follower that falls behind the compacted log catches up from a
-// multi-megabyte snapshot sent over real gRPC (#11). The snapshot travels in
-// its own RaftBatch.
+// A follower that falls behind the compacted log catches up from a snapshot
+// sent over real gRPC (#11). The snapshot is 40 MiB, well over the 16 MiB
+// gRPC message limit, so it only gets through as a stream of chunks.
 func TestSnapshotOverGRPC(t *testing.T) {
 	const group = 1
 	ids := []uint64{1, 2, 3}
@@ -267,7 +268,7 @@ func TestSnapshotOverGRPC(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		sm := &bigSM{}
+		sm := &bigSM{pad: 40 << 20}
 		n, err := raftnode.Start(raftnode.Config{ID: id, Peers: ids, SM: sm, Transport: tr,
 			TickInterval: 20 * time.Millisecond, Logger: quiet, SnapshotEntries: 20, CatchUpEntries: 5})
 		if err != nil {
@@ -317,13 +318,21 @@ func TestSnapshotOverGRPC(t *testing.T) {
 	}
 }
 
-func TestOversizedMessageDoesNotFit(t *testing.T) {
-	small := raftpb.Message{Type: raftpb.MsgSnap, Snapshot: &raftpb.Snapshot{Data: make([]byte, 1<<20)}}
-	huge := raftpb.Message{Type: raftpb.MsgSnap, Snapshot: &raftpb.Snapshot{Data: make([]byte, MaxMsgSize)}}
-	if !fitsInOneCall(small) {
-		t.Error("a 1 MiB snapshot should fit in one call")
+// A snapshot stream addressed to another Raft group is refused, like a batch.
+func TestSnapshotStreamRejectsWrongGroup(t *testing.T) {
+	members, addrs := startGroup(t)
+	waitLeader(t, members)
+	conn, err := grpc.NewClient(addrs[1], grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if fitsInOneCall(huge) {
-		t.Error("a snapshot at the gRPC limit must be reported, not sent")
+	defer conn.Close()
+	stream, err := seatsafev1.NewRaftTransportClient(conn).SendSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = stream.Send(&seatsafev1.SnapshotChunk{GroupId: 2, From: 1, Data: []byte("x")})
+	if _, err := stream.CloseAndRecv(); err == nil {
+		t.Fatal("a snapshot for group 2 was accepted by a group 1 node")
 	}
 }
