@@ -338,8 +338,8 @@ func PrintSummary(sum *Summary) string {
 		if !a.Pass {
 			verdict = "FAIL"
 		}
-		fmt.Fprintf(&b, "  audit %s: %d orders, %d confirmed seats, %d seats taken, %d unknown; double-booked %d, confirmed-but-free %d, unexplained %d\n",
-			verdict, a.Orders, a.ConfirmedSeats, a.SeatsTaken, a.UnknownOrders, a.DoubleBooked, a.StillFree, a.Unexplained)
+		fmt.Fprintf(&b, "  audit %s: %d orders, %d confirmed seats, %d seats taken, %d unknown; double-booked %d, confirmed-but-free %d, unexplained %d, confirmed-pre-booked %d\n",
+			verdict, a.Orders, a.ConfirmedSeats, a.SeatsTaken, a.UnknownOrders, a.DoubleBooked, a.StillFree, a.Unexplained, a.PreBooked)
 		for _, s := range a.Samples {
 			fmt.Fprintf(&b, "    %s\n", s)
 		}

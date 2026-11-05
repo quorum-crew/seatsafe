@@ -457,6 +457,15 @@ func TestAudit(t *testing.T) {
 	if gone.Pass || gone.Unexplained != 1 {
 		t.Fatalf("unexplained seat not caught: %+v", gone)
 	}
+
+	// Seat a was already booked before the run (not in before), and the
+	// cluster CONFIRMs it again. It is not free after, and rule c only looks
+	// at seats free before, so only rule d can catch it.
+	preBooked := map[Seat]bool{b: true, c: true, d: true}
+	again := RunAudit(preBooked, preBooked, []AuditOrder{{"r1", []Seat{a}, OutcomeConfirmed}})
+	if again.Pass || again.PreBooked != 1 || again.DoubleBooked != 0 || again.StillFree != 0 || again.Unexplained != 0 || len(again.Samples) != 1 {
+		t.Fatalf("confirmation of a pre-booked seat not caught: %+v", again)
+	}
 }
 
 func TestAvailability(t *testing.T) {

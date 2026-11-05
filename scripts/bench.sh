@@ -18,11 +18,16 @@
 #
 # Knobs: SECTIONS, ROWS, SEATS_PER_ROW (dataset), RATE (skip the ramp and use
 # this as the base rate), DURATION, USERS, RAMP_STEP, RAMP_STEP_DURATION,
-# RAMP_END, SLO.
+# RAMP_END, SLO, COMPOSE_PROJECT (compose project name, default seatsafe).
+#
+# Works from any directory and any checkout folder name: paths are resolved
+# from this script's location and the compose project name is set explicitly.
+# Only POSIX date/awk are used, so it runs on Linux, macOS and Git Bash.
 set -euo pipefail
 export MSYS_NO_PATHCONV=1
 
-cd "$(dirname "$0")/.."
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+cd "$ROOT"
 SECTIONS=${SECTIONS:-1000}
 ROWS=${ROWS:-20}
 SEATS_PER_ROW=${SEATS_PER_ROW:-50}
@@ -41,8 +46,9 @@ STAMP=$(date +%Y%m%d-%H%M%S)
 OUT=results/$STAMP
 mkdir -p "$OUT"
 COMMIT=$(git rev-parse HEAD 2>/dev/null || echo unknown)
-COMPOSE=(docker compose -f docker-compose.yml -f deploy/compose.bench.yml)
-NETWORK=seatsafe_seatsafe
+PROJECT=${COMPOSE_PROJECT:-seatsafe}
+COMPOSE=(docker compose -p "$PROJECT" -f "$ROOT/docker-compose.yml" -f "$ROOT/deploy/compose.bench.yml")
+NETWORK=${PROJECT}_seatsafe # the compose file's "seatsafe" network
 STORAGE=()
 for s in 1 2 3; do for n in 1 2 3; do STORAGE+=("shard$s-node$n"); done; done
 
@@ -50,8 +56,21 @@ echo "== dataset: $SECTIONS sections x $ROWS rows x $SEATS_PER_ROW seats"
 docker run --rm -v "$HOST:/src" -w /src -e CGO_ENABLED=0 golang:1.24 \
   go run ./cmd/datagen -out deploy -events 0 -flash-sections "$SECTIONS" -flash-rows "$ROWS" -flash-seats-per-row "$SEATS_PER_ROW" | tee "$OUT/dataset.txt"
 
-# seconds_between prints b - a for two docker log timestamps.
-seconds_between() { echo $(( $(date -d "$2" +%s%3N) - $(date -d "$1" +%s%3N) )) | awk '{printf "%.1f", $1/1000}'; }
+# seconds_between prints b - a, in seconds, for two RFC 3339 UTC timestamps
+# as docker logs --timestamps prints them (2026-10-31T22:15:16.123456789Z).
+# Plain awk arithmetic: no GNU date -d or %N, which macOS lacks.
+seconds_between() {
+  awk -v a="$1" -v b="$2" '
+    function epoch(ts,  y, m, d, era, yoe, doy, doe) {
+      y = substr(ts, 1, 4) + 0; m = substr(ts, 6, 2) + 0; d = substr(ts, 9, 2) + 0
+      y -= (m <= 2)
+      era = int(y / 400); yoe = y - era * 400
+      doy = int((153 * (m > 2 ? m - 3 : m + 9) + 2) / 5) + d - 1
+      doe = yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy
+      return (era * 146097 + doe - 719468) * 86400 + substr(ts, 12, 2) * 3600 + substr(ts, 15, 2) * 60 + substr(ts, 18) + 0
+    }
+    BEGIN { printf "%.1f", epoch(b) - epoch(a) }'
+}
 
 # fresh_cluster wipes everything, starts the cluster and times seeding.
 "${COMPOSE[@]}" build >/dev/null
@@ -73,14 +92,14 @@ fresh_cluster() {
       fi
     done
     echo "memory after seeding:"
-    docker stats --no-stream --format '  {{.Name}} {{.MemUsage}}' | grep seatsafe- | sort
+    docker stats --no-stream --format '  {{.Name}} {{.MemUsage}}' | grep "^  $PROJECT-" | sort
   } | tee "$OUT/seed-$label.txt"
 }
 
 # sample_stats appends docker stats to a file until killed.
 sample_stats() {
   while :; do
-    docker stats --no-stream --format '{{.Name}},{{.CPUPerc}},{{.MemUsage}}' 2>/dev/null | grep '^seatsafe' >>"$1" || true
+    docker stats --no-stream --format '{{.Name}},{{.CPUPerc}},{{.MemUsage}}' 2>/dev/null | grep "^$PROJECT-" >>"$1" || true
   done
 }
 
@@ -98,7 +117,7 @@ peaks() {
       if (c + 0 > cpu[$1] + 0) cpu[$1] = c
       if (m + 0 > mem[$1] + 0) mem[$1] = m }
     END { for (n in cpu) printf "| %s | %.0f%% | %.0f MiB |\n", n, cpu[n], mem[n] }
-  ' "$1" | sed 's/seatsafe-//; s/-1 |/ |/' | sort
+  ' "$1" | sed "s/$PROJECT-//; s/-1 |/ |/" | sort
 }
 
 # run_load label args...: one load generator run with docker stats alongside.
@@ -110,7 +129,7 @@ run_load() {
   mkdir -p "$dir"
   sample_stats "$dir/docker-stats.csv" &
   stats_pid=$!
-  docker run --rm --name seatsafe-loadgen --network "$NETWORK" \
+  docker run --rm --name "$PROJECT-loadgen" --network "$NETWORK" \
     -v "$HOST/deploy:/deploy:ro" -v "$HOST/$dir:/out" seatsafe:dev \
     loadgen -target router:7000 -shardmap /deploy/shardmap.json -seed-dir /deploy/seed \
     -out /out -label "$label" -git-commit "$COMMIT" "$@" | tee "$dir/console.txt" | grep -v '^ *[0-9]*s sent=' || true
@@ -123,7 +142,7 @@ run_load() {
   if [ -f "$dir/history.jsonl" ]; then
     docker run --rm -v "$HOST/$dir:/out:ro" seatsafe:dev checkhistory /out/history.jsonl | tee "$dir/checkhistory.txt" || AUDIT_FAILED=1
   fi
-  docker stats --no-stream --format '{{.Name}} {{.MemUsage}}' | grep '^seatsafe' | sort >"$dir/memory-after.txt"
+  docker stats --no-stream --format '{{.Name}} {{.MemUsage}}' | grep "^$PROJECT-" | sort >"$dir/memory-after.txt"
 }
 
 reset() { if [ "$RESET_BETWEEN" = 1 ]; then fresh_cluster "$1"; fi; }

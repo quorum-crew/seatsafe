@@ -80,6 +80,7 @@ type Audit struct {
 	DoubleBooked int      `json:"a_double_booked"`        // rule a
 	StillFree    int      `json:"b_confirmed_still_free"` // rule b
 	Unexplained  int      `json:"c_unexplained_taken"`    // rule c
+	PreBooked    int      `json:"d_confirmed_pre_booked"` // rule d
 	Samples      []string `json:"samples,omitempty"`
 }
 
@@ -89,13 +90,17 @@ func (a *Audit) sample(format string, args ...any) {
 	}
 }
 
-// RunAudit applies the three rules:
+// RunAudit applies the four rules:
 //
 //	a) no seat is in two CONFIRMED orders with different request_ids
 //	b) every seat of a CONFIRMED order is no longer available
 //	c) every seat that became unavailable belongs to a CONFIRMED or UNKNOWN order
+//	d) every seat of a CONFIRMED order was available before the run: confirming
+//	   a seat that was already booked is a double booking against state the
+//	   run did not create (reruns with RESET_BETWEEN=0, fault injection)
 //
-// before and after are the free seats around the run.
+// before and after are the free seats around the run, read over every section
+// the workload can book.
 func RunAudit(before, after map[Seat]bool, orders []AuditOrder) *Audit {
 	a := &Audit{Orders: len(orders)}
 	owner := make(map[Seat]string)
@@ -111,6 +116,10 @@ func RunAudit(before, after map[Seat]bool, orders []AuditOrder) *Audit {
 					a.sample("seat %s CONFIRMED by %s and %s", s, prev, o.RequestID)
 				}
 				owner[s] = o.RequestID
+				if !before[s] {
+					a.PreBooked++
+					a.sample("seat %s CONFIRMED by %s but already unavailable before the run", s, o.RequestID)
+				}
 				if after[s] {
 					a.StillFree++
 					a.sample("seat %s CONFIRMED by %s but still available", s, o.RequestID)
@@ -133,6 +142,6 @@ func RunAudit(before, after map[Seat]bool, orders []AuditOrder) *Audit {
 			a.sample("seat %s became unavailable with no CONFIRMED or UNKNOWN order", s)
 		}
 	}
-	a.Pass = a.DoubleBooked == 0 && a.StillFree == 0 && a.Unexplained == 0
+	a.Pass = a.DoubleBooked == 0 && a.StillFree == 0 && a.Unexplained == 0 && a.PreBooked == 0
 	return a
 }
