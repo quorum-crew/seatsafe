@@ -47,7 +47,9 @@ OUT=results/$STAMP
 mkdir -p "$OUT"
 COMMIT=$(git rev-parse HEAD 2>/dev/null || echo unknown)
 PROJECT=${COMPOSE_PROJECT:-seatsafe}
-COMPOSE=(docker compose -p "$PROJECT" -f "$ROOT/docker-compose.yml" -f "$ROOT/deploy/compose.bench.yml")
+# Relative to $ROOT (the cd above): absolute POSIX paths break Docker on Git
+# Bash, where MSYS_NO_PATHCONV stops their conversion.
+COMPOSE=(docker compose -p "$PROJECT" -f docker-compose.yml -f deploy/compose.bench.yml)
 NETWORK=${PROJECT}_seatsafe # the compose file's "seatsafe" network
 STORAGE=()
 for s in 1 2 3; do for n in 1 2 3; do STORAGE+=("shard$s-node$n"); done; done
