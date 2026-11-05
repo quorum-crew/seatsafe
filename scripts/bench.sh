@@ -94,7 +94,7 @@ fresh_cluster() {
       fi
     done
     echo "memory after seeding:"
-    docker stats --no-stream --format '  {{.Name}} {{.MemUsage}}' | grep "^  $PROJECT-" | sort
+    docker stats --no-stream --format '  {{.Name}} {{.MemUsage}}' | grep "^ *$PROJECT-" | sort
   } | tee "$OUT/seed-$label.txt"
 }
 
