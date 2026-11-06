@@ -158,6 +158,10 @@ type Node struct {
 	// SoftState it processed.
 	lead     uint64
 	isLeader bool
+	// knownLead is lead for Propose to read without a round trip to the
+	// Raft goroutine. Written by the apply goroutine before it fails
+	// pending proposals for that SoftState.
+	knownLead atomic.Uint64
 	// Owned by the apply goroutine: the current membership (for snapshot
 	// metadata).
 	confState raftpb.ConfState
@@ -566,6 +570,7 @@ func (n *Node) leadershipChanged(ss *raft.SoftState) bool {
 	gained := n.lead == raft.None && ss.Lead == n.cfg.ID
 	changed := (ss.Lead != n.lead && !gained) || (wasLeader && ss.RaftState != raft.StateLeader)
 	n.lead, n.isLeader = ss.Lead, ss.RaftState == raft.StateLeader
+	n.knownLead.Store(ss.Lead)
 	return changed
 }
 
@@ -593,8 +598,12 @@ func (n *Node) propose(ctx context.Context, data []byte, checkLeader bool) (any,
 	defer n.forget(id)
 
 	// Registered first, so a leader lost after this check is caught: its
-	// SoftState reaches failPending only after this waiter exists.
-	if checkLeader && n.raft.Status().Lead == raft.None {
+	// SoftState reaches failPending only after this waiter exists. The
+	// cached leader is enough while one is known; only when it shows none
+	// does Propose ask Raft, whose view is ahead of the applied SoftState
+	// (a node that just won an election accepts proposals before its first
+	// leader SoftState is applied).
+	if checkLeader && n.knownLead.Load() == raft.None && n.raft.Status().Lead == raft.None {
 		return nil, raft.ErrProposalDropped
 	}
 	if err := n.raft.Propose(pctx, encode(id, data)); err != nil {

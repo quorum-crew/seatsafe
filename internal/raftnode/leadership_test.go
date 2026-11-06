@@ -216,13 +216,15 @@ func TestLeadershipTransitions(t *testing.T) {
 }
 
 // With no known leader, Propose fails at once instead of waiting inside etcd
-// raft until a leader appears (#27).
+// raft until a leader appears (#27). The test waits until the node has also
+// applied the SoftState that lost the leader: before that, Propose still
+// takes the cached leader and the proposal is failed by failPending instead.
 func TestProposeWithNoLeaderFailsFast(t *testing.T) {
 	c := newCluster(t, 3)
 	old := c.waitLeader()
 	c.net.Isolate(old)
 	deadline := time.Now().Add(5 * time.Second)
-	for c.nodes[old].Status().Leader != raft.None {
+	for c.nodes[old].Status().Leader != raft.None || c.nodes[old].knownLead.Load() != raft.None {
 		if time.Now().After(deadline) {
 			t.Fatal("isolated leader never gave up leadership")
 		}
@@ -242,7 +244,7 @@ func TestFailPendingReleasesBlockedPropose(t *testing.T) {
 	n := c.nodes[old]
 	c.net.Isolate(old)
 	deadline := time.Now().Add(5 * time.Second)
-	for n.Status().Leader != raft.None {
+	for n.Status().Leader != raft.None || n.knownLead.Load() != raft.None {
 		if time.Now().After(deadline) {
 			t.Fatal("isolated leader never gave up leadership")
 		}
