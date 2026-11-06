@@ -24,7 +24,6 @@ import (
 	"github.com/quorum-crew/seatsafe/internal/raftnode"
 	"github.com/quorum-crew/seatsafe/internal/raftstore"
 	"github.com/quorum-crew/seatsafe/internal/seatsm"
-	"github.com/quorum-crew/seatsafe/internal/transport"
 )
 
 // fakeSeed is a seed file whose chunk i is section sec-<i> with 10 seats.
@@ -242,15 +241,34 @@ func ctx5(t *testing.T) context.Context {
 	return ctx
 }
 
+// book books through the node at addr and, like the router, retries with the
+// same request ID when the leader changes under it: UNAVAILABLE is retried
+// in place, and a redirect is followed. Slow fsyncs under -race with 10 ms
+// ticks make a leader step down now and then.
 func book(t *testing.T, addr, req, user string, seats ...*seatsafev1.SeatRef) *seatsafev1.BookSeatsResponse {
 	t.Helper()
-	resp, err := seatsafev1.NewShardServiceClient(conn(t, addr)).Book(ctx5(t),
-		&seatsafev1.ShardBookRequest{RequestId: req, UserId: user, Seats: seats})
-	if err != nil {
+	ctx := ctx5(t)
+	for {
+		var trailer metadata.MD
+		resp, err := seatsafev1.NewShardServiceClient(conn(t, addr)).Book(ctx,
+			&seatsafev1.ShardBookRequest{RequestId: req, UserId: user, Seats: seats}, grpc.Trailer(&trailer))
+		if err == nil {
+			return resp
+		}
+		switch leader := trailer.Get(LeaderTrailer); {
+		case ctx.Err() != nil:
+		case status.Code(err) == codes.Unavailable:
+			time.Sleep(20 * time.Millisecond)
+			continue
+		case status.Code(err) == codes.FailedPrecondition && len(leader) > 0 && leader[0] != "":
+			addr = leader[0]
+			continue
+		}
 		t.Fatalf("book %s: %v", req, err)
 	}
-	return resp
 }
+
+var _ raftnode.SnapshotCapturer = Applier{}
 
 func TestSeedsEveryReplica(t *testing.T) {
 	c := startShard(t, fakeSeed{version: "v1", chunks: 5}, false)
@@ -595,9 +613,9 @@ func TestRestartFromSnapshot(t *testing.T) {
 
 // A shard at benchmark scale: 25,000 seats (the largest real shard has 23,400)
 // and 480,000 requests still remembered for dedup, about what a peak run
-// leaves inside the retention window. Its snapshot is far over the 16 MiB
-// gRPC limit (about 83 MiB), which is why snapshots are streamed in chunks
-// and taken off the Raft loop. The snapshot must restore to the same state.
+// leaves inside the retention window. The snapshot must restore to the same
+// state. It was 83 MiB in the JSON format and is about 6 MiB in the compact
+// one (#29); TestSnapshotOverGRPC covers snapshots over the gRPC limit.
 func TestBenchmarkScaleSnapshotRoundTrip(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds a 480,000-request state machine")
@@ -641,9 +659,6 @@ func TestBenchmarkScaleSnapshotRoundTrip(t *testing.T) {
 	}
 	t.Logf("snapshot of %d seats + %d requests: %.1f MiB, encode %v, restore %v",
 		sections*seatsPer, requests, float64(len(data))/(1<<20), encode.Round(time.Millisecond), time.Since(start).Round(time.Millisecond))
-	if len(data) <= transport.MaxMsgSize {
-		t.Logf("note: snapshot fits in one gRPC message; this test no longer covers the over-limit case")
-	}
 	if err := restored.CheckInvariants(); err != nil {
 		t.Fatal(err)
 	}

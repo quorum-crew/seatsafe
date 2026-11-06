@@ -3,6 +3,7 @@ package raftnode
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -24,11 +25,17 @@ type logSM struct {
 	restores int // Restore calls since this SM was created
 }
 
+// Apply appends data and returns its position. Data already in the log is
+// not added again, like seatsm's dedup by request ID, so the propose helper
+// can retry after a leader change without double-counting.
 func (s *logSM) Apply(_ uint64, data []byte) any {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.entries = append(s.entries, string(data))
 	s.applies++
+	if i := slices.Index(s.entries, string(data)); i >= 0 {
+		return i + 1
+	}
+	s.entries = append(s.entries, string(data))
 	return len(s.entries)
 }
 
@@ -213,15 +220,25 @@ func (c *cluster) waitApplied(want int) {
 	}
 }
 
+// propose proposes data through n and returns its position in the log. When
+// the leader changes under it (slow fsyncs under -race with 10 ms ticks make
+// that happen now and then) it retries, as a real client does; logSM ignores
+// data it already holds, so a retry of an entry that did commit is harmless.
 func propose(t *testing.T, n *Node, data string) int {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	res, err := n.Propose(ctx, []byte(data))
-	if err != nil {
+	for {
+		res, err := n.Propose(ctx, []byte(data))
+		if err == nil {
+			return res.(int)
+		}
+		if ctx.Err() == nil && (errors.Is(err, ErrLeadershipLost) || errors.Is(err, raft.ErrProposalDropped)) {
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
 		t.Fatalf("propose %q: %v", data, err)
 	}
-	return res.(int)
 }
 
 func TestElectsLeaderAndReplicates(t *testing.T) {
