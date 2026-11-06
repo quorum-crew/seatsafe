@@ -212,20 +212,106 @@ func TestSecondRedirectFallsBackToDiscovery(t *testing.T) {
 }
 
 func TestUnusableTrailer(t *testing.T) {
-	g := newTestGroup(t, 2, Config{})
-	g.nodes[0].set(redirectTo("stranger:7000"), role(leaderRole, 1, ""))
-	var n atomic.Int32
-	g.nodes[0].set(func(ctx context.Context) error {
-		if n.Add(1) == 1 {
-			return redirectTo("stranger:7000")(ctx)
+	// A trailer naming an unknown node or the node itself is no redirect, but
+	// it still says the node is not the leader: rediscover and retry.
+	for _, hint := range []string{"stranger:7000", "n0:7000"} {
+		g := newTestGroup(t, 2, Config{})
+		g.nodes[0].set(func(ctx context.Context) error {
+			g.nodes[1].set(nil, role(leaderRole, 2, "")) // leadership moves as n0 refuses
+			return redirectTo(hint)(ctx)
+		}, role(leaderRole, 1, ""))
+		got, err := g.book(ctxFor(t, time.Second))
+		if err != nil || got != "n1:7000" {
+			t.Fatalf("%s: answered by %q, %v (want the rediscovered leader)", hint, got, err)
 		}
-		return nil
-	}, nil)
-	if _, err := g.book(ctxFor(t, time.Second)); err != nil {
+		if g.nodes[0].calls.Load() != 1 || g.nodes[1].calls.Load() != 1 {
+			t.Fatalf("%s: calls n0=%d n1=%d, want 1 and 1", hint, g.nodes[0].calls.Load(), g.nodes[1].calls.Load())
+		}
+		if g.m.Retries.Value("g", ReasonRedirect) != 0 || g.m.Retries.Value("g", ReasonNotLeader) != 1 {
+			t.Fatalf("%s: redirect %v, not_leader %v, want 0 and 1", hint, g.m.Retries.Value("g", ReasonRedirect), g.m.Retries.Value("g", ReasonNotLeader))
+		}
+		if g.nodes[0].stats.Load() != 2 || g.nodes[1].stats.Load() != 2 {
+			t.Fatalf("%s: status calls n0=%d n1=%d, want a second discovery round", hint, g.nodes[0].stats.Load(), g.nodes[1].stats.Load())
+		}
+		if g.Leader() != "n1:7000" || g.m.LeaderRecovery.Count("g") != 1 {
+			t.Fatalf("%s: leader %q, recovery count %d", hint, g.Leader(), g.m.LeaderRecovery.Count("g"))
+		}
+	}
+}
+
+func TestFailedPreconditionWithoutTrailerIsFinal(t *testing.T) {
+	g := newTestGroup(t, 3, Config{})
+	g.nodes[0].set(nil, role(leaderRole, 1, ""))
+	if _, err := g.book(ctxFor(t, time.Second)); err != nil { // warms the leader cache
 		t.Fatal(err)
 	}
-	if g.m.Retries.Value("g", ReasonRedirect) != 0 || g.m.Retries.Value("g", ReasonNotLeader) != 1 {
-		t.Fatal("a trailer naming an unknown node was followed")
+	stats := func() (n int32) {
+		for _, nd := range g.nodes {
+			n += nd.stats.Load()
+		}
+		return n
+	}
+	before := stats()
+
+	g.nodes[0].set(refuse(codes.FailedPrecondition), nil) // e.g. Commit of an aborted txn
+	if _, err := g.book(ctxFor(t, time.Second)); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("got %v", err)
+	}
+	if g.nodes[0].calls.Load() != 2 || g.nodes[1].calls.Load() != 0 || g.nodes[2].calls.Load() != 0 {
+		t.Fatal("retried")
+	}
+	if got := stats(); got != before {
+		t.Fatalf("%d discovery status calls, want none", got-before)
+	}
+	for _, reason := range []string{ReasonRedirect, ReasonNotLeader, ReasonUnavailable, ReasonAttemptTimer} {
+		if g.m.Retries.Value("g", reason) != 0 {
+			t.Fatalf("counted a %s retry", reason)
+		}
+	}
+	if g.Leader() != "n0:7000" || g.m.LeaderRecovery.Count("g") != 0 {
+		t.Fatalf("leader %q, recovery count %d: a final answer is not a failure", g.Leader(), g.m.LeaderRecovery.Count("g"))
+	}
+}
+
+func TestRecoveryCoversFailedAttempt(t *testing.T) {
+	const (
+		attempt  = 100 * time.Millisecond
+		discover = 40 * time.Millisecond
+	)
+	g := newTestGroup(t, 3, Config{AttemptTimeout: attempt, StatusTimeout: 500 * time.Millisecond})
+	// n0 leads, then hangs on the next write until the attempt deadline; while
+	// it hangs n1 takes over, and finding it takes a slow Status round.
+	var moved atomic.Bool
+	g.nodes[0].set(func(ctx context.Context) error {
+		moved.Store(true)
+		<-ctx.Done()
+		return ctx.Err()
+	}, func() *seatsafev1.NodeStatus {
+		if moved.Load() {
+			return &seatsafev1.NodeStatus{Role: followerRole, Term: 2, LeaderAddr: "n1:7000"}
+		}
+		return &seatsafev1.NodeStatus{Role: leaderRole, Term: 1}
+	})
+	g.nodes[1].set(nil, func() *seatsafev1.NodeStatus {
+		if moved.Load() {
+			time.Sleep(discover)
+			return &seatsafev1.NodeStatus{Role: leaderRole, Term: 2}
+		}
+		return &seatsafev1.NodeStatus{Role: followerRole, Term: 1}
+	})
+
+	start := time.Now()
+	got, err := g.book(ctxFor(t, 5*time.Second))
+	waited := time.Since(start)
+	if err != nil || got != "n1:7000" {
+		t.Fatalf("answered by %q, %v", got, err)
+	}
+	if g.m.LeaderRecovery.Count("g") != 1 {
+		t.Fatalf("recovery count %d", g.m.LeaderRecovery.Count("g"))
+	}
+	rec := time.Duration(g.m.LeaderRecovery.Sum("g") * float64(time.Second))
+	if rec < attempt+discover || rec > waited {
+		t.Fatalf("recorded recovery %v, want between attempt timeout + discovery (%v) and the caller's wait (%v)", rec, attempt+discover, waited)
 	}
 }
 

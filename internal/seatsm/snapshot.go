@@ -5,16 +5,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 
 	seatsafev1 "github.com/quorum-crew/seatsafe/gen/seatsafe/v1"
 )
 
-// snapshotVersion is the first byte of every snapshot.
-const snapshotVersion byte = 1
+// The first byte of a snapshot is its format. Snapshot writes the compact
+// format (snapshot_compact.go). Restore also reads JSON, because stores and
+// followers can hold snapshots written before the compact format existed.
+const (
+	snapshotVersion byte = 1 // JSON
+	compactVersion  byte = 2
+)
 
-// The JSON shapes below hold only slices, each sorted by key, so the same
-// state always encodes to the same bytes.
+// The JSON shape of format 1.
 
 type snapFile struct {
 	AppliedIndex uint64        `json:"applied_index"`
@@ -66,17 +69,6 @@ type snapTxn struct {
 	DecidedAt   int64     `json:"decided_at,omitempty"`
 }
 
-func toSnapRefs(keys []seatKey) []snapRef {
-	if len(keys) == 0 {
-		return nil
-	}
-	out := make([]snapRef, len(keys))
-	for i, k := range keys {
-		out[i] = snapRef{k.event, k.section, k.seat}
-	}
-	return out
-}
-
 func fromSnapRefs(rs []snapRef) []seatKey {
 	if len(rs) == 0 {
 		return nil
@@ -93,56 +85,7 @@ func fromSnapRefs(rs []snapRef) []seatKey {
 func (m *Machine) Snapshot() ([]byte, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-
-	f := snapFile{
-		AppliedIndex: m.applied,
-		Seed:         snapSeed{Version: m.seedVersion, Total: m.seedTotal, Chunks: []uint32{}},
-		Sections:     make([]snapSection, 0, len(m.sections)),
-		Reqs:         make([]snapReq, 0, len(m.reqs)),
-		Txns:         make([]snapTxn, 0, len(m.txns)),
-	}
-	for c := range m.seedChunks {
-		f.Seed.Chunks = append(f.Seed.Chunks, c)
-	}
-	sort.Slice(f.Seed.Chunks, func(i, j int) bool { return f.Seed.Chunks[i] < f.Seed.Chunks[j] })
-
-	for sk, sec := range m.sections {
-		ss := snapSection{Event: sk.event, Section: sk.section, Seats: make([]snapSeat, len(sec.sorted))}
-		for i, st := range sec.sorted {
-			ss.Seats[i] = snapSeat{ID: st.id, State: int32(st.state), Owner: st.owner, User: st.user}
-		}
-		f.Sections = append(f.Sections, ss)
-	}
-	sort.Slice(f.Sections, func(i, j int) bool {
-		a, b := f.Sections[i], f.Sections[j]
-		if a.Event != b.Event {
-			return a.Event < b.Event
-		}
-		return a.Section < b.Section
-	})
-
-	for id, r := range m.reqs {
-		sr := snapReq{ID: id, AppliedAt: r.appliedAt, OrderID: r.resp.OrderId, Outcome: int32(r.resp.Outcome), CrossShard: r.resp.CrossShard}
-		for _, u := range r.resp.UnavailableSeats {
-			sr.Unavailable = append(sr.Unavailable, snapRef{u.EventId, u.SectionId, u.SeatId})
-		}
-		f.Reqs = append(f.Reqs, sr)
-	}
-	sort.Slice(f.Reqs, func(i, j int) bool { return f.Reqs[i].ID < f.Reqs[j].ID })
-
-	for id, t := range m.txns {
-		f.Txns = append(f.Txns, snapTxn{
-			ID: id, Status: int(t.status), User: t.user, Seats: toSnapRefs(t.seats), HoldExpires: t.holdExpires,
-			Vote: int32(t.vote), Conflicts: toSnapRefs(t.conflicts), DecidedAt: t.decidedAt,
-		})
-	}
-	sort.Slice(f.Txns, func(i, j int) bool { return f.Txns[i].ID < f.Txns[j].ID })
-
-	body, err := json.Marshal(f)
-	if err != nil {
-		return nil, fmt.Errorf("seatsm: encode snapshot: %w", err)
-	}
-	return append([]byte{snapshotVersion}, body...), nil
+	return compress(encodeCompact(m.state)), nil
 }
 
 // Restore replaces all state, AppliedIndex included, with a snapshot. On
@@ -151,18 +94,21 @@ func (m *Machine) Restore(data []byte) error {
 	if len(data) == 0 {
 		return errors.New("seatsm: empty snapshot")
 	}
-	if data[0] != snapshotVersion {
-		return fmt.Errorf("seatsm: snapshot format %d, want %d", data[0], snapshotVersion)
+	var s *state
+	var err error
+	switch data[0] {
+	case snapshotVersion:
+		s, err = decodeJSON(data[1:])
+	case compactVersion:
+		s, err = decodeCompact(data[1:])
+	default:
+		err = fmt.Errorf("seatsm: snapshot format %d, want %d or %d", data[0], snapshotVersion, compactVersion)
 	}
-	var f snapFile
-	dec := json.NewDecoder(bytes.NewReader(data[1:]))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&f); err != nil {
-		return fmt.Errorf("seatsm: decode snapshot: %w", err)
-	}
-	s, err := fromSnap(f)
 	if err != nil {
 		return err
+	}
+	if err := s.check(); err != nil {
+		return fmt.Errorf("seatsm: snapshot rejected: %w", err)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -170,18 +116,32 @@ func (m *Machine) Restore(data []byte) error {
 	return nil
 }
 
-func fromSnap(f snapFile) (*state, error) {
-	s := newState()
-	s.applied = f.AppliedIndex
-	s.seedVersion, s.seedTotal = f.Seed.Version, f.Seed.Total
-	for _, c := range f.Seed.Chunks {
-		if c >= s.seedTotal {
-			return nil, fmt.Errorf("seatsm: snapshot seed chunk %d of %d out of range", c, s.seedTotal)
+// setSeed restores seed progress, whichever format it came from.
+func (s *state) setSeed(version string, total uint32, chunks []uint32) error {
+	s.seedVersion, s.seedTotal = version, total
+	for _, c := range chunks {
+		if c >= total {
+			return fmt.Errorf("seatsm: snapshot seed chunk %d of %d out of range", c, total)
 		}
 		s.seedChunks[c] = struct{}{}
 	}
-	if (s.seedVersion == "") != (s.seedTotal == 0) || (s.seedVersion == "" && len(s.seedChunks) > 0) {
-		return nil, errors.New("seatsm: snapshot seed progress is inconsistent")
+	if (version == "") != (total == 0) || (version == "" && len(chunks) > 0) {
+		return errors.New("seatsm: snapshot seed progress is inconsistent")
+	}
+	return nil
+}
+
+func decodeJSON(body []byte) (*state, error) {
+	var f snapFile
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&f); err != nil {
+		return nil, fmt.Errorf("seatsm: decode snapshot: %w", err)
+	}
+	s := newState()
+	s.applied = f.AppliedIndex
+	if err := s.setSeed(f.Seed.Version, f.Seed.Total, f.Seed.Chunks); err != nil {
+		return nil, err
 	}
 
 	for _, ss := range f.Sections {
@@ -226,10 +186,6 @@ func fromSnap(f snapFile) (*state, error) {
 		if status == txnPrepared {
 			s.prepared[st.ID] = t
 		}
-	}
-
-	if err := s.check(); err != nil {
-		return nil, fmt.Errorf("seatsm: snapshot rejected: %w", err)
 	}
 	return s, nil
 }

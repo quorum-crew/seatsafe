@@ -314,7 +314,7 @@ func TestSnapshotCanonical(t *testing.T) {
 func TestRestoreRejectsBadSnapshots(t *testing.T) {
 	h := newHarness(t, true)
 	h.applyAll(prepCmd(1, "t1", 9, a1))
-	good := h.snap()
+	good := mustSnapshotV1(t, h.m) // these cases edit the JSON of format 1
 	body := string(good[1:])
 
 	replace := func(old, new string) []byte {
@@ -337,7 +337,7 @@ func TestRestoreRejectsBadSnapshots(t *testing.T) {
 		"invariant broken":   replace(`"id":"s1","st":2`, `"id":"s1","st":1`),
 	}
 	h.applyAll(bookCmd(2, "r1", a2))
-	good2 := h.snap()
+	good2 := mustSnapshotV1(t, h.m)
 	cases["duplicate req"] = bytes.Replace(good2, []byte(`"reqs":[`), []byte(`"reqs":[{"id":"r1","applied_at":1,"order_id":"r1","outcome":1},`), 1)
 
 	for name, data := range cases {
