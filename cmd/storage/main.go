@@ -13,7 +13,7 @@
 //	RAFT_TICK_MS           Raft tick interval in milliseconds (default 100)
 //	RAFT_ELECTION_TICKS    ticks without a leader before an election (default 10)
 //	RAFT_HEARTBEAT_TICKS   ticks between leader heartbeats (default 1)
-//	RAFT_SNAPSHOT_ENTRIES  applied entries between snapshots (default 10000)
+//	RAFT_SNAPSHOT_ENTRIES  applied entries between snapshots (default 100000)
 //	RAFT_CATCHUP_ENTRIES   entries kept before a snapshot for catch-up (default 5000)
 //	GC_RETENTION_MS        how long finished request and txn records are kept
 //	                       for dedup before GC drops them (default 120000, 2 min)

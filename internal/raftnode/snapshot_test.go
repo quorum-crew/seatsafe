@@ -2,6 +2,7 @@ package raftnode
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -115,8 +116,9 @@ func TestRestartAfterReceivingSnapshot(t *testing.T) {
 	c.waitApplied(111)
 }
 
-// slowSnapSM stands in for a big state machine: at benchmark scale seatsm
-// takes about 2 s to encode an 83 MiB snapshot.
+// slowSnapSM stands in for a big state machine without SnapshotCapturer: its
+// whole Snapshot runs on the apply goroutine (seatsm took 1 to 2 s at the
+// 1M-seat benchmark).
 type slowSnapSM struct {
 	logSM
 	slow atomic.Bool
@@ -183,4 +185,66 @@ func TestSlowSnapshotKeepsLeader(t *testing.T) {
 	if st := nodes[lead].Status(); st.SnapshotIndex == 0 {
 		t.Fatal("no snapshot was taken")
 	}
+}
+
+// capSM copies its entries to capture and encodes slowly, like seatsm at
+// benchmark scale (a 175 ms copy, then a 1 s encode).
+type capSM struct {
+	logSM
+	encodeDelay time.Duration
+	encodes     atomic.Int32
+}
+
+func (s *capSM) CaptureSnapshot() func() ([]byte, error) {
+	s.mu.Lock()
+	entries := append([]string(nil), s.entries...)
+	s.mu.Unlock()
+	return func() ([]byte, error) {
+		time.Sleep(s.encodeDelay)
+		s.encodes.Add(1)
+		return json.Marshal(entries)
+	}
+}
+
+// Encoding a snapshot must not hold up applying: with a 1 s encode every 20
+// entries, proposals must keep completing quickly. Encoding on the apply
+// goroutine made every Propose behind it wait, which cut benchmark throughput
+// by more than half.
+func TestSlowSnapshotEncodeDoesNotStallApply(t *testing.T) {
+	net := NewNetwork()
+	t.Cleanup(net.Close)
+	peers := []uint64{1, 2, 3}
+	nodes := map[uint64]*Node{}
+	sms := map[uint64]*capSM{}
+	for _, id := range peers {
+		sms[id] = &capSM{encodeDelay: time.Second}
+		n, err := Start(Config{ID: id, Peers: peers, SM: sms[id], Transport: net,
+			TickInterval: 10 * time.Millisecond, Logger: quiet, SnapshotEntries: 20, CatchUpEntries: 5})
+		if err != nil {
+			t.Fatal(err)
+		}
+		net.Add(id, n)
+		nodes[id] = n
+		t.Cleanup(n.Stop)
+	}
+	c := &cluster{t: t, nodes: nodes}
+	lead := c.waitLeader()
+
+	var slowest time.Duration
+	for i := range 100 {
+		start := time.Now()
+		propose(t, nodes[lead], fmt.Sprintf("e-%d", i))
+		slowest = max(slowest, time.Since(start))
+	}
+	if slowest > 400*time.Millisecond {
+		t.Fatalf("slowest proposal took %v while snapshots encoded for 1 s each", slowest)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for sms[lead].encodes.Load() == 0 || nodes[lead].Status().SnapshotIndex == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("no snapshot was finished")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Logf("slowest proposal %v; snapshot at %d", slowest, nodes[lead].Status().SnapshotIndex)
 }

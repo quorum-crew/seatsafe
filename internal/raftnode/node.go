@@ -26,7 +26,8 @@ import (
 )
 
 // StateMachine is applied to committed entries in log order, from a single
-// goroutine (the node's apply goroutine, never the Raft loop). Apply must be deterministic: the same entries in the same order
+// goroutine (the node's apply goroutine, never the Raft loop). Apply must be
+// deterministic: the same entries in the same order
 // must produce the same state and the same results on every replica, so it
 // must not read clocks, use randomness, or depend on map iteration order.
 type StateMachine interface {
@@ -34,11 +35,21 @@ type StateMachine interface {
 	// proposer, if it is waiting on this node, receives from Propose.
 	Apply(index uint64, data []byte) any
 	// Snapshot serializes the full state at the last applied entry. It is
-	// called from the apply goroutine, so it may take a while without
-	// holding up heartbeats or elections.
+	// called from the apply goroutine, so applying waits for it (heartbeats
+	// and elections do not). A state machine whose snapshots are slow should
+	// also implement SnapshotCapturer.
 	Snapshot() ([]byte, error)
 	// Restore replaces the full state with a snapshot.
 	Restore(data []byte) error
+}
+
+// SnapshotCapturer is an optional StateMachine method for state machines
+// whose snapshots take long to encode. CaptureSnapshot is called on the apply
+// goroutine and should be cheap (a copy of the state); the function it
+// returns encodes that copy and runs on another goroutine while applying
+// continues. It must return what Snapshot would have at the capture.
+type SnapshotCapturer interface {
+	CaptureSnapshot() func() ([]byte, error)
 }
 
 // LogStore persists what Raft needs to survive a restart. raftstore.Pebble
@@ -53,9 +64,9 @@ type LogStore interface {
 	Load() (raftpb.HardState, raftpb.Snapshot, []raftpb.Entry, error)
 	// SaveSnapshot durably stores a snapshot this node took of its own state
 	// and drops log entries up to and including compactTo (0 = keep all).
-	// Entries after the snapshot are kept. It is called from the apply
-	// goroutine, concurrently with Save, and must ignore a snapshot older
-	// than one Save already stored.
+	// Entries after the snapshot are kept. It is called off the Raft loop,
+	// concurrently with Save, must not hold Save up while it syncs, and must
+	// ignore a snapshot older than one Save already stored.
 	SaveSnapshot(snap raftpb.Snapshot, compactTo uint64) error
 }
 
@@ -87,9 +98,11 @@ type Config struct {
 	CatchUpEntries uint64 // default DefaultCatchUpEntries
 }
 
-// Snapshot defaults (design doc: snapshot every 10,000 applied entries).
+// Snapshot defaults, as etcd's (SnapshotCount 100,000, catch-up 5,000). At
+// benchmark load a shard applies about 5,000 entries a second, so 10,000 meant
+// a snapshot of a 334k-seat shard every 2 s.
 const (
-	DefaultSnapshotEntries = 10000
+	DefaultSnapshotEntries = 100000
 	DefaultCatchUpEntries  = 5000
 )
 
@@ -146,9 +159,15 @@ type Node struct {
 	lead     uint64
 	isLeader bool
 	// Owned by the apply goroutine: the current membership (for snapshot
-	// metadata) and the index of the newest snapshot.
+	// metadata).
 	confState raftpb.ConfState
-	snapIndex uint64
+	// The index of the newest snapshot, own or received. Raised by the
+	// apply goroutine and the snapshot goroutine, never lowered.
+	snapIndex atomic.Uint64
+	// snapshotting is set while a snapshot goroutine runs (one at a time);
+	// snapshots waits for it at Stop.
+	snapshotting atomic.Bool
+	snapshots    sync.WaitGroup
 
 	stop     chan struct{}
 	done     chan struct{}
@@ -249,7 +268,8 @@ func (n *Node) loadState(rc *raft.Config) (bool, error) {
 			return false, fmt.Errorf("raftnode: restore state machine: %w", err)
 		}
 		n.applied.Store(snap.Metadata.Index)
-		n.confState, n.snapIndex = snap.Metadata.ConfState, snap.Metadata.Index
+		n.confState = snap.Metadata.ConfState
+		n.snapIndex.Store(snap.Metadata.Index)
 	}
 	if err := n.storage.SetHardState(hs); err != nil {
 		return false, fmt.Errorf("raftnode: load hard state: %w", err)
@@ -273,6 +293,7 @@ func (n *Node) run() {
 	defer func() {
 		n.applyq.close()
 		<-applied
+		n.snapshots.Wait() // the caller may close the store once Stop returns
 	}()
 
 	ticker := time.NewTicker(n.cfg.TickInterval)
@@ -386,7 +407,8 @@ func (n *Node) apply(b applyBatch) error {
 			return fmt.Errorf("restore state machine: %w", err)
 		}
 		n.applied.Store(b.snap.Metadata.Index)
-		n.confState, n.snapIndex = b.snap.Metadata.ConfState, b.snap.Metadata.Index
+		n.confState = b.snap.Metadata.ConfState
+		raiseTo(&n.snapIndex, b.snap.Metadata.Index)
 		n.log.Infof("raftnode %d: restored snapshot at index %d (%d bytes) in %v",
 			n.cfg.ID, b.snap.Metadata.Index, len(b.snap.Data), time.Since(start).Round(time.Millisecond))
 	}
@@ -432,30 +454,62 @@ func (n *Node) apply(b applyBatch) error {
 	return nil
 }
 
-// maybeSnapshot takes a snapshot of the state machine at the applied index
-// once SnapshotEntries entries have been applied since the last one, stores
-// it, and compacts the log, keeping CatchUpEntries entries before it. It runs
-// on the apply goroutine right after applying, so the state machine and the
-// applied index match exactly, and it logs how long each step took.
-//
-// The Raft loop keeps running meanwhile and may install a newer snapshot from
-// the leader; then CreateSnapshot reports ErrSnapOutOfDate, or the store
-// ignores this older one, and nothing is lost.
+// maybeSnapshot starts a snapshot once SnapshotEntries entries have been
+// applied since the last one. It runs on the apply goroutine right after
+// applying, so the state it captures matches the applied index exactly. Only
+// the capture happens here (all of Snapshot, for a state machine without
+// SnapshotCapturer); encoding, storing and compacting run on a separate
+// goroutine, one snapshot at a time, while applying continues.
 func (n *Node) maybeSnapshot() error {
 	if n.cfg.SnapshotEntries == 0 {
 		return nil // only a Node built without Start, in tests
 	}
 	applied := n.applied.Load()
-	if applied-n.snapIndex < n.cfg.SnapshotEntries {
+	if applied-n.snapIndex.Load() < n.cfg.SnapshotEntries || n.snapshotting.Load() {
 		return nil
 	}
 	start := time.Now()
-	data, err := n.cfg.SM.Snapshot()
+	var encode func() ([]byte, error)
+	if c, ok := n.cfg.SM.(SnapshotCapturer); ok {
+		encode = c.CaptureSnapshot()
+	} else {
+		data, err := n.cfg.SM.Snapshot()
+		if err != nil {
+			return err
+		}
+		encode = func() ([]byte, error) { return data, nil }
+	}
+	captured := time.Since(start)
+	cs := n.confState // a copy: the apply goroutine owns n.confState
+
+	n.snapshotting.Store(true)
+	n.snapshots.Add(1)
+	go func() {
+		defer n.snapshots.Done()
+		defer n.snapshotting.Store(false)
+		if err := n.saveSnapshot(applied, cs, encode, captured); err != nil {
+			// Same as an apply failure: this replica can no longer be trusted.
+			panic(fmt.Sprintf("raftnode %d: snapshot: %v", n.cfg.ID, err))
+		}
+	}()
+	return nil
+}
+
+// saveSnapshot encodes a captured state, stores it as the snapshot at
+// applied, and compacts the log, keeping CatchUpEntries entries before it,
+// logging how long each step took.
+//
+// The Raft loop and the apply goroutine keep running meanwhile and may
+// install a newer snapshot from the leader; then CreateSnapshot reports
+// ErrSnapOutOfDate, or the store ignores this older one, and nothing is lost.
+func (n *Node) saveSnapshot(applied uint64, cs raftpb.ConfState, encode func() ([]byte, error), captured time.Duration) error {
+	start := time.Now()
+	data, err := encode()
 	if err != nil {
 		return err
 	}
 	encoded := time.Since(start)
-	snap, err := n.storage.CreateSnapshot(applied, &n.confState, data)
+	snap, err := n.storage.CreateSnapshot(applied, &cs, data)
 	if errors.Is(err, raft.ErrSnapOutOfDate) {
 		return nil
 	}
@@ -479,10 +533,20 @@ func (n *Node) maybeSnapshot() error {
 			return err
 		}
 	}
-	n.snapIndex = applied
-	n.log.Infof("raftnode %d: snapshot at index %d: %d bytes, encode %v, persist %v, log compacted through %d",
-		n.cfg.ID, applied, len(data), encoded.Round(time.Millisecond), saved.Round(time.Millisecond), compactTo)
+	raiseTo(&n.snapIndex, applied)
+	n.log.Infof("raftnode %d: snapshot at index %d: %d bytes, capture %v (apply waited), encode %v, persist %v, log compacted through %d",
+		n.cfg.ID, applied, len(data), captured.Round(time.Millisecond), encoded.Round(time.Millisecond), saved.Round(time.Millisecond), compactTo)
 	return nil
+}
+
+// raiseTo sets v to x unless v is already at least x.
+func raiseTo(v *atomic.Uint64, x uint64) {
+	for {
+		old := v.Load()
+		if old >= x || v.CompareAndSwap(old, x) {
+			return
+		}
+	}
 }
 
 // leadershipChanged records a SoftState change and reports whether pending
