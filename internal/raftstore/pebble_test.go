@@ -3,6 +3,7 @@ package raftstore
 import (
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
@@ -187,5 +188,78 @@ func TestSyncsOnlyWhenRequired(t *testing.T) {
 	}
 	if hs.Commit != 3 {
 		t.Fatalf("commit index after reopen = %d, want 3", hs.Commit)
+	}
+}
+
+// Plain appends must not write a range deletion each (#30's load test found
+// Save stalling for seconds and the heap exploding: Pebble flushes nested
+// range tombstones in quadratic time). 30,000 one-entry appends, the shape of
+// a leader under load, must stay fast. Before the fix one Save blocked for
+// seconds at 20,000 and the process ran out of memory soon after.
+func TestAppendsStayFast(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow when it regresses")
+	}
+	p, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	data := make([]byte, 200)
+	var slowest time.Duration
+	start := time.Now()
+	for i := uint64(1); i <= 30000; i++ {
+		s := time.Now()
+		if err := p.Save(raftpb.HardState{Term: 1, Commit: i}, []raftpb.Entry{{Term: 1, Index: i, Data: data}}, raftpb.Snapshot{}, false); err != nil {
+			t.Fatal(err)
+		}
+		slowest = max(slowest, time.Since(s))
+		if time.Since(start) > 20*time.Second {
+			t.Fatalf("only %d appends in 20s (slowest Save %v): appends are writing range deletions again", i, slowest)
+		}
+	}
+	if slowest > time.Second {
+		t.Fatalf("a single append took %v", slowest)
+	}
+	t.Logf("30,000 appends in %v, slowest Save %v", time.Since(start).Round(time.Millisecond), slowest.Round(time.Microsecond))
+}
+
+// The last index is loaded on open, so a conflicting tail written after a
+// restart is still dropped: a new leader's shorter log replaces ours.
+func TestConflictingTailDroppedAfterReopen(t *testing.T) {
+	dir := t.TempDir()
+	p, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Save(raftpb.HardState{Term: 1, Commit: 6}, entries(1, 1, 10), raftpb.Snapshot{}, true); err != nil {
+		t.Fatal(err)
+	}
+	p.Close()
+
+	p, err = Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	// Term 2's leader has entries 7 and 8 only: 9 and 10 must go.
+	if err := p.Save(raftpb.HardState{Term: 2, Commit: 6}, entries(2, 7, 8), raftpb.Snapshot{}, true); err != nil {
+		t.Fatal(err)
+	}
+	// A later plain append extends the new log normally.
+	if err := p.Save(raftpb.HardState{}, entries(2, 9, 9), raftpb.Snapshot{}, true); err != nil {
+		t.Fatal(err)
+	}
+	_, _, ents, err := p.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := indexes(ents); len(got) != 9 || got[8] != 9 {
+		t.Fatalf("entries = %v, want 1..9", got)
+	}
+	for _, e := range ents[6:] {
+		if e.Term != 2 {
+			t.Fatalf("entry %d has term %d: the old tail survived the reopen", e.Index, e.Term)
+		}
 	}
 }

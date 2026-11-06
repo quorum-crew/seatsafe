@@ -41,6 +41,13 @@ func entryKey(index uint64) []byte {
 // Pebble is a durable Raft log store.
 type Pebble struct {
 	db *pebble.DB
+
+	// lastIndex is the index of the last entry on disk (or of the snapshot
+	// if there are no entries after it). Loaded on open and kept current by
+	// Save, so Save only writes a range deletion when new entries really
+	// truncate a conflicting tail. Save and SaveSnapshot are only called
+	// from the node's Raft loop, so no lock is needed.
+	lastIndex uint64
 }
 
 // Open opens (or creates) the store in dir.
@@ -53,7 +60,33 @@ func open(dir string, opts *pebble.Options) (*Pebble, error) {
 	if err != nil {
 		return nil, fmt.Errorf("raftstore: open %s: %w", dir, err)
 	}
-	return &Pebble{db: db}, nil
+	p := &Pebble{db: db}
+	if p.lastIndex, err = p.loadLastIndex(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("raftstore: open %s: %w", dir, err)
+	}
+	return p, nil
+}
+
+// loadLastIndex returns the index of the last entry on disk, or the
+// snapshot's index if no entry follows it, or 0 for a fresh store.
+func (p *Pebble) loadLastIndex() (uint64, error) {
+	var snap raftpb.Snapshot
+	if err := p.get(keySnapshot, snap.Unmarshal); err != nil {
+		return 0, err
+	}
+	it, err := p.db.NewIter(&pebble.IterOptions{LowerBound: entryKey(0), UpperBound: []byte{entryPrefix + 1}})
+	if err != nil {
+		return 0, err
+	}
+	defer it.Close()
+	last := snap.Metadata.Index
+	if it.Last() {
+		if i := binary.BigEndian.Uint64(it.Key()[1:]); i > last {
+			last = i
+		}
+	}
+	return last, it.Error()
 }
 
 // Save writes one Ready's HardState, new entries and snapshot in a single
@@ -81,6 +114,10 @@ func (p *Pebble) Save(hs raftpb.HardState, ents []raftpb.Entry, snap raftpb.Snap
 			return err
 		}
 	}
+	newLast := p.lastIndex
+	if !raft.IsEmptySnap(snap) && snap.Metadata.Index > newLast {
+		newLast = snap.Metadata.Index
+	}
 	if len(ents) > 0 {
 		for i := range ents {
 			data, err := ents[i].Marshal()
@@ -91,13 +128,19 @@ func (p *Pebble) Save(hs raftpb.HardState, ents []raftpb.Entry, snap raftpb.Snap
 				return err
 			}
 		}
-		// New entries overwrite a conflicting tail: drop anything after them.
+		// New entries that end before the current last index overwrite a
+		// conflicting tail (a new leader's log replacing ours): drop
+		// everything after them. A plain append has no tail to drop, so it
+		// writes no range deletion. Writing one on every Save left a range
+		// tombstone per append, which Pebble's flushes handle in quadratic
+		// time: Saves stalled for seconds and memory blew up under load.
 		last := ents[len(ents)-1].Index
-		if last < math.MaxUint64 {
+		if last < newLast && last < math.MaxUint64 {
 			if err := b.DeleteRange(entryKey(last+1), entryKey(math.MaxUint64), nil); err != nil {
 				return err
 			}
 		}
+		newLast = last
 	}
 	if !raft.IsEmptyHardState(hs) {
 		data, err := hs.Marshal()
@@ -111,10 +154,15 @@ func (p *Pebble) Save(hs raftpb.HardState, ents []raftpb.Entry, snap raftpb.Snap
 	if b.Empty() {
 		return nil
 	}
+	opts := pebble.NoSync
 	if mustSync || !raft.IsEmptySnap(snap) {
-		return b.Commit(pebble.Sync)
+		opts = pebble.Sync
 	}
-	return b.Commit(pebble.NoSync)
+	if err := b.Commit(opts); err != nil {
+		return err
+	}
+	p.lastIndex = newLast
+	return nil
 }
 
 // Load returns everything saved, for restarting a node. A fresh store returns
