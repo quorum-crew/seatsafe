@@ -5,14 +5,29 @@
 // an RPC against the cached leader and handles the error contract:
 //
 //	OK, INVALID_ARGUMENT, other codes  returned as is
-//	FAILED_PRECONDITION + trailer      switch to the leader named in the
-//	                                   "seatsafe-leader" trailer and retry
-//	                                   there at once (once per Call)
+//	FAILED_PRECONDITION + usable       switch to the leader named in the
+//	trailer, first time in this Call   "seatsafe-leader" trailer and retry
+//	                                   there at once
+//	FAILED_PRECONDITION + unusable     treated as not leader: rediscover and
+//	trailer (unknown node or the       retry with backoff, as below
+//	node itself), or a usable
+//	trailer after that redirect
+//	FAILED_PRECONDITION with no        returned as is, no discovery and no
+//	leader trailer                     retry: the node answered that the
+//	                                   request contradicts its log (only a
+//	                                   node that is not the leader sets the
+//	                                   trailer; "no known leader" is
+//	                                   UNAVAILABLE)
 //	UNAVAILABLE, connection errors,    ask every node for NodeService.Status
-//	attempt DEADLINE_EXCEEDED,         in parallel, adopt the leader they
-//	FAILED_PRECONDITION without a      report, and retry with backoff
-//	usable trailer                     (10, 25, 50, 100, then 200 ms) until
+//	attempt DEADLINE_EXCEEDED          in parallel, adopt the leader they
+//	                                   report, and retry with backoff
+//	                                   (10, 25, 50, 100, then 200 ms) until
 //	                                   the caller's ctx expires
+//	caller's ctx ends                  DEADLINE_EXCEEDED or CANCELED, never
+//	                                   a guess
+//
+// leader_recovery_seconds runs from the start of the first failed attempt to
+// the next answer, so it covers the whole time callers were blocked.
 //
 // Each attempt gets its own deadline (500 ms by default, capped by ctx). The
 // request is never changed between attempts, so retries are safe only for
@@ -76,7 +91,7 @@ type Metrics struct {
 // Retry reasons.
 const (
 	ReasonRedirect     = "redirect"        // FAILED_PRECONDITION with a leader trailer
-	ReasonNotLeader    = "not_leader"      // FAILED_PRECONDITION without a usable trailer
+	ReasonNotLeader    = "not_leader"      // FAILED_PRECONDITION with an unusable trailer, or a usable one after this Call already redirected
 	ReasonUnavailable  = "unavailable"     // UNAVAILABLE or a connection error
 	ReasonAttemptTimer = "attempt_timeout" // the attempt's own deadline passed
 )
@@ -90,7 +105,7 @@ func NewMetrics(r *metrics.Registry) *Metrics {
 		Retries:       r.NewCounterVec("seatsafe_groupclient_retries_total", "Retried attempts by group and reason.", "group", "reason"),
 		LeaderChanges: r.NewCounterVec("seatsafe_groupclient_leader_changes_total", "Times the cached leader of a group changed.", "group"),
 		LeaderRecovery: r.NewHistogramVec("seatsafe_groupclient_leader_recovery_seconds",
-			"Time from the first failed attempt against a group to its next success (failover time seen by the router).",
+			"Time from the start of the first failed attempt against a group to its next answer (failover time seen by the router).",
 			RecoveryBuckets, "group"),
 		DiscoveryRounds: r.NewCounterVec("seatsafe_groupclient_discovery_rounds_total", "NodeService.Status rounds by group and result (found, none).", "group", "result"),
 	}
@@ -107,7 +122,8 @@ type Group struct {
 	mu           sync.Mutex
 	leader       string        // cached leader; "" after it failed, until rediscovered
 	lastLeader   string        // last leader ever cached, to count changes
-	failingSince time.Time     // first failure since the last answer; zero when healthy
+	failingSince time.Time     // start of the first failed attempt since the last answer; zero when healthy
+	lastAnswer   time.Time     // when the group last answered
 	discovering  chan struct{} // closed when the discovery round in flight ends
 }
 
@@ -173,6 +189,7 @@ func (g *Group) Call(ctx context.Context, rpc RPC) error {
 			target = g.addrs[retries%len(g.addrs)] // nobody knows: try nodes in turn
 		}
 
+		start := time.Now()
 		actx, cancel := context.WithTimeout(ctx, g.cfg.AttemptTimeout)
 		var trailer metadata.MD
 		err := rpc(actx, g.conns[target], grpc.Trailer(&trailer))
@@ -181,12 +198,17 @@ func (g *Group) Call(ctx context.Context, rpc RPC) error {
 		reason := ""
 		switch code := status.Code(err); {
 		case ctx.Err() != nil && err != nil:
-			g.markFailed()
+			g.markFailed(start)
 			return ctxError(ctx)
 		case code == codes.FailedPrecondition:
+			if len(trailer.Get(LeaderTrailer)) == 0 {
+				// Not a leadership problem: the node refused the request.
+				g.markAnswered()
+				return err
+			}
 			if hint := g.usableHint(trailer, target); hint != "" && !redirected {
 				redirected = true
-				g.markFailed()
+				g.markFailed(start)
 				g.m.Retries.Inc(g.name, ReasonRedirect)
 				g.setLeader(target, hint)
 				continue
@@ -202,7 +224,7 @@ func (g *Group) Call(ctx context.Context, rpc RPC) error {
 			return err
 		}
 
-		g.markFailed()
+		g.markFailed(start)
 		g.m.Retries.Inc(g.name, reason)
 		g.forget(target)
 		if !g.sleep(ctx, g.cfg.Backoff[min(retries, len(g.cfg.Backoff)-1)]) {
@@ -245,10 +267,16 @@ func (g *Group) usableHint(md metadata.MD, from string) string {
 	return vals[0]
 }
 
-func (g *Group) markFailed() {
+// markFailed records an attempt that started at start and failed. An attempt
+// that started before the group's last answer only counts from that answer,
+// so a slow call that overlapped healthy ones doesn't stretch the outage.
+func (g *Group) markFailed(start time.Time) {
 	g.mu.Lock()
 	if g.failingSince.IsZero() {
-		g.failingSince = time.Now()
+		if start.Before(g.lastAnswer) {
+			start = g.lastAnswer
+		}
+		g.failingSince = start
 	}
 	g.mu.Unlock()
 }
@@ -257,6 +285,7 @@ func (g *Group) markAnswered() {
 	g.mu.Lock()
 	since := g.failingSince
 	g.failingSince = time.Time{}
+	g.lastAnswer = time.Now()
 	g.mu.Unlock()
 	if !since.IsZero() {
 		g.m.LeaderRecovery.Observe(time.Since(since).Seconds(), g.name)

@@ -54,6 +54,7 @@ var (
 	lastIndex   = gauge{"seatsafe_raft_last_index", "Index of the last entry in this node's log."}
 	commitIndex = gauge{"seatsafe_raft_commit_index", "Highest log index known to be committed."}
 	applied     = gauge{"seatsafe_raft_applied_index", "Highest log index applied to the state machine."}
+	snapIndex   = gauge{"seatsafe_raft_snapshot_index", "Index of this node's newest snapshot (0 = none)."}
 
 	followerMatch  = gauge{"seatsafe_raft_follower_match_index", "Leader only: highest log index known to be on each follower."}
 	followerLag    = gauge{"seatsafe_raft_follower_lag_entries", "Leader only: entries each follower is behind the leader's last index."}
@@ -72,6 +73,7 @@ func write(w io.Writer, group, node string, st raftnode.Status, names map[uint64
 	one(lastIndex, st.LastIndex)
 	one(commitIndex, st.Commit)
 	one(applied, st.Applied)
+	one(snapIndex, st.SnapshotIndex)
 
 	if len(st.Followers) == 0 {
 		return // not the leader: no per-follower view
