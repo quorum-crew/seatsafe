@@ -46,17 +46,26 @@ func entryKey(index uint64) []byte {
 type Pebble struct {
 	db *pebble.DB
 
-	// mu serializes Save (the Raft loop) and SaveSnapshot (the apply
-	// goroutine).
-	mu sync.Mutex
-	// lastIndex is the index of the last entry on disk (or of the snapshot
-	// if there are no entries after it). Loaded on open and kept current by
-	// Save, so Save only writes a range deletion when new entries really
-	// truncate a conflicting tail.
-	lastIndex uint64
+	// Save runs on the Raft loop and SaveSnapshot on the node's snapshot
+	// goroutine. They only contend when both write a snapshot: a plain Save
+	// never waits for SaveSnapshot's fsync. Pebble commits batches safely in
+	// parallel, and SaveSnapshot's compaction only deletes entries at or
+	// below the applied index, which Save never rewrites.
+	//
+	// snapMu guards the snapshot key and snapIndex: SaveSnapshot holds it
+	// through its commit, and Save only when it stores a received snapshot.
+	// Taken before mu.
+	snapMu sync.Mutex
 	// snapIndex is the index of the stored snapshot, so SaveSnapshot can
 	// ignore a snapshot older than one received from the leader meanwhile.
 	snapIndex uint64
+
+	// mu guards lastIndex, the index of the last entry on disk (or of the
+	// snapshot if there are no entries after it). Loaded on open and kept
+	// current by Save, so Save only writes a range deletion when new entries
+	// really truncate a conflicting tail.
+	mu        sync.Mutex
+	lastIndex uint64
 }
 
 // Open opens (or creates) the store in dir.
@@ -107,6 +116,10 @@ func (p *Pebble) loadIndexes() (last, snapIndex uint64, err error) {
 // only change is the commit index, which Raft can recompute after a crash)
 // the batch is committed without an fsync.
 func (p *Pebble) Save(hs raftpb.HardState, ents []raftpb.Entry, snap raftpb.Snapshot, mustSync bool) error {
+	if !raft.IsEmptySnap(snap) {
+		p.snapMu.Lock()
+		defer p.snapMu.Unlock()
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	b := p.db.NewBatch()
@@ -186,12 +199,13 @@ func (p *Pebble) Save(hs raftpb.HardState, ents []raftpb.Entry, snap raftpb.Snap
 // drops entries up to and including compactTo (0 = none). Unlike a snapshot
 // received in Save, entries after it are kept: they are this node's own log.
 //
-// It runs on the node's apply goroutine while the Raft loop keeps saving. If
-// the loop already stored a newer snapshot from the leader, this one is
-// stale and is ignored: writing it would roll the snapshot back.
+// It runs on the node's snapshot goroutine while the Raft loop keeps saving,
+// and holds up a Save only if that Save stores a snapshot too. If the loop
+// already stored a newer snapshot from the leader, this one is stale and is
+// ignored: writing it would roll the snapshot back.
 func (p *Pebble) SaveSnapshot(snap raftpb.Snapshot, compactTo uint64) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.snapMu.Lock()
+	defer p.snapMu.Unlock()
 	if snap.Metadata.Index <= p.snapIndex {
 		return nil
 	}

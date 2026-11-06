@@ -383,3 +383,86 @@ func TestOlderOwnSnapshotIgnored(t *testing.T) {
 	}
 	check("after reopen")
 }
+
+// slowSyncFS makes every fsync take delay while slow is set, and signals
+// entered when one starts.
+type slowSyncFS struct {
+	vfs.FS
+	slow    *atomic.Bool
+	delay   time.Duration
+	entered chan struct{}
+}
+
+func (fs slowSyncFS) Create(name string) (vfs.File, error) {
+	f, err := fs.FS.Create(name)
+	return slowSyncFile{f, fs}, err
+}
+
+func (fs slowSyncFS) ReuseForWrite(oldname, newname string) (vfs.File, error) {
+	f, err := fs.FS.ReuseForWrite(oldname, newname)
+	return slowSyncFile{f, fs}, err
+}
+
+type slowSyncFile struct {
+	vfs.File
+	fs slowSyncFS
+}
+
+func (f slowSyncFile) wait() {
+	if f.fs.slow.Load() {
+		select {
+		case f.fs.entered <- struct{}{}:
+		default:
+		}
+		time.Sleep(f.fs.delay)
+	}
+}
+
+func (f slowSyncFile) Sync() error     { f.wait(); return f.File.Sync() }
+func (f slowSyncFile) SyncData() error { f.wait(); return f.File.SyncData() }
+func (f slowSyncFile) SyncTo(n int64) (bool, error) {
+	f.wait()
+	return f.File.SyncTo(n)
+}
+
+// The node's snapshot goroutine stores snapshots while the Raft loop keeps
+// saving. A Save that needs no fsync must not wait for the snapshot's fsync:
+// holding one lock across that commit stalled the Raft loop for 1.4 s on
+// every replica of a shard at once.
+func TestSaveNotBlockedBySnapshotSync(t *testing.T) {
+	var slow atomic.Bool
+	fs := slowSyncFS{FS: vfs.Default, slow: &slow, delay: 500 * time.Millisecond, entered: make(chan struct{}, 1)}
+	p, err := open(t.TempDir(), &pebble.Options{Logger: quietLogger{}, FS: fs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	if err := p.Save(raftpb.HardState{Term: 1, Commit: 10}, entries(1, 1, 10), raftpb.Snapshot{}, true); err != nil {
+		t.Fatal(err)
+	}
+
+	slow.Store(true)
+	errc := make(chan error, 1)
+	go func() { errc <- p.SaveSnapshot(snapAt(8, "own"), 5) }()
+	<-fs.entered // the snapshot's commit is fsyncing
+
+	start := time.Now()
+	if err := p.Save(raftpb.HardState{Term: 1, Commit: 12}, entries(1, 11, 12), raftpb.Snapshot{}, false); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d > 250*time.Millisecond {
+		t.Fatalf("Save waited %v for the snapshot's fsync", d)
+	}
+	if err := <-errc; err != nil {
+		t.Fatal(err)
+	}
+	slow.Store(false)
+
+	_, snap, ents, err := p.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Metadata.Index != 8 || len(ents) != 4 || ents[0].Index != 9 || ents[3].Index != 12 {
+		t.Fatalf("after both: snapshot %d, %d entries after it, on disk %v", snap.Metadata.Index, len(ents), rawEntries(t, p))
+	}
+}
