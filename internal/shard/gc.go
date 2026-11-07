@@ -12,10 +12,14 @@ import (
 	"github.com/quorum-crew/seatsafe/internal/seatsm"
 )
 
-// Default garbage collection timing (design doc: every 30 s, 10 min retention).
+// Default garbage collection timing: every 30 s, dropping records older than
+// 2 min. Snapshots carry every req/ and txn/ record still kept, so retention
+// sets their size: at benchmark rates, 10 min of records made an 83 MiB
+// snapshot. 2 min is still far above any client retry window (seconds).
+// cmd/storage reads GC_RETENTION_MS to override it.
 const (
 	DefaultGCInterval  = 30 * time.Second
-	DefaultGCRetention = 10 * time.Minute
+	DefaultGCRetention = 2 * time.Minute
 )
 
 // Collector keeps seatsm's dedup (req/) and decided-txn (txn/) tables from
