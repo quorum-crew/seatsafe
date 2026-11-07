@@ -19,7 +19,8 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	RaftTransport_Send_FullMethodName = "/seatsafe.v1.RaftTransport/Send"
+	RaftTransport_Send_FullMethodName         = "/seatsafe.v1.RaftTransport/Send"
+	RaftTransport_SendSnapshot_FullMethodName = "/seatsafe.v1.RaftTransport/SendSnapshot"
 )
 
 // RaftTransportClient is the client API for RaftTransport service.
@@ -29,6 +30,10 @@ const (
 // Node-to-node Raft traffic inside one group (a shard or the coordinator group).
 type RaftTransportClient interface {
 	Send(ctx context.Context, in *RaftBatch, opts ...grpc.CallOption) (*RaftAck, error)
+	// SendSnapshot carries one MsgSnap, which can be far bigger than the gRPC
+	// message limit, as a stream of chunks. The receiver joins them and steps
+	// the message once the stream ends.
+	SendSnapshot(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[SnapshotChunk, RaftAck], error)
 }
 
 type raftTransportClient struct {
@@ -49,6 +54,19 @@ func (c *raftTransportClient) Send(ctx context.Context, in *RaftBatch, opts ...g
 	return out, nil
 }
 
+func (c *raftTransportClient) SendSnapshot(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[SnapshotChunk, RaftAck], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &RaftTransport_ServiceDesc.Streams[0], RaftTransport_SendSnapshot_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[SnapshotChunk, RaftAck]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type RaftTransport_SendSnapshotClient = grpc.ClientStreamingClient[SnapshotChunk, RaftAck]
+
 // RaftTransportServer is the server API for RaftTransport service.
 // All implementations must embed UnimplementedRaftTransportServer
 // for forward compatibility.
@@ -56,6 +74,10 @@ func (c *raftTransportClient) Send(ctx context.Context, in *RaftBatch, opts ...g
 // Node-to-node Raft traffic inside one group (a shard or the coordinator group).
 type RaftTransportServer interface {
 	Send(context.Context, *RaftBatch) (*RaftAck, error)
+	// SendSnapshot carries one MsgSnap, which can be far bigger than the gRPC
+	// message limit, as a stream of chunks. The receiver joins them and steps
+	// the message once the stream ends.
+	SendSnapshot(grpc.ClientStreamingServer[SnapshotChunk, RaftAck]) error
 	mustEmbedUnimplementedRaftTransportServer()
 }
 
@@ -68,6 +90,9 @@ type UnimplementedRaftTransportServer struct{}
 
 func (UnimplementedRaftTransportServer) Send(context.Context, *RaftBatch) (*RaftAck, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Send not implemented")
+}
+func (UnimplementedRaftTransportServer) SendSnapshot(grpc.ClientStreamingServer[SnapshotChunk, RaftAck]) error {
+	return status.Errorf(codes.Unimplemented, "method SendSnapshot not implemented")
 }
 func (UnimplementedRaftTransportServer) mustEmbedUnimplementedRaftTransportServer() {}
 func (UnimplementedRaftTransportServer) testEmbeddedByValue()                       {}
@@ -108,6 +133,13 @@ func _RaftTransport_Send_Handler(srv interface{}, ctx context.Context, dec func(
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RaftTransport_SendSnapshot_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(RaftTransportServer).SendSnapshot(&grpc.GenericServerStream[SnapshotChunk, RaftAck]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type RaftTransport_SendSnapshotServer = grpc.ClientStreamingServer[SnapshotChunk, RaftAck]
+
 // RaftTransport_ServiceDesc is the grpc.ServiceDesc for RaftTransport service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -120,7 +152,13 @@ var RaftTransport_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _RaftTransport_Send_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "SendSnapshot",
+			Handler:       _RaftTransport_SendSnapshot_Handler,
+			ClientStreams: true,
+		},
+	},
 	Metadata: "seatsafe/v1/raft.proto",
 }
 

@@ -133,6 +133,66 @@ func (x *RaftBatch) GetMessages() [][]byte {
 	return nil
 }
 
+type SnapshotChunk struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	GroupId       uint32                 `protobuf:"varint,1,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"` // same on every chunk of a stream
+	From          uint64                 `protobuf:"varint,2,opt,name=from,proto3" json:"from,omitempty"`                      // same on every chunk of a stream
+	Data          []byte                 `protobuf:"bytes,3,opt,name=data,proto3" json:"data,omitempty"`                       // the next piece of one marshaled raftpb.Message (MsgSnap)
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SnapshotChunk) Reset() {
+	*x = SnapshotChunk{}
+	mi := &file_seatsafe_v1_raft_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SnapshotChunk) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SnapshotChunk) ProtoMessage() {}
+
+func (x *SnapshotChunk) ProtoReflect() protoreflect.Message {
+	mi := &file_seatsafe_v1_raft_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SnapshotChunk.ProtoReflect.Descriptor instead.
+func (*SnapshotChunk) Descriptor() ([]byte, []int) {
+	return file_seatsafe_v1_raft_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *SnapshotChunk) GetGroupId() uint32 {
+	if x != nil {
+		return x.GroupId
+	}
+	return 0
+}
+
+func (x *SnapshotChunk) GetFrom() uint64 {
+	if x != nil {
+		return x.From
+	}
+	return 0
+}
+
+func (x *SnapshotChunk) GetData() []byte {
+	if x != nil {
+		return x.Data
+	}
+	return nil
+}
+
 type RaftAck struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -141,7 +201,7 @@ type RaftAck struct {
 
 func (x *RaftAck) Reset() {
 	*x = RaftAck{}
-	mi := &file_seatsafe_v1_raft_proto_msgTypes[1]
+	mi := &file_seatsafe_v1_raft_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -153,7 +213,7 @@ func (x *RaftAck) String() string {
 func (*RaftAck) ProtoMessage() {}
 
 func (x *RaftAck) ProtoReflect() protoreflect.Message {
-	mi := &file_seatsafe_v1_raft_proto_msgTypes[1]
+	mi := &file_seatsafe_v1_raft_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -166,7 +226,7 @@ func (x *RaftAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RaftAck.ProtoReflect.Descriptor instead.
 func (*RaftAck) Descriptor() ([]byte, []int) {
-	return file_seatsafe_v1_raft_proto_rawDescGZIP(), []int{1}
+	return file_seatsafe_v1_raft_proto_rawDescGZIP(), []int{2}
 }
 
 type StatusRequest struct {
@@ -177,7 +237,7 @@ type StatusRequest struct {
 
 func (x *StatusRequest) Reset() {
 	*x = StatusRequest{}
-	mi := &file_seatsafe_v1_raft_proto_msgTypes[2]
+	mi := &file_seatsafe_v1_raft_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -189,7 +249,7 @@ func (x *StatusRequest) String() string {
 func (*StatusRequest) ProtoMessage() {}
 
 func (x *StatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_seatsafe_v1_raft_proto_msgTypes[2]
+	mi := &file_seatsafe_v1_raft_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -202,7 +262,7 @@ func (x *StatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatusRequest.ProtoReflect.Descriptor instead.
 func (*StatusRequest) Descriptor() ([]byte, []int) {
-	return file_seatsafe_v1_raft_proto_rawDescGZIP(), []int{2}
+	return file_seatsafe_v1_raft_proto_rawDescGZIP(), []int{3}
 }
 
 type NodeStatus struct {
@@ -222,7 +282,7 @@ type NodeStatus struct {
 
 func (x *NodeStatus) Reset() {
 	*x = NodeStatus{}
-	mi := &file_seatsafe_v1_raft_proto_msgTypes[3]
+	mi := &file_seatsafe_v1_raft_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -234,7 +294,7 @@ func (x *NodeStatus) String() string {
 func (*NodeStatus) ProtoMessage() {}
 
 func (x *NodeStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_seatsafe_v1_raft_proto_msgTypes[3]
+	mi := &file_seatsafe_v1_raft_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -247,7 +307,7 @@ func (x *NodeStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeStatus.ProtoReflect.Descriptor instead.
 func (*NodeStatus) Descriptor() ([]byte, []int) {
-	return file_seatsafe_v1_raft_proto_rawDescGZIP(), []int{3}
+	return file_seatsafe_v1_raft_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *NodeStatus) GetNodeId() string {
@@ -324,7 +384,7 @@ type FollowerProgress struct {
 
 func (x *FollowerProgress) Reset() {
 	*x = FollowerProgress{}
-	mi := &file_seatsafe_v1_raft_proto_msgTypes[4]
+	mi := &file_seatsafe_v1_raft_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -336,7 +396,7 @@ func (x *FollowerProgress) String() string {
 func (*FollowerProgress) ProtoMessage() {}
 
 func (x *FollowerProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_seatsafe_v1_raft_proto_msgTypes[4]
+	mi := &file_seatsafe_v1_raft_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -349,7 +409,7 @@ func (x *FollowerProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FollowerProgress.ProtoReflect.Descriptor instead.
 func (*FollowerProgress) Descriptor() ([]byte, []int) {
-	return file_seatsafe_v1_raft_proto_rawDescGZIP(), []int{4}
+	return file_seatsafe_v1_raft_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *FollowerProgress) GetNodeId() uint64 {
@@ -381,7 +441,11 @@ const file_seatsafe_v1_raft_proto_rawDesc = "" +
 	"\tRaftBatch\x12\x19\n" +
 	"\bgroup_id\x18\x01 \x01(\rR\agroupId\x12\x12\n" +
 	"\x04from\x18\x02 \x01(\x04R\x04from\x12\x1a\n" +
-	"\bmessages\x18\x03 \x03(\fR\bmessages\"\t\n" +
+	"\bmessages\x18\x03 \x03(\fR\bmessages\"R\n" +
+	"\rSnapshotChunk\x12\x19\n" +
+	"\bgroup_id\x18\x01 \x01(\rR\agroupId\x12\x12\n" +
+	"\x04from\x18\x02 \x01(\x04R\x04from\x12\x12\n" +
+	"\x04data\x18\x03 \x01(\fR\x04data\"\t\n" +
 	"\aRaftAck\"\x0f\n" +
 	"\rStatusRequest\"\xc2\x02\n" +
 	"\n" +
@@ -405,9 +469,10 @@ const file_seatsafe_v1_raft_proto_rawDesc = "" +
 	"\x15RAFT_ROLE_UNSPECIFIED\x10\x00\x12\x16\n" +
 	"\x12RAFT_ROLE_FOLLOWER\x10\x01\x12\x17\n" +
 	"\x13RAFT_ROLE_CANDIDATE\x10\x02\x12\x14\n" +
-	"\x10RAFT_ROLE_LEADER\x10\x032E\n" +
+	"\x10RAFT_ROLE_LEADER\x10\x032\x89\x01\n" +
 	"\rRaftTransport\x124\n" +
-	"\x04Send\x12\x16.seatsafe.v1.RaftBatch\x1a\x14.seatsafe.v1.RaftAck2L\n" +
+	"\x04Send\x12\x16.seatsafe.v1.RaftBatch\x1a\x14.seatsafe.v1.RaftAck\x12B\n" +
+	"\fSendSnapshot\x12\x1a.seatsafe.v1.SnapshotChunk\x1a\x14.seatsafe.v1.RaftAck(\x012L\n" +
 	"\vNodeService\x12=\n" +
 	"\x06Status\x12\x1a.seatsafe.v1.StatusRequest\x1a\x17.seatsafe.v1.NodeStatusB<Z:github.com/quorum-crew/seatsafe/gen/seatsafe/v1;seatsafev1b\x06proto3"
 
@@ -424,24 +489,27 @@ func file_seatsafe_v1_raft_proto_rawDescGZIP() []byte {
 }
 
 var file_seatsafe_v1_raft_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_seatsafe_v1_raft_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
+var file_seatsafe_v1_raft_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
 var file_seatsafe_v1_raft_proto_goTypes = []any{
 	(RaftRole)(0),            // 0: seatsafe.v1.RaftRole
 	(*RaftBatch)(nil),        // 1: seatsafe.v1.RaftBatch
-	(*RaftAck)(nil),          // 2: seatsafe.v1.RaftAck
-	(*StatusRequest)(nil),    // 3: seatsafe.v1.StatusRequest
-	(*NodeStatus)(nil),       // 4: seatsafe.v1.NodeStatus
-	(*FollowerProgress)(nil), // 5: seatsafe.v1.FollowerProgress
+	(*SnapshotChunk)(nil),    // 2: seatsafe.v1.SnapshotChunk
+	(*RaftAck)(nil),          // 3: seatsafe.v1.RaftAck
+	(*StatusRequest)(nil),    // 4: seatsafe.v1.StatusRequest
+	(*NodeStatus)(nil),       // 5: seatsafe.v1.NodeStatus
+	(*FollowerProgress)(nil), // 6: seatsafe.v1.FollowerProgress
 }
 var file_seatsafe_v1_raft_proto_depIdxs = []int32{
 	0, // 0: seatsafe.v1.NodeStatus.role:type_name -> seatsafe.v1.RaftRole
-	5, // 1: seatsafe.v1.NodeStatus.followers:type_name -> seatsafe.v1.FollowerProgress
+	6, // 1: seatsafe.v1.NodeStatus.followers:type_name -> seatsafe.v1.FollowerProgress
 	1, // 2: seatsafe.v1.RaftTransport.Send:input_type -> seatsafe.v1.RaftBatch
-	3, // 3: seatsafe.v1.NodeService.Status:input_type -> seatsafe.v1.StatusRequest
-	2, // 4: seatsafe.v1.RaftTransport.Send:output_type -> seatsafe.v1.RaftAck
-	4, // 5: seatsafe.v1.NodeService.Status:output_type -> seatsafe.v1.NodeStatus
-	4, // [4:6] is the sub-list for method output_type
-	2, // [2:4] is the sub-list for method input_type
+	2, // 3: seatsafe.v1.RaftTransport.SendSnapshot:input_type -> seatsafe.v1.SnapshotChunk
+	4, // 4: seatsafe.v1.NodeService.Status:input_type -> seatsafe.v1.StatusRequest
+	3, // 5: seatsafe.v1.RaftTransport.Send:output_type -> seatsafe.v1.RaftAck
+	3, // 6: seatsafe.v1.RaftTransport.SendSnapshot:output_type -> seatsafe.v1.RaftAck
+	5, // 7: seatsafe.v1.NodeService.Status:output_type -> seatsafe.v1.NodeStatus
+	5, // [5:8] is the sub-list for method output_type
+	2, // [2:5] is the sub-list for method input_type
 	2, // [2:2] is the sub-list for extension type_name
 	2, // [2:2] is the sub-list for extension extendee
 	0, // [0:2] is the sub-list for field type_name
@@ -458,7 +526,7 @@ func file_seatsafe_v1_raft_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_seatsafe_v1_raft_proto_rawDesc), len(file_seatsafe_v1_raft_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   5,
+			NumMessages:   6,
 			NumExtensions: 0,
 			NumServices:   2,
 		},
