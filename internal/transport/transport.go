@@ -17,6 +17,7 @@ import (
 
 	"go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
@@ -237,6 +238,15 @@ func (p *peer) send(batch []raftpb.Message) {
 	}
 }
 
+// reconnect caps gRPC's reconnect backoff at 1 s. Its default grows to 120 s
+// while a peer is down, so a restarted node could wait many seconds for its
+// peers to try again before it got any Raft traffic. Raft peers are few and
+// known, so retrying every second costs nothing.
+var reconnect = grpc.ConnectParams{
+	Backoff:           backoff.Config{BaseDelay: 100 * time.Millisecond, Multiplier: 1.6, Jitter: 0.2, MaxDelay: time.Second},
+	MinConnectTimeout: time.Second,
+}
+
 // dial connects to the peer. passthrough makes gRPC resolve the name again
 // on every reconnect instead of caching its IP: a restarted container can get
 // a new IP, and its old one can go to another node.
@@ -244,6 +254,7 @@ func (p *peer) dial() error {
 	opts := append([]grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(MaxMsgSize)),
+		grpc.WithConnectParams(reconnect),
 	}, p.t.dialOpts...)
 	conn, err := grpc.NewClient("passthrough:///"+p.addr, opts...)
 	if err != nil {
