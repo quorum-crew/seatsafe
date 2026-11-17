@@ -15,6 +15,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -194,6 +195,63 @@ func (c *Cluster) WaitHealed(ctx context.Context, timeout time.Duration) (time.D
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
+}
+
+// agreedLeader returns the leader that every node of the shard outside
+// exclude reports, if they all report the same one and it is not excluded;
+// otherwise 0. This is the leader the rest of the group has actually moved
+// to: an isolated or paused old leader may still think it leads.
+func (c *Cluster) agreedLeader(ctx context.Context, shard int, exclude []string) int {
+	leader, seen := 0, 0
+	for _, n := range NodeIDs {
+		svc := Service(shard, n)
+		if slices.Contains(exclude, svc) {
+			continue
+		}
+		m, err := c.Metrics(ctx, svc)
+		if err != nil {
+			return 0
+		}
+		l := int(m["seatsafe_raft_leader_id"])
+		if l == 0 || slices.Contains(exclude, Service(shard, l)) || (leader != 0 && l != leader) {
+			return 0
+		}
+		leader, seen = l, seen+1
+	}
+	if seen == 0 {
+		return 0
+	}
+	return leader
+}
+
+// commitIndex returns the highest commit index any reachable node of the
+// shard reports.
+func (c *Cluster) commitIndex(ctx context.Context, shard int) uint64 {
+	var hi uint64
+	for _, n := range NodeIDs {
+		if m, err := c.Metrics(ctx, Service(shard, n)); err == nil {
+			hi = max(hi, uint64(m["seatsafe_raft_commit_index"]))
+		}
+	}
+	return hi
+}
+
+// caughtUp reports whether every node of the shard answers, they all agree
+// on one leader, and every one has applied at least target.
+func (c *Cluster) caughtUp(ctx context.Context, shard int, target uint64) bool {
+	leader := -1
+	for _, n := range NodeIDs {
+		m, err := c.Metrics(ctx, Service(shard, n))
+		if err != nil {
+			return false
+		}
+		l := int(m["seatsafe_raft_leader_id"])
+		if l == 0 || (leader != -1 && l != leader) || uint64(m["seatsafe_raft_applied_index"]) < target {
+			return false
+		}
+		leader = l
+	}
+	return true
 }
 
 func keys(m map[int]bool) []int {

@@ -163,6 +163,27 @@ func TestWaitHealed(t *testing.T) {
 	}
 }
 
+// agreedLeader ignores what the faulted nodes say: an isolated old leader
+// still believes it leads.
+func TestAgreedLeader(t *testing.T) {
+	d := &fakeDocker{leader: 2}
+	c := &Cluster{Docker: d, Project: "seatsafe"}
+	if l := c.agreedLeader(context.Background(), 1, nil); l != 2 {
+		t.Fatalf("no faults: leader %d", l)
+	}
+	// Node 2 is the faulted one, and the others still name it: no failover yet.
+	if l := c.agreedLeader(context.Background(), 1, []string{"shard1-node2"}); l != 0 {
+		t.Fatalf("faulted leader counted as the new one: %d", l)
+	}
+	d.leader = 3
+	if l := c.agreedLeader(context.Background(), 1, []string{"shard1-node2"}); l != 3 {
+		t.Fatalf("after failover: leader %d", l)
+	}
+	if !c.caughtUp(context.Background(), 1, 100) || c.caughtUp(context.Background(), 1, 101) {
+		t.Fatal("caughtUp wrong around the applied index")
+	}
+}
+
 func TestParseKinds(t *testing.T) {
 	if k, err := ParseKinds("all"); err != nil || len(k) != len(AllKinds) {
 		t.Fatal(k, err)
@@ -177,12 +198,12 @@ func TestParseKinds(t *testing.T) {
 
 func TestSummarize(t *testing.T) {
 	s := Summarize([]Result{
-		{Run: 1, Kind: KillLeader, Verdict: "PASS", HealedIn: 2 * time.Second},
-		{Run: 2, Kind: KillLeader, Verdict: "PASS", HealedIn: 4 * time.Second},
+		{Run: 1, Kind: KillLeader, Verdict: "PASS", Failover: 2 * time.Second, Recovery: time.Second},
+		{Run: 2, Kind: KillLeader, Verdict: "PASS", Failover: 4 * time.Second, Recovery: 3 * time.Second},
 		{Run: 3, Kind: KillLeader, Verdict: "FAIL", Fault: "kill-leader shard 1", Reason: "correctness audit failed"},
-		{Run: 4, Kind: PauseLeader, Verdict: "SKIP"},
+		{Run: 4, Kind: PauseLeader, Verdict: "SKIP", Failover: -1, Recovery: -1},
 	})
-	for _, want := range []string{"4 runs: 2 PASS, 1 FAIL, 1 SKIP", "| kill-leader | 3 | 2 | 1 | 0 | 4.0 s | 4.0 s |", "| pause-leader | 1 | 0 | 0 | 1 | - | - |", "run 3: kill-leader shard 1: correctness audit failed"} {
+	for _, want := range []string{"4 runs: 2 PASS, 1 FAIL, 1 SKIP", "| kill-leader | 3 | 2 | 1 | 0 | 4.0 s | 4.0 s | 3.0 s | 3.0 s |", "| pause-leader | 1 | 0 | 0 | 1 | - | - | - | - |", "run 3: kill-leader shard 1: correctness audit failed"} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("summary missing %q:\n%s", want, s)
 		}

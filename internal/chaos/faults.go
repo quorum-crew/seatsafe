@@ -26,6 +26,12 @@ const (
 	RollingRestart  Kind = "rolling-restart"  // restart a shard's nodes one after another
 )
 
+// RemovesLeader reports whether the fault takes the shard's leader away, so
+// the rest of the group has to elect a new one (a failover).
+func (k Kind) RemovesLeader() bool {
+	return k == KillLeader || k == IsolateLeader || k == PauseLeader
+}
+
 // AllKinds lists every fault kind, in a stable order.
 var AllKinds = []Kind{KillLeader, KillFollower, IsolateLeader, IsolateFollower, PauseLeader, QuorumLoss, DelayShard, KillRouter, RollingRestart}
 

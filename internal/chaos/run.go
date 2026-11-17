@@ -47,9 +47,16 @@ type Result struct {
 	HealAt    time.Duration
 	InjectErr string
 	Audit     string // the load generator's audit line
-	HealedIn  time.Duration
-	Verdict   string // PASS, FAIL, or SKIP (the fault could not be injected)
-	Reason    string
+	// Failover is the time from the fault until the rest of the shard
+	// agreed on a new leader, for faults that take the leader away; -1 if
+	// not measured. Recovery is the time from healing until every replica
+	// was back, agreed on the leader and had applied everything committed
+	// when the fault was healed; -1 if not measured. Both are sampled about
+	// every 100-300 ms (one docker exec per node), so they are approximate.
+	Failover time.Duration
+	Recovery time.Duration
+	Verdict  string // PASS, FAIL, or SKIP (the fault could not be injected)
+	Reason   string
 }
 
 var auditLine = regexp.MustCompile(`(?m)^\s*audit (PASS|FAIL).*$`)
@@ -68,7 +75,7 @@ func Campaign(ctx context.Context, c *Cluster, cfg Config) ([]Result, error) {
 	}
 	defer csvFile.Close()
 	w := csv.NewWriter(csvFile)
-	_ = w.Write([]string{"run", "verdict", "kind", "fault", "inject_at_s", "heal_at_s", "healed_in_s", "audit", "reason"})
+	_ = w.Write([]string{"run", "verdict", "kind", "fault", "inject_at_s", "heal_at_s", "failover_s", "recovery_s", "audit", "reason"})
 	w.Flush()
 
 	rnd := rand.New(rand.NewPCG(cfg.Seed, cfg.Seed^0x9e3779b97f4a7c15))
@@ -91,9 +98,9 @@ func Campaign(ctx context.Context, c *Cluster, cfg Config) ([]Result, error) {
 		}
 		r := runOnce(ctx, c, in, rnd, cfg, i)
 		results = append(results, r)
-		cfg.Logf("run %d: %s  %s  healed in %.1fs  %s %s", i, r.Verdict, r.Fault, r.HealedIn.Seconds(), r.Audit, r.Reason)
+		cfg.Logf("run %d: %s  %s  failover %s  recovery %s  %s %s", i, r.Verdict, r.Fault, secs(r.Failover), secs(r.Recovery), r.Audit, r.Reason)
 		_ = w.Write([]string{strconv.Itoa(r.Run), r.Verdict, string(r.Kind), r.Fault,
-			secs(r.InjectAt), secs(r.HealAt), secs(r.HealedIn), r.Audit, r.Reason})
+			secs(r.InjectAt), secs(r.HealAt), secs(r.Failover), secs(r.Recovery), r.Audit, r.Reason})
 		w.Flush()
 		if r.Verdict == "FAIL" && cfg.StopOnFail {
 			cfg.Logf("stopping after a failure; the cluster is left as it is for inspection")
@@ -104,7 +111,7 @@ func Campaign(ctx context.Context, c *Cluster, cfg Config) ([]Result, error) {
 }
 
 func runOnce(ctx context.Context, c *Cluster, in *Injector, rnd *rand.Rand, cfg Config, i int) Result {
-	r := Result{Run: i, Kind: cfg.Kinds[rnd.IntN(len(cfg.Kinds))]}
+	r := Result{Run: i, Kind: cfg.Kinds[rnd.IntN(len(cfg.Kinds))], Failover: -1, Recovery: -1}
 	dir := filepath.Join(cfg.Out, fmt.Sprintf("run-%04d", i))
 	_ = os.MkdirAll(dir, 0o755)
 	abs, _ := filepath.Abs(dir)
@@ -153,15 +160,39 @@ func runOnce(ctx context.Context, c *Cluster, in *Injector, rnd *rand.Rand, cfg 
 		r.InjectErr = err.Error()
 	}
 	if f != nil {
-		sleep(ctx, between(rnd, cfg.FaultFor))
+		injected := time.Now()
+		holdFor := between(rnd, cfg.FaultFor)
+		failover := make(chan time.Duration, 1)
+		fctx, stopFailover := context.WithTimeout(ctx, holdFor)
+		go func() {
+			d := time.Duration(-1)
+			if err == nil && r.Kind.RemovesLeader() {
+				d = waitFor(fctx, func() bool { return c.agreedLeader(fctx, f.Shard, f.Targets) != 0 }, injected)
+			}
+			failover <- d
+		}()
+		sleep(ctx, holdFor)
+		stopFailover()
+		r.Failover = <-failover
+
+		var target uint64
+		if f.Shard != 0 {
+			target = c.commitIndex(ctx, f.Shard)
+		}
 		hctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		herr := healRetry(hctx, f)
 		cancel()
-		f = nil
+		healed := time.Now()
 		r.HealAt = time.Since(start)
 		if herr != nil {
 			r.Reason = "heal failed: " + herr.Error()
+		} else if f.Shard != 0 && r.Kind != RollingRestart {
+			rctx, cancel := context.WithTimeout(ctx, cfg.HealTimeout)
+			shard := f.Shard
+			r.Recovery = waitFor(rctx, func() bool { return c.caughtUp(rctx, shard, target) }, healed)
+			cancel()
 		}
+		f = nil
 	}
 
 	ld := <-loadDone
@@ -170,8 +201,7 @@ func runOnce(ctx context.Context, c *Cluster, in *Injector, rnd *rand.Rand, cfg 
 		r.Audit = strings.TrimSpace(m)
 	}
 
-	healed, bad, herr := c.WaitHealed(ctx, cfg.HealTimeout)
-	r.HealedIn = healed
+	_, bad, herr := c.WaitHealed(ctx, cfg.HealTimeout)
 	writeFaultLog(dir, r, bad)
 
 	switch {
@@ -194,6 +224,21 @@ func runOnce(ctx context.Context, c *Cluster, in *Injector, rnd *rand.Rand, cfg 
 	return r
 }
 
+// waitFor polls cond until it holds and returns the time since from, or -1
+// if ctx ends first.
+func waitFor(ctx context.Context, cond func() bool, from time.Time) time.Duration {
+	for {
+		if cond() {
+			return time.Since(from)
+		}
+		select {
+		case <-ctx.Done():
+			return -1
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
 func healRetry(ctx context.Context, f *Fault) error {
 	var err error
 	for range 3 {
@@ -211,7 +256,7 @@ func writeFaultLog(dir string, r Result, bad []ShardHealth) {
 	if r.InjectErr != "" {
 		fmt.Fprintf(&b, "inject error: %s\n", r.InjectErr)
 	}
-	fmt.Fprintf(&b, "healed in: %.1fs after the load\n", r.HealedIn.Seconds())
+	fmt.Fprintf(&b, "failover: %ss\nrecovery: %ss (-1 = not measured)\n", secs(r.Failover), secs(r.Recovery))
 	for _, h := range bad {
 		fmt.Fprintf(&b, "not healed: shard %d: %s\n", h.Shard, h.Err)
 	}
@@ -227,10 +272,10 @@ func Summarize(results []Result) string {
 		count[r.Verdict]++
 	}
 	fmt.Fprintf(&b, "%d runs: %d PASS, %d FAIL, %d SKIP\n\n", len(results), count["PASS"], count["FAIL"], count["SKIP"])
-	fmt.Fprintf(&b, "| Fault | Runs | Pass | Fail | Skip | Healed in, median | Healed in, max |\n|---|---|---|---|---|---|---|\n")
+	fmt.Fprintf(&b, "| Fault | Runs | Pass | Fail | Skip | Failover, median | Failover, max | Recovery, median | Recovery, max |\n|---|---|---|---|---|---|---|---|---|\n")
 	for _, k := range AllKinds {
 		var n, pass, fail, skip int
-		var heal []float64
+		var fo, rec []float64
 		for _, r := range results {
 			if r.Kind != k {
 				continue
@@ -239,7 +284,12 @@ func Summarize(results []Result) string {
 			switch r.Verdict {
 			case "PASS":
 				pass++
-				heal = append(heal, r.HealedIn.Seconds())
+				if r.Failover >= 0 {
+					fo = append(fo, r.Failover.Seconds())
+				}
+				if r.Recovery >= 0 {
+					rec = append(rec, r.Recovery.Seconds())
+				}
 			case "FAIL":
 				fail++
 			default:
@@ -249,12 +299,9 @@ func Summarize(results []Result) string {
 		if n == 0 {
 			continue
 		}
-		med, mx := "-", "-"
-		if len(heal) > 0 {
-			slices.Sort(heal)
-			med, mx = fmt.Sprintf("%.1f s", heal[len(heal)/2]), fmt.Sprintf("%.1f s", heal[len(heal)-1])
-		}
-		fmt.Fprintf(&b, "| %s | %d | %d | %d | %d | %s | %s |\n", k, n, pass, fail, skip, med, mx)
+		fmed, fmax := medMax(fo)
+		rmed, rmax := medMax(rec)
+		fmt.Fprintf(&b, "| %s | %d | %d | %d | %d | %s | %s | %s | %s |\n", k, n, pass, fail, skip, fmed, fmax, rmed, rmax)
 	}
 	var fails []string
 	for _, r := range results {
@@ -266,6 +313,14 @@ func Summarize(results []Result) string {
 		b.WriteString("\nFailures:\n" + strings.Join(fails, "\n") + "\n")
 	}
 	return b.String()
+}
+
+func medMax(v []float64) (string, string) {
+	if len(v) == 0 {
+		return "-", "-"
+	}
+	slices.Sort(v)
+	return fmt.Sprintf("%.1f s", v[len(v)/2]), fmt.Sprintf("%.1f s", v[len(v)-1])
 }
 
 func describe(bad []ShardHealth) string {
@@ -290,7 +345,12 @@ func sleep(ctx context.Context, d time.Duration) {
 	}
 }
 
-func secs(d time.Duration) string { return strconv.FormatFloat(d.Seconds(), 'f', 1, 64) }
+func secs(d time.Duration) string {
+	if d < 0 {
+		return "-1"
+	}
+	return strconv.FormatFloat(d.Seconds(), 'f', 1, 64)
+}
 
 func errString(err error) string {
 	if err == nil {

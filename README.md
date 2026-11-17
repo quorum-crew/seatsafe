@@ -58,8 +58,12 @@ go run ./cmd/chaos -runs 500 -seed 1     # the full campaign; the same seed repl
 ```
 
 Results go to `results/chaos-<timestamp>/`: `summary.md` (per fault: runs,
-failures, recovery time), `runs.csv`, and `run-NNNN/` with each run's load
-generator output and history. `-faults kill-leader,quorum-loss` limits the
+failures, failover time and recovery time), `runs.csv`, and `run-NNNN/` with
+each run's load generator output and history. Failover is measured from the
+fault until the rest of the shard agrees on a new leader; recovery from the
+heal until every replica has caught up. Both are sampled through `docker
+exec`, so they are accurate to a few hundred milliseconds; the router's
+`seatsafe_groupclient_leader_recovery_seconds` gives the client's view. `-faults kill-leader,quorum-loss` limits the
 fault kinds, `-stop-on-fail` stops at the first failure and leaves the
 cluster as it is, and `go run ./cmd/chaos -h` lists the rest.
 
