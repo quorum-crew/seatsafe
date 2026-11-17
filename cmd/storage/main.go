@@ -10,6 +10,10 @@
 //	HTTP_ADDR  health and metrics listen address (default :8080)
 //	DATA_DIR   Pebble directory for the Raft log (default /data)
 //	SEED_DIR   directory holding shard{N}.json (default /seed)
+//	COORDINATOR_PEERS  gRPC addresses of the 2PC coordinator group, e.g.
+//	           coord-1:7000,coord-2:7000,coord-3:7000. The shard leader asks it
+//	           for the decision on a hold that expired without one. Unset:
+//	           expired holds stay held (they are never released unilaterally).
 package main
 
 import (
@@ -28,6 +32,8 @@ import (
 
 	"google.golang.org/grpc"
 
+	"github.com/quorum-crew/seatsafe/internal/groupclient"
+	"github.com/quorum-crew/seatsafe/internal/metrics"
 	"github.com/quorum-crew/seatsafe/internal/raftmetrics"
 	"github.com/quorum-crew/seatsafe/internal/raftnode"
 	"github.com/quorum-crew/seatsafe/internal/raftstore"
@@ -100,7 +106,8 @@ func run() error {
 	// HTTP: /healthz (process is up), /readyz (leader known and shard seeded),
 	// /metrics (including Raft role, log positions and, on the leader, follower lag).
 	mux := http.NewServeMux()
-	mux.Handle("/", server.Handler(info, raftmetrics.Writer(strconv.FormatUint(shardID, 10), info.NodeID, node, raftmetrics.NamesFromAddrs(addrs))))
+	reg := metrics.NewRegistry()
+	mux.Handle("/", server.Handler(info, raftmetrics.Writer(strconv.FormatUint(shardID, 10), info.NodeID, node, raftmetrics.NamesFromAddrs(addrs)), reg.Write))
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
 		st := node.Status()
 		_, applied, total, seeded := sm.SeedStatus()
@@ -121,6 +128,19 @@ func run() error {
 	defer stop()
 	go (&shard.Seeder{Node: node, SM: sm, Load: seedLoader(uint32(shardID)), Logf: log.Printf}).Run(ctx)
 	go (&shard.Collector{Node: node, Logf: log.Printf}).Run(ctx)
+	if coord := os.Getenv("COORDINATOR_PEERS"); coord != "" {
+		g, err := groupclient.New("coordinator", splitList(coord), groupclient.Config{}, groupclient.NewMetrics(reg))
+		if err != nil {
+			return err
+		}
+		defer g.Close()
+		resolved := reg.NewCounterVec("seatsafe_expired_holds_resolved_total",
+			"Expired 2PC holds this node resolved as leader, by the coordinator's decision.", "decision")
+		go (&shard.HoldResolver{Node: node, SM: sm, Decide: shard.CoordinatorDecider(g), Logf: log.Printf,
+			OnResolved: func(d string) { resolved.Inc(d) }}).Run(ctx)
+	} else {
+		log.Printf("storage %s: COORDINATOR_PEERS not set; expired 2PC holds will not be resolved", info.NodeID)
+	}
 
 	log.Printf("storage %s: shard %d, raft id %d, peers %v, raft tick %v, election %d ticks, heartbeat %d ticks",
 		info.NodeID, shardID, raftID, addrs, timing.tick, timing.election, timing.heartbeat)
@@ -211,4 +231,15 @@ func getenv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// splitList splits a comma-separated list, dropping blanks.
+func splitList(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

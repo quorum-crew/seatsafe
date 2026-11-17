@@ -42,17 +42,17 @@ services:
     volumes: ["./deploy/seed:/seed:ro", "./deploy/shardmap.json:/etc/seatsafe/shardmap.json:ro"]
 
   # ---- Shard 1 (Raft group 1). Each node keeps its Raft log in its own volume. ----
-  shard1-node1: { <<: *storage, environment: { NODE_ID: shard1-node1, SHARD_ID: "1", PEERS: *shard1 }, volumes: ["./deploy/seed:/seed:ro", "shard1-node1:/data"] }
-  shard1-node2: { <<: *storage, environment: { NODE_ID: shard1-node2, SHARD_ID: "1", PEERS: *shard1 }, volumes: ["./deploy/seed:/seed:ro", "shard1-node2:/data"] }
-  shard1-node3: { <<: *storage, environment: { NODE_ID: shard1-node3, SHARD_ID: "1", PEERS: *shard1 }, volumes: ["./deploy/seed:/seed:ro", "shard1-node3:/data"] }
+  shard1-node1: { <<: *storage, environment: { NODE_ID: shard1-node1, SHARD_ID: "1", COORDINATOR_PEERS: *coord, PEERS: *shard1 }, volumes: ["./deploy/seed:/seed:ro", "shard1-node1:/data"] }
+  shard1-node2: { <<: *storage, environment: { NODE_ID: shard1-node2, SHARD_ID: "1", COORDINATOR_PEERS: *coord, PEERS: *shard1 }, volumes: ["./deploy/seed:/seed:ro", "shard1-node2:/data"] }
+  shard1-node3: { <<: *storage, environment: { NODE_ID: shard1-node3, SHARD_ID: "1", COORDINATOR_PEERS: *coord, PEERS: *shard1 }, volumes: ["./deploy/seed:/seed:ro", "shard1-node3:/data"] }
   # ---- Shard 2 ----
-  shard2-node1: { <<: *storage, environment: { NODE_ID: shard2-node1, SHARD_ID: "2", PEERS: *shard2 }, volumes: ["./deploy/seed:/seed:ro", "shard2-node1:/data"] }
-  shard2-node2: { <<: *storage, environment: { NODE_ID: shard2-node2, SHARD_ID: "2", PEERS: *shard2 }, volumes: ["./deploy/seed:/seed:ro", "shard2-node2:/data"] }
-  shard2-node3: { <<: *storage, environment: { NODE_ID: shard2-node3, SHARD_ID: "2", PEERS: *shard2 }, volumes: ["./deploy/seed:/seed:ro", "shard2-node3:/data"] }
+  shard2-node1: { <<: *storage, environment: { NODE_ID: shard2-node1, SHARD_ID: "2", COORDINATOR_PEERS: *coord, PEERS: *shard2 }, volumes: ["./deploy/seed:/seed:ro", "shard2-node1:/data"] }
+  shard2-node2: { <<: *storage, environment: { NODE_ID: shard2-node2, SHARD_ID: "2", COORDINATOR_PEERS: *coord, PEERS: *shard2 }, volumes: ["./deploy/seed:/seed:ro", "shard2-node2:/data"] }
+  shard2-node3: { <<: *storage, environment: { NODE_ID: shard2-node3, SHARD_ID: "2", COORDINATOR_PEERS: *coord, PEERS: *shard2 }, volumes: ["./deploy/seed:/seed:ro", "shard2-node3:/data"] }
   # ---- Shard 3 ----
-  shard3-node1: { <<: *storage, environment: { NODE_ID: shard3-node1, SHARD_ID: "3", PEERS: *shard3 }, volumes: ["./deploy/seed:/seed:ro", "shard3-node1:/data"] }
-  shard3-node2: { <<: *storage, environment: { NODE_ID: shard3-node2, SHARD_ID: "3", PEERS: *shard3 }, volumes: ["./deploy/seed:/seed:ro", "shard3-node2:/data"] }
-  shard3-node3: { <<: *storage, environment: { NODE_ID: shard3-node3, SHARD_ID: "3", PEERS: *shard3 }, volumes: ["./deploy/seed:/seed:ro", "shard3-node3:/data"] }
+  shard3-node1: { <<: *storage, environment: { NODE_ID: shard3-node1, SHARD_ID: "3", COORDINATOR_PEERS: *coord, PEERS: *shard3 }, volumes: ["./deploy/seed:/seed:ro", "shard3-node1:/data"] }
+  shard3-node2: { <<: *storage, environment: { NODE_ID: shard3-node2, SHARD_ID: "3", COORDINATOR_PEERS: *coord, PEERS: *shard3 }, volumes: ["./deploy/seed:/seed:ro", "shard3-node2:/data"] }
+  shard3-node3: { <<: *storage, environment: { NODE_ID: shard3-node3, SHARD_ID: "3", COORDINATOR_PEERS: *coord, PEERS: *shard3 }, volumes: ["./deploy/seed:/seed:ro", "shard3-node3:/data"] }
   # ---- 2PC coordinator (Raft group 0; still a placeholder) ----
   coord-1: { <<: *seatsafe, command: ["coordinator"], environment: { NODE_ID: coord-1, PEERS: *coord } }
   coord-2: { <<: *seatsafe, command: ["coordinator"], environment: { NODE_ID: coord-2, PEERS: *coord } }
