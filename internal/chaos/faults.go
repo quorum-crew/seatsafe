@@ -24,6 +24,10 @@ const (
 	DelayShard      Kind = "delay-shard"      // add network delay to every node of a shard
 	KillRouter      Kind = "kill-router"      // SIGKILL the stateless router, restart it later
 	RollingRestart  Kind = "rolling-restart"  // restart a shard's nodes one after another
+
+	// None injects nothing: a control run under the same load, to count
+	// elections nobody caused. Not part of "all".
+	None Kind = "none"
 )
 
 // RemovesLeader reports whether the fault takes the shard's leader away, so
@@ -43,8 +47,8 @@ func ParseKinds(s string) ([]Kind, error) {
 	var out []Kind
 	for _, p := range strings.Split(s, ",") {
 		k := Kind(strings.TrimSpace(p))
-		if !slices.Contains(AllKinds, k) {
-			return nil, fmt.Errorf("unknown fault %q (known: %v)", k, AllKinds)
+		if !slices.Contains(AllKinds, k) && k != None {
+			return nil, fmt.Errorf("unknown fault %q (known: %v, none)", k, AllKinds)
 		}
 		out = append(out, k)
 	}
@@ -94,6 +98,10 @@ type Injector struct {
 func (in *Injector) Inject(ctx context.Context, kind Kind) (*Fault, error) {
 	shard := ShardIDs[in.Rand.IntN(len(ShardIDs))]
 	f := &Fault{Kind: kind, Shard: shard}
+	if kind == None {
+		f.Shard = 0
+		return f, nil
+	}
 	pickLeader := func() (int, error) {
 		l := in.C.Leader(ctx, shard)
 		if l == 0 {

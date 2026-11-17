@@ -224,6 +224,24 @@ func (c *Cluster) agreedLeader(ctx context.Context, shard int, exclude []string)
 	return leader
 }
 
+// Terms returns each shard's current Raft term (the highest any of its nodes
+// reports). ok is false if a shard has no reachable node.
+func (c *Cluster) Terms(ctx context.Context) (map[int]uint64, bool) {
+	terms := map[int]uint64{}
+	for _, s := range ShardIDs {
+		found := false
+		for _, n := range NodeIDs {
+			if m, err := c.Metrics(ctx, Service(s, n)); err == nil {
+				terms[s], found = max(terms[s], uint64(m["seatsafe_raft_term"])), true
+			}
+		}
+		if !found {
+			return nil, false
+		}
+	}
+	return terms, true
+}
+
 // commitIndex returns the highest commit index any reachable node of the
 // shard reports.
 func (c *Cluster) commitIndex(ctx context.Context, shard int) uint64 {

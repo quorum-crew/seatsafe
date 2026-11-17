@@ -198,14 +198,40 @@ func TestParseKinds(t *testing.T) {
 
 func TestSummarize(t *testing.T) {
 	s := Summarize([]Result{
-		{Run: 1, Kind: KillLeader, Verdict: "PASS", Failover: 2 * time.Second, Recovery: time.Second},
-		{Run: 2, Kind: KillLeader, Verdict: "PASS", Failover: 4 * time.Second, Recovery: 3 * time.Second},
+		{Run: 1, Kind: KillLeader, Verdict: "PASS", Failover: 2 * time.Second, Recovery: time.Second, Elections: 1, P99: 50 * time.Millisecond, Max: 800 * time.Millisecond},
+		{Run: 2, Kind: KillLeader, Verdict: "PASS", Failover: 4 * time.Second, Recovery: 3 * time.Second, Elections: 2, P99: 100 * time.Millisecond, Max: 900 * time.Millisecond},
 		{Run: 3, Kind: KillLeader, Verdict: "FAIL", Fault: "kill-leader shard 1", Reason: "correctness audit failed"},
 		{Run: 4, Kind: PauseLeader, Verdict: "SKIP", Failover: -1, Recovery: -1},
 	})
-	for _, want := range []string{"4 runs: 2 PASS, 1 FAIL, 1 SKIP", "| kill-leader | 3 | 2 | 1 | 0 | 4.0 s | 4.0 s | 3.0 s | 3.0 s |", "| pause-leader | 1 | 0 | 0 | 1 | - | - | - | - |", "run 3: kill-leader shard 1: correctness audit failed"} {
+	for _, want := range []string{"4 runs: 2 PASS, 1 FAIL, 1 SKIP", "| kill-leader | 3 | 2 | 1 | 0 | 4.0 s | 4.0 s | 3.0 s | 3.0 s | 1.5 | 0.1 s | 0.9 s |", "| pause-leader | 1 | 0 | 0 | 1 | - | - | - | - | - | - | - |", "run 3: kill-leader shard 1: correctness audit failed"} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("summary missing %q:\n%s", want, s)
 		}
+	}
+}
+
+func TestClientLatencyParsing(t *testing.T) {
+	out := "closed flash, 30s window\n  latency (ms)            count       p50       p90       p99     p99.9       max\n" +
+		"  all                     88899   4587.52   5091.33   6176.77   6946.81   7766.02\n  CONFIRMED  18115 573.95 4243.45 4886.53 5861.38 6549.50\n"
+	p99, max := clientLatency(out)
+	if p99 != 6176770*time.Microsecond || max != 7766020*time.Microsecond {
+		t.Fatalf("p99 %v max %v", p99, max)
+	}
+	if p99, _ := clientLatency("no table"); p99 != -1 {
+		t.Fatal("missing table should give -1")
+	}
+}
+
+func TestNoneInjectsNothing(t *testing.T) {
+	d := &fakeDocker{leader: 2}
+	f, err := newInjector(d).Inject(context.Background(), None)
+	if err != nil || f == nil || len(d.commands()) != 0 || f.Heal(context.Background()) != nil {
+		t.Fatalf("none: %v %v %v", f, err, d.commands())
+	}
+	if k, err := ParseKinds("none,kill-leader"); err != nil || len(k) != 2 {
+		t.Fatal(k, err)
+	}
+	if k, _ := ParseKinds("all"); slices.Contains(k, None) {
+		t.Fatal("all should not include none")
 	}
 }

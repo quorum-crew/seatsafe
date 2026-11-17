@@ -55,6 +55,14 @@ type Result struct {
 	// every 100-300 ms (one docker exec per node), so they are approximate.
 	Failover time.Duration
 	Recovery time.Duration
+	// Elections is how many elections happened during the run, summed over
+	// the shards (Raft term increases); -1 if unknown. In a "none" run
+	// every one is unnecessary.
+	Elections int
+	// P99 and Max are the load generator's client latency over the run
+	// (from intended send time, so they include failover stalls); -1 if
+	// unknown.
+	P99, Max time.Duration
 	Verdict  string // PASS, FAIL, or SKIP (the fault could not be injected)
 	Reason   string
 }
@@ -75,7 +83,7 @@ func Campaign(ctx context.Context, c *Cluster, cfg Config) ([]Result, error) {
 	}
 	defer csvFile.Close()
 	w := csv.NewWriter(csvFile)
-	_ = w.Write([]string{"run", "verdict", "kind", "fault", "inject_at_s", "heal_at_s", "failover_s", "recovery_s", "audit", "reason"})
+	_ = w.Write([]string{"run", "verdict", "kind", "fault", "inject_at_s", "heal_at_s", "failover_s", "recovery_s", "elections", "client_p99_ms", "client_max_ms", "audit", "reason"})
 	w.Flush()
 
 	rnd := rand.New(rand.NewPCG(cfg.Seed, cfg.Seed^0x9e3779b97f4a7c15))
@@ -98,9 +106,11 @@ func Campaign(ctx context.Context, c *Cluster, cfg Config) ([]Result, error) {
 		}
 		r := runOnce(ctx, c, in, rnd, cfg, i)
 		results = append(results, r)
-		cfg.Logf("run %d: %s  %s  failover %s  recovery %s  %s %s", i, r.Verdict, r.Fault, secs(r.Failover), secs(r.Recovery), r.Audit, r.Reason)
+		cfg.Logf("run %d: %s  %s  failover %s  recovery %s  elections %d  client p99 %s max %s  %s %s", i, r.Verdict, r.Fault,
+			secs(r.Failover), secs(r.Recovery), r.Elections, millis(r.P99), millis(r.Max), r.Audit, r.Reason)
 		_ = w.Write([]string{strconv.Itoa(r.Run), r.Verdict, string(r.Kind), r.Fault,
-			secs(r.InjectAt), secs(r.HealAt), secs(r.Failover), secs(r.Recovery), r.Audit, r.Reason})
+			secs(r.InjectAt), secs(r.HealAt), secs(r.Failover), secs(r.Recovery), strconv.Itoa(r.Elections),
+			millis(r.P99), millis(r.Max), r.Audit, r.Reason})
 		w.Flush()
 		if r.Verdict == "FAIL" && cfg.StopOnFail {
 			cfg.Logf("stopping after a failure; the cluster is left as it is for inspection")
@@ -111,7 +121,8 @@ func Campaign(ctx context.Context, c *Cluster, cfg Config) ([]Result, error) {
 }
 
 func runOnce(ctx context.Context, c *Cluster, in *Injector, rnd *rand.Rand, cfg Config, i int) Result {
-	r := Result{Run: i, Kind: cfg.Kinds[rnd.IntN(len(cfg.Kinds))], Failover: -1, Recovery: -1}
+	r := Result{Run: i, Kind: cfg.Kinds[rnd.IntN(len(cfg.Kinds))], Failover: -1, Recovery: -1, Elections: -1, P99: -1, Max: -1}
+	termsBefore, termsOK := c.Terms(ctx)
 	dir := filepath.Join(cfg.Out, fmt.Sprintf("run-%04d", i))
 	_ = os.MkdirAll(dir, 0o755)
 	abs, _ := filepath.Abs(dir)
@@ -200,8 +211,15 @@ func runOnce(ctx context.Context, c *Cluster, in *Injector, rnd *rand.Rand, cfg 
 	if m := auditLine.FindString(ld.out); m != "" {
 		r.Audit = strings.TrimSpace(m)
 	}
+	r.P99, r.Max = clientLatency(ld.out)
 
 	_, bad, herr := c.WaitHealed(ctx, cfg.HealTimeout)
+	if after, ok := c.Terms(ctx); ok && termsOK {
+		r.Elections = 0
+		for s, t := range after {
+			r.Elections += int(t - termsBefore[s])
+		}
+	}
 	writeFaultLog(dir, r, bad)
 
 	switch {
@@ -248,6 +266,22 @@ func waitFor(ctx context.Context, cond func() bool, from time.Time) time.Duratio
 	}
 }
 
+var allLatency = regexp.MustCompile(`(?m)^\s*all\s+\d+\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s*$`)
+
+// clientLatency reads p99 and max from the "all" row of the load
+// generator's latency table (count, p50, p90, p99, p99.9, max, in ms).
+func clientLatency(out string) (p99, max time.Duration) {
+	m := allLatency.FindStringSubmatch(out)
+	if m == nil {
+		return -1, -1
+	}
+	ms := func(s string) time.Duration {
+		v, _ := strconv.ParseFloat(s, 64)
+		return time.Duration(v * float64(time.Millisecond))
+	}
+	return ms(m[3]), ms(m[5])
+}
+
 func healRetry(ctx context.Context, f *Fault) error {
 	var err error
 	for range 3 {
@@ -281,10 +315,11 @@ func Summarize(results []Result) string {
 		count[r.Verdict]++
 	}
 	fmt.Fprintf(&b, "%d runs: %d PASS, %d FAIL, %d SKIP\n\n", len(results), count["PASS"], count["FAIL"], count["SKIP"])
-	fmt.Fprintf(&b, "| Fault | Runs | Pass | Fail | Skip | Failover, median | Failover, max | Recovery, median | Recovery, max |\n|---|---|---|---|---|---|---|---|---|\n")
-	for _, k := range AllKinds {
+	fmt.Fprintf(&b, "| Fault | Runs | Pass | Fail | Skip | Failover, median | Failover, max | Recovery, median | Recovery, max | Elections per run | Client p99, median | Client max, median |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n")
+	for _, k := range append(slices.Clone(AllKinds), None) {
 		var n, pass, fail, skip int
-		var fo, rec []float64
+		var fo, rec, p99, mx []float64
+		elections, counted := 0, 0
 		for _, r := range results {
 			if r.Kind != k {
 				continue
@@ -299,6 +334,12 @@ func Summarize(results []Result) string {
 				if r.Recovery >= 0 {
 					rec = append(rec, r.Recovery.Seconds())
 				}
+				if r.Elections >= 0 {
+					elections, counted = elections+r.Elections, counted+1
+				}
+				if r.P99 >= 0 {
+					p99, mx = append(p99, r.P99.Seconds()), append(mx, r.Max.Seconds())
+				}
 			case "FAIL":
 				fail++
 			default:
@@ -310,7 +351,13 @@ func Summarize(results []Result) string {
 		}
 		fmed, fmax := medMax(fo)
 		rmed, rmax := medMax(rec)
-		fmt.Fprintf(&b, "| %s | %d | %d | %d | %d | %s | %s | %s | %s |\n", k, n, pass, fail, skip, fmed, fmax, rmed, rmax)
+		pmed, _ := medMax(p99)
+		mmed, _ := medMax(mx)
+		el := "-"
+		if counted > 0 {
+			el = strconv.FormatFloat(float64(elections)/float64(counted), 'f', 1, 64)
+		}
+		fmt.Fprintf(&b, "| %s | %d | %d | %d | %d | %s | %s | %s | %s | %s | %s | %s |\n", k, n, pass, fail, skip, fmed, fmax, rmed, rmax, el, pmed, mmed)
 	}
 	var fails []string
 	for _, r := range results {
@@ -352,6 +399,13 @@ func sleep(ctx context.Context, d time.Duration) {
 	case <-ctx.Done():
 	case <-time.After(d):
 	}
+}
+
+func millis(d time.Duration) string {
+	if d < 0 {
+		return "-1"
+	}
+	return strconv.FormatFloat(float64(d)/float64(time.Millisecond), 'f', 0, 64)
 }
 
 func secs(d time.Duration) string {
