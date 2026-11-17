@@ -28,7 +28,10 @@ docker compose down                   # stop everything
 ```
 
 - Prometheus: http://localhost:9090/targets
-- Grafana: http://localhost:3000
+- Grafana: http://localhost:3000, dashboard **SeatSafe → SeatSafe overview** (no login): bookings by
+  outcome, latency p50/p99/p99.9, leader and term per shard, follower lag, nodes up, router retries
+  and failover time. It is provisioned from `deploy/grafana/provisioning/dashboards/`; edits made in
+  the UI are lost on restart, so export the JSON back into that folder to keep them.
 
 ## Run tests
 
