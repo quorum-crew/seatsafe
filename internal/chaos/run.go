@@ -221,6 +221,15 @@ func runOnce(ctx context.Context, c *Cluster, in *Injector, rnd *rand.Rand, cfg 
 	if r.InjectErr != "" && r.Verdict != "SKIP" && r.Reason == "" {
 		r.Reason = "partial inject: " + r.InjectErr
 	}
+	if r.Verdict == "FAIL" {
+		// Keep the evidence: the next run may reset the cluster, which
+		// deletes the containers and their logs.
+		lctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		if logs, err := c.compose(lctx, "logs", "--no-color", "--timestamps"); err == nil {
+			_ = os.WriteFile(filepath.Join(dir, "cluster-logs.txt"), []byte(logs), 0o644)
+		}
+		cancel()
+	}
 	return r
 }
 
