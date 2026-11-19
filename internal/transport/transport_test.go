@@ -3,6 +3,7 @@ package transport
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -26,9 +27,14 @@ type recordSM struct {
 	entries []string
 }
 
+// Apply records data, ignoring data it already holds (like seatsm's dedup
+// by request ID), so propose can retry after a leader change.
 func (s *recordSM) Apply(_ uint64, data []byte) any {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if i := slices.Index(s.entries, string(data)); i >= 0 {
+		return i + 1
+	}
 	s.entries = append(s.entries, string(data))
 	return len(s.entries)
 }
@@ -145,11 +151,24 @@ func waitSame(t *testing.T, members map[uint64]*member, want int) {
 	}
 }
 
+// propose proposes data through n, retrying like a client while the
+// leadership is moving (raftnode.ErrLeadershipLost, or raft.ErrProposalDropped
+// during an election): slow fsyncs under -race and GOMAXPROCS=2 make a leader
+// step down now and then. The state machines ignore data they already hold,
+// so a retry of an entry that did commit is harmless.
 func propose(t *testing.T, n *raftnode.Node, data string) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if _, err := n.Propose(ctx, []byte(data)); err != nil {
+	for {
+		_, err := n.Propose(ctx, []byte(data))
+		if err == nil {
+			return
+		}
+		if ctx.Err() == nil && (errors.Is(err, raftnode.ErrLeadershipLost) || errors.Is(err, raft.ErrProposalDropped)) {
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
 		t.Fatalf("propose: %v", err)
 	}
 }
