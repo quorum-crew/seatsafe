@@ -215,6 +215,12 @@ func (s *server) SendSnapshot(stream grpc.ClientStreamingServer[seatsafev1.Snaps
 	if m.Type != raftpb.MsgSnap {
 		return status.Errorf(codes.InvalidArgument, "SendSnapshot carried a %v", m.Type)
 	}
+	if m.To != s.t.self {
+		// Same check as Send: a snapshot for another node would replace this
+		// node's state with the wrong replica's view of the log.
+		return status.Errorf(codes.FailedPrecondition,
+			"%s: snapshot for Raft node %d reached node %d of group %d", misaddressed, m.To, s.t.self, s.t.groupID)
+	}
 	n := s.t.node.Load()
 	if n == nil {
 		return status.Error(codes.Unavailable, "node not started yet")
@@ -314,6 +320,7 @@ func (p *peer) runSnapshots() {
 			}
 			start := time.Now()
 			size, err := p.sendSnapshot(m)
+			p.redialIfMisaddressed(err)
 			if err != nil {
 				log.Printf("transport: snapshot at index %d to peer %d failed after %v: %v",
 					index, p.id, time.Since(start).Round(time.Millisecond), err)
