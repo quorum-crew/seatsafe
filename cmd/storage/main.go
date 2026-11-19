@@ -157,8 +157,10 @@ func run() error {
 		defer g.Close()
 		resolved := reg.NewCounterVec("seatsafe_expired_holds_resolved_total",
 			"Expired 2PC holds this node resolved as leader, by the coordinator's decision.", "decision")
+		refused := reg.NewCounterVec("seatsafe_2pc_decision_refused_total",
+			"Coordinator decisions this shard refused because they contradict its log; should stay 0.", "decision")
 		go (&shard.HoldResolver{Node: node, SM: sm, Decide: shard.CoordinatorDecider(g), Logf: log.Printf,
-			OnResolved: func(d string) { resolved.Inc(d) }}).Run(ctx)
+			OnResolved: func(d string) { resolved.Inc(d) }, OnRefused: func(d string) { refused.Inc(d) }}).Run(ctx)
 	} else {
 		log.Printf("storage %s: COORDINATOR_PEERS not set; expired 2PC holds will not be resolved", info.NodeID)
 	}

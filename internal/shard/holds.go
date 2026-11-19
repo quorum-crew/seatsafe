@@ -69,6 +69,11 @@ type HoldResolver struct {
 	// OnResolved, if set, is called after a decision is applied, with the
 	// decision ("commit" or "abort"). Used for metrics.
 	OnResolved func(decision string)
+	// OnRefused, if set, is called when this shard refuses the coordinator's
+	// decision because it contradicts the shard's log (e.g. COMMIT for a txn
+	// it already aborted). That means the coordinator and a participant
+	// disagree about a txn's outcome, so it should never happen.
+	OnRefused func(decision string)
 
 	now func() time.Time // the leader's clock; replaced in tests
 }
@@ -187,6 +192,9 @@ func (r *HoldResolver) resolveOne(ctx context.Context, txnID string, now func() 
 		// The decision contradicts this shard's log, e.g. COMMIT for a txn it
 		// already aborted. The first decision applied stands.
 		r.Logf("holds: txn %s: %s refused: %v", txnID, name, rr.Err)
+		if r.OnRefused != nil {
+			r.OnRefused(name)
+		}
 		return nil
 	}
 	r.Logf("holds: txn %s expired, coordinator says %s", txnID, name)

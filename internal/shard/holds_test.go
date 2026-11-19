@@ -260,3 +260,48 @@ func TestCoordinatorDecider(t *testing.T) {
 		t.Fatalf("leader asked %d times", leader.asked.Load())
 	}
 }
+
+// If the coordinator's answer contradicts the shard's log, the shard keeps
+// its first decision and counts the refusal (#39). Here the coordinator's
+// Abort reaches the shard while the resolver is asking GetDecision, which
+// then (wrongly) says COMMIT.
+func TestRefusedDecisionCounted(t *testing.T) {
+	c := startShard(t, fakeSeed{version: "v1", chunks: 1}, false)
+	c.waitSeeded()
+	leadID, lead := c.leader()
+	a := seat(0, 6)
+	prepareHold(t, lead.addr, "t1", 50*time.Millisecond, a)
+
+	var aborted sync.Once
+	var refused, resolved atomic.Int32
+	decide := func(ctx context.Context, txn string) (seatsafev1.Decision, error) {
+		aborted.Do(func() {
+			if _, err := seatsafev1.NewParticipantServiceClient(conn(t, lead.addr)).Abort(ctx, &seatsafev1.DecisionRequest{TxnId: txn}); err != nil {
+				t.Errorf("abort: %v", err)
+			}
+		})
+		return seatsafev1.Decision_DECISION_COMMIT, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		(&HoldResolver{Node: c.nodes[leadID].node, SM: c.nodes[leadID].sm, Decide: decide, Logf: t.Logf, Interval: 10 * time.Millisecond,
+			OnRefused: func(string) { refused.Add(1) }, OnResolved: func(string) { resolved.Add(1) }}).Run(ctx)
+	}()
+	t.Cleanup(func() { cancel(); <-done })
+
+	deadline := time.Now().Add(5 * time.Second)
+	for refused.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("refused decision never counted")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if resolved.Load() != 0 {
+		t.Fatalf("a refused decision was also counted as resolved")
+	}
+	if r := book(t, lead.addr, "req-after", "bob", a); r.Outcome != seatsafev1.BookingOutcome_BOOKING_OUTCOME_CONFIRMED {
+		t.Fatalf("the abort should stand and free the seat: %v", r)
+	}
+}
