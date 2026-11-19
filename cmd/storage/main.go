@@ -10,7 +10,7 @@
 //	HTTP_ADDR  health and metrics listen address (default :8080)
 //	DATA_DIR   Pebble directory for the Raft log (default /data)
 //	SEED_DIR   directory holding shard{N}.json (default /seed)
-//	RAFT_TICK_MS           Raft tick interval in milliseconds (default 100)
+//	RAFT_TICK_MS           Raft tick interval in milliseconds (default 25)
 //	RAFT_ELECTION_TICKS    ticks without a leader before an election (default 10)
 //	RAFT_HEARTBEAT_TICKS   ticks between leader heartbeats (default 1)
 //	RAFT_SNAPSHOT_ENTRIES  applied entries between snapshots (default 100000)

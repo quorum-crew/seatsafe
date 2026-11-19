@@ -74,3 +74,19 @@ The new default should be confirmed under the heaviest load we run. Run no-fault
 chaos runs during the 10,000-user benchmark, or `go run ./cmd/chaos -faults
 none -rate 1000`, and check that elections stay at 0. If they don't, go back
 to `RAFT_TICK_MS=50` in compose: still under 1 s.
+
+### Laptop check, Nov 19 (Mrudula)
+
+The 10,000-user benchmark (1M seats, #26 + #32 + this change + #35) with 25 ms
+ticks had **4 elections after startup** (shard 1: 2, shards 2 and 3: 1 each).
+Leaders stepped down because their followers went quiet ("quorum is not
+active"). The elections coincided with slow snapshots (capture up to 2.15 s,
+encode up to 2.9 s, persist up to 1.7 s) while the load generator, on the same
+laptop, used about 11 cores and one storage node peaked at 1030% CPU. Two of
+the elections were on shards that were not snapshotting at the time, so CPU
+starvation is the likelier cause. The fresh and flash runs at 800 orders/s had
+none.
+
+**Decision:** keep 25 ms for now and decide between 25 and 50 ms on AWS, where
+the load generator runs on its own machine. If elections remain under the
+heaviest load there, `RAFT_TICK_MS=50` keeps failover under 1 s.
