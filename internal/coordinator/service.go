@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -39,20 +40,7 @@ func (c *Coordinator) submit(ctx context.Context, req *seatsafev1.SubmitOrderReq
 	if err := c.validate(req); err != nil {
 		return nil, err
 	}
-	res, err := c.propose(ctx, &seatsafev1.CoordCommand{Op: &seatsafev1.CoordCommand_Started{Started: &seatsafev1.TxnStarted{
-		TxnId: req.GetTxnId(), UserId: req.GetUserId(), Participants: req.GetParticipants(),
-	}}})
-	if err != nil {
-		return nil, statusErr(err)
-	}
-	if res.Err != nil || res.Txn == nil {
-		return nil, status.Errorf(codes.Internal, "coordinator: TxnStarted refused: %v", res.Err)
-	}
-	if res.Txn.Decided() {
-		return res.Txn.Response(true), nil // the stored answer to an earlier try
-	}
-
-	f, ok := c.join(res.Txn)
+	f, ok := c.join(req)
 	if !ok {
 		return nil, statusErr(errClosed)
 	}
@@ -65,7 +53,7 @@ func (c *Coordinator) submit(ctx context.Context, req *seatsafev1.SubmitOrderReq
 	if f.err != nil {
 		return nil, statusErr(f.err)
 	}
-	return f.txn.Response(false), nil
+	return f.txn.Response(f.replayed), nil
 }
 
 // validate checks what the router promises: a txn id, and participants sorted
@@ -91,23 +79,28 @@ func (c *Coordinator) validate(req *seatsafev1.SubmitOrderRequest) error {
 	return nil
 }
 
-// join returns the run of t in progress on this node, starting one if there
-// is none. ok is false if the coordinator is closed.
-func (c *Coordinator) join(t *coordsm.Txn) (f *flight, ok bool) {
+// join returns the run of the order in progress on this node, starting one
+// if there is none. ok is false if the coordinator is closed.
+//
+// The run is registered before TxnStarted is proposed. A node that has just
+// become leader aborts every undecided txn it is not running itself, so an
+// order must count as running here from before its record can exist.
+func (c *Coordinator) join(req *seatsafev1.SubmitOrderRequest) (f *flight, ok bool) {
+	id := req.GetTxnId()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if f := c.flights[t.ID]; f != nil {
+	if f := c.flights[id]; f != nil {
 		return f, true
 	}
 	if c.closed {
 		return nil, false
 	}
 	f = &flight{done: make(chan struct{})}
-	c.flights[t.ID] = f
+	c.flights[id] = f
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
-		c.run(f, t)
+		c.run(f, req)
 	}()
 	return f, true
 }
@@ -119,21 +112,32 @@ func (c *Coordinator) inFlight(id string) bool {
 }
 
 // land ends a run: waiting callers get the decided record or the error.
-func (c *Coordinator) land(f *flight, id string, t *coordsm.Txn, err error) {
+func (c *Coordinator) land(f *flight, id string, t *coordsm.Txn, replayed bool, err error) {
 	c.mu.Lock()
 	delete(c.flights, id)
 	c.mu.Unlock()
-	f.txn, f.err = t, err
+	f.txn, f.replayed, f.err = t, replayed, err
 	close(f.done)
 }
 
-// run takes one undecided txn from Prepare to its decision, then hands the
-// decision to the background deliveries. It does not depend on any caller.
-func (c *Coordinator) run(f *flight, t *coordsm.Txn) {
-	// A run that ended between this caller's TxnStarted and its join has
-	// already decided the txn.
-	if cur, ok := c.sm.Get(t.ID); ok && cur.Decided() {
-		c.land(f, t.ID, cur, nil)
+// run takes one order from TxnStarted to its decision, then hands the
+// decision to the background deliveries. It does not depend on any caller:
+// once started, the order is decided even if every caller gives up.
+func (c *Coordinator) run(f *flight, req *seatsafev1.SubmitOrderRequest) {
+	id := req.GetTxnId()
+	res, err := c.proposeWhileLeader(&seatsafev1.CoordCommand{Op: &seatsafev1.CoordCommand_Started{Started: &seatsafev1.TxnStarted{
+		TxnId: id, UserId: req.GetUserId(), Participants: req.GetParticipants(),
+	}}})
+	if err == nil && (res.Err != nil || res.Txn == nil) {
+		err = fmt.Errorf("TxnStarted refused: %v", res.Err)
+	}
+	if err != nil {
+		c.land(f, id, nil, false, err)
+		return
+	}
+	t := res.Txn
+	if t.Decided() {
+		c.land(f, id, t, true, nil) // the stored answer to an earlier try
 		return
 	}
 
@@ -141,36 +145,36 @@ func (c *Coordinator) run(f *flight, t *coordsm.Txn) {
 	votes := c.prepare(t)
 	c.Metrics.Prepare.Observe(time.Since(start).Seconds())
 	if c.cfg.beforeDecide != nil {
-		c.cfg.beforeDecide(c.ctx, t.ID)
+		c.cfg.beforeDecide(c.ctx, id)
 	}
 	if c.ctx.Err() != nil {
-		c.land(f, t.ID, nil, errClosed)
+		c.land(f, id, nil, false, errClosed)
 		return
 	}
 
 	start = time.Now()
-	res, err := c.proposeWhileLeader(&seatsafev1.CoordCommand{Op: &seatsafev1.CoordCommand_Decided{Decided: decide(t, votes)}})
+	res, err = c.proposeWhileLeader(&seatsafev1.CoordCommand{Op: &seatsafev1.CoordCommand_Decided{Decided: decide(t, votes)}})
 	c.Metrics.Decide.Observe(time.Since(start).Seconds())
 	if err == nil && (res.Err != nil || res.Txn == nil) {
-		err = status.Errorf(codes.Internal, "TxnDecided refused: %v", res.Err)
+		err = fmt.Errorf("TxnDecided refused: %v", res.Err)
 	}
 	if err != nil {
 		// Not leader any more, or shutting down: the next leader aborts the
 		// txn or finds the decision if this proposal still commits.
-		c.land(f, t.ID, nil, err)
+		c.land(f, id, nil, false, err)
 		return
 	}
 	if res.Won {
 		c.Metrics.Decisions.Inc(decisionLabel(res.Txn.Decision), SourceVotes)
 	}
 	if c.cfg.afterDecided != nil {
-		c.cfg.afterDecided(c.ctx, t.ID)
+		c.cfg.afterDecided(c.ctx, id)
 	}
 	if c.ctx.Err() != nil {
-		c.land(f, t.ID, nil, errClosed)
+		c.land(f, id, nil, false, errClosed)
 		return
 	}
-	c.land(f, t.ID, res.Txn, nil)
+	c.land(f, id, res.Txn, false, nil)
 	c.deliver(res.Txn)
 }
 

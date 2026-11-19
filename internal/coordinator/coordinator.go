@@ -6,9 +6,9 @@
 //
 // # SubmitOrder
 //
-//  1. Log TxnStarted with the participants. If the txn is already decided,
-//     answer with the stored result (replayed = true). If this leader is
-//     already running it, wait for that run.
+//  1. If this leader is already running the order, wait for that run.
+//     Otherwise log TxnStarted with the participants; if the txn turns out
+//     to be decided already, answer with the stored result (replayed = true).
 //  2. Prepare on every participant in parallel, within PrepareTimeout.
 //  3. All YES: propose TxnDecided(COMMIT, CONFIRMED). Any NO that names
 //     conflicting seats: ABORT, SEAT_UNAVAILABLE with the conflicts of every
@@ -167,9 +167,10 @@ type Coordinator struct {
 // flight is one order being run on this node. Later SubmitOrder calls for the
 // same txn wait on done instead of running it again.
 type flight struct {
-	done chan struct{}
-	txn  *coordsm.Txn // the decided record, when err is nil
-	err  error
+	done     chan struct{}
+	txn      *coordsm.Txn // the decided record, when err is nil
+	replayed bool         // the txn was decided before this run began
+	err      error
 }
 
 type delivery struct {

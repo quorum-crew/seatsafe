@@ -341,3 +341,38 @@ func TestRandomOrdersWithLeaderKills(t *testing.T) {
 		t.Fatal("no coordinator leader or no shard leader was killed during the run")
 	}
 }
+
+// Orders that reach a node just as it becomes leader are its own to run: the
+// takeover aborts what earlier leaders left undecided, never an order
+// submitted to the new leader itself. Every order here is first sent after
+// the old leader died and its seats are free, so each must commit.
+func TestTakeoverSparesOrdersSubmittedToTheNewLeader(t *testing.T) {
+	c := startCluster(t, options{})
+	for round := range 3 {
+		old, _ := c.coordLeader()
+		c.killCoord(old)
+		const n = 24
+		results := make([]*seatsafev1.BookSeatsResponse, n)
+		var wg sync.WaitGroup
+		for i := range n {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				seatNo := round*n + i
+				results[i] = c.mustSubmit(fmt.Sprintf("r%d-%d", round, i), on(1, seatNo), on(2, seatNo), on(3, seatNo))
+			}()
+		}
+		wg.Wait()
+		for i, r := range results {
+			if r.GetOutcome() != confirmed {
+				t.Fatalf("round %d: order %d, submitted only to the new leader, ended %v\ncoordinator log:\n%s", round, i, r.GetOutcome(), c.logText())
+			}
+		}
+		c.startCoordNode(old)
+		c.coordLeader()
+	}
+	if got := c.value(decisions, "abort", SourceNewLeader); got != 0 {
+		t.Fatalf("new leaders aborted %v orders that were theirs to run", got)
+	}
+	c.settled()
+}
