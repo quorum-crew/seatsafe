@@ -67,7 +67,7 @@ func (r *run) attempt(intended time.Time, dropped bool) {
 
 func (r *run) done(res Result, intended time.Time) {
 	r.mu.Lock()
-	r.orders = append(r.orders, AuditOrder{res.RequestID, res.Order.Seats, res.Outcome})
+	r.orders = append(r.orders, AuditOrder{res.RequestID, res.Order.Seats, res.Outcome, res.Order.Cross})
 	sinks := r.sinks
 	r.mu.Unlock()
 	for _, s := range sinks {
@@ -291,6 +291,18 @@ func Run(ctx context.Context, cfg Config, u *Universe, env Env) (*Summary, error
 			return nil, err
 		}
 		sum.Audit = RunAudit(before, after, r.orders)
+		// An aborted cross-shard order's seats stay HELD until the
+		// coordinator's Abort arrives, which is after the order was
+		// answered. Give those holds time to go before calling a seat
+		// unexplained.
+		for reads := 1; sum.Audit.Unsettled() && reads <= auditRereads; reads++ {
+			time.Sleep(auditRereadEvery)
+			if after, err = Availability(context.Background(), env.List, probe.Touchable()); err != nil {
+				return nil, err
+			}
+			sum.Audit = RunAudit(before, after, r.orders)
+			sum.Audit.Rereads = reads
+		}
 		if err := writeJSON(filepath.Join(cfg.Out, "audit.json"), sum.Audit); err != nil {
 			return nil, err
 		}
@@ -338,14 +350,22 @@ func PrintSummary(sum *Summary) string {
 		if !a.Pass {
 			verdict = "FAIL"
 		}
-		fmt.Fprintf(&b, "  audit %s: %d orders, %d confirmed seats, %d seats taken, %d unknown; double-booked %d, confirmed-but-free %d, unexplained %d, confirmed-pre-booked %d\n",
-			verdict, a.Orders, a.ConfirmedSeats, a.SeatsTaken, a.UnknownOrders, a.DoubleBooked, a.StillFree, a.Unexplained, a.PreBooked)
+		fmt.Fprintf(&b, "  audit %s: %d orders, %d confirmed seats, %d seats taken, %d unknown; double-booked %d, confirmed-but-free %d, unexplained %d, confirmed-pre-booked %d, cross-shard-half-booked %d, taken-by-unconfirmed %d\n",
+			verdict, a.Orders, a.ConfirmedSeats, a.SeatsTaken, a.UnknownOrders, a.DoubleBooked, a.StillFree, a.Unexplained, a.PreBooked, a.HalfBooked, a.TakenByFailed)
 		for _, s := range a.Samples {
 			fmt.Fprintf(&b, "    %s\n", s)
 		}
 	}
 	return b.String()
 }
+
+// How often and how long the audit reads the seats again while the only
+// failures are seats that a hold being released would explain: 15 s covers
+// the coordinator's delivery backoff after a leader change.
+const (
+	auditRereads     = 15
+	auditRereadEvery = time.Second
+)
 
 // ErrAuditFailed marks a run whose audit failed.
 var ErrAuditFailed = errors.New("loadgen: audit failed")

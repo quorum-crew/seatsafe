@@ -431,29 +431,29 @@ func TestAudit(t *testing.T) {
 	all := map[Seat]bool{a: true, b: true, c: true, d: true}
 
 	clean := RunAudit(all, map[Seat]bool{d: true}, []AuditOrder{
-		{"r1", []Seat{a}, OutcomeConfirmed},
-		{"r2", []Seat{a}, OutcomeUnavailable},
-		{"r3", []Seat{b}, OutcomeUnknown},
-		{"r4", []Seat{c}, OutcomeConfirmed},
+		{"r1", []Seat{a}, OutcomeConfirmed, false},
+		{"r2", []Seat{a}, OutcomeUnavailable, false},
+		{"r3", []Seat{b}, OutcomeUnknown, false},
+		{"r4", []Seat{c}, OutcomeConfirmed, false},
 	})
 	if !clean.Pass || clean.SeatsTaken != 3 || clean.ConfirmedSeats != 2 || clean.UnknownOrders != 1 {
 		t.Fatalf("%+v", clean)
 	}
 
 	double := RunAudit(all, map[Seat]bool{b: true, c: true, d: true}, []AuditOrder{
-		{"r1", []Seat{a}, OutcomeConfirmed},
-		{"r2", []Seat{a}, OutcomeConfirmed},
+		{"r1", []Seat{a}, OutcomeConfirmed, false},
+		{"r2", []Seat{a}, OutcomeConfirmed, false},
 	})
 	if double.Pass || double.DoubleBooked != 1 || len(double.Samples) != 1 {
 		t.Fatalf("double booking not caught: %+v", double)
 	}
 
-	free := RunAudit(all, all, []AuditOrder{{"r1", []Seat{a}, OutcomeConfirmed}})
+	free := RunAudit(all, all, []AuditOrder{{"r1", []Seat{a}, OutcomeConfirmed, false}})
 	if free.Pass || free.StillFree != 1 {
 		t.Fatalf("confirmed but free not caught: %+v", free)
 	}
 
-	gone := RunAudit(all, map[Seat]bool{b: true, c: true, d: true}, []AuditOrder{{"r1", []Seat{a}, OutcomeUnavailable}})
+	gone := RunAudit(all, map[Seat]bool{b: true, c: true, d: true}, []AuditOrder{{"r1", []Seat{a}, OutcomeUnavailable, false}})
 	if gone.Pass || gone.Unexplained != 1 {
 		t.Fatalf("unexplained seat not caught: %+v", gone)
 	}
@@ -462,9 +462,87 @@ func TestAudit(t *testing.T) {
 	// cluster CONFIRMs it again. It is not free after, and rule c only looks
 	// at seats free before, so only rule d can catch it.
 	preBooked := map[Seat]bool{b: true, c: true, d: true}
-	again := RunAudit(preBooked, preBooked, []AuditOrder{{"r1", []Seat{a}, OutcomeConfirmed}})
+	again := RunAudit(preBooked, preBooked, []AuditOrder{{"r1", []Seat{a}, OutcomeConfirmed, false}})
 	if again.Pass || again.PreBooked != 1 || again.DoubleBooked != 0 || again.StillFree != 0 || again.Unexplained != 0 || len(again.Samples) != 1 {
 		t.Fatalf("confirmation of a pre-booked seat not caught: %+v", again)
+	}
+}
+
+// Rule e: a cross-shard order is all or nothing. The histories here are what
+// a broken 2PC would leave: an order CONFIRMED with only one shard's seats
+// booked, and an order ABORTED with one shard's seats still taken.
+func TestAuditCrossShardAtomicity(t *testing.T) {
+	a1, a2 := Seat{"e", "s1", "a1"}, Seat{"e", "s1", "a2"} // shard 1
+	b1, b2 := Seat{"e", "s2", "b1"}, Seat{"e", "s2", "b2"} // shard 2
+	all := map[Seat]bool{a1: true, a2: true, b1: true, b2: true}
+	free := func(seats ...Seat) map[Seat]bool {
+		m := map[Seat]bool{}
+		for _, s := range seats {
+			m[s] = true
+		}
+		return m
+	}
+
+	// Both orders whole: one committed on both shards, one aborted on both.
+	clean := RunAudit(all, free(a2, b2), []AuditOrder{
+		{"commit", []Seat{a1, b1}, OutcomeConfirmed, true},
+		{"abort", []Seat{a2, b2}, OutcomeAborted, true},
+	})
+	if !clean.Pass || clean.HalfBooked != 0 || clean.TakenByFailed != 0 || clean.Unsettled() {
+		t.Fatalf("clean history failed: %+v", clean)
+	}
+
+	// CONFIRMED, but shard 2 never booked its seat.
+	half := RunAudit(all, free(a2, b1, b2), []AuditOrder{{"commit", []Seat{a1, b1}, OutcomeConfirmed, true}})
+	if half.Pass || half.HalfBooked != 1 || half.StillFree != 1 || half.Unsettled() {
+		t.Fatalf("half-committed order not caught: %+v", half)
+	}
+
+	// ABORTED, but shard 1 booked (or still holds) its seat.
+	leak := RunAudit(all, free(a1, b1, b2), []AuditOrder{
+		{"refused", []Seat{a1, b1}, OutcomeUnavailable, true},
+		{"abort", []Seat{a2, b2}, OutcomeAborted, true},
+	})
+	if leak.Pass || leak.TakenByFailed != 1 || leak.HalfBooked != 0 || !leak.Unsettled() {
+		t.Fatalf("half-aborted order not caught: %+v", leak)
+	}
+	// The same seat named by two failed orders is one seat.
+	twice := RunAudit(all, free(a1, b1, b2), []AuditOrder{
+		{"abort-1", []Seat{a2, b2}, OutcomeAborted, true},
+		{"abort-2", []Seat{a2, b1}, OutcomeUnavailable, true},
+	})
+	if twice.Pass || twice.TakenByFailed != 1 {
+		t.Fatalf("one leaked seat counted %d times", twice.TakenByFailed)
+	}
+	// A seat an aborted order names is fine if a CONFIRMED or UNKNOWN order
+	// explains it.
+	for _, outcome := range []string{OutcomeConfirmed, OutcomeUnknown} {
+		ok := RunAudit(all, free(a1, b1, b2), []AuditOrder{
+			{"abort", []Seat{a2, b2}, OutcomeAborted, true},
+			{"other", []Seat{a2}, outcome, false},
+		})
+		if !ok.Pass || ok.TakenByFailed != 0 {
+			t.Fatalf("seat explained by a %s order still flagged: %+v", outcome, ok)
+		}
+	}
+
+	// CONFIRMED cross-shard, but one of its seats is also CONFIRMED for
+	// another request, or was taken before the run: not booked by that order.
+	shared := RunAudit(all, free(a2, b2), []AuditOrder{
+		{"commit", []Seat{a1, b1}, OutcomeConfirmed, true},
+		{"single", []Seat{b1}, OutcomeConfirmed, false},
+	})
+	if shared.Pass || shared.HalfBooked != 1 || shared.DoubleBooked != 1 {
+		t.Fatalf("contested seat of a cross-shard order not caught: %+v", shared)
+	}
+	pre := RunAudit(free(a1, a2, b2), free(a2, b2), []AuditOrder{{"commit", []Seat{a1, b1}, OutcomeConfirmed, true}})
+	if pre.Pass || pre.HalfBooked != 1 || pre.PreBooked != 1 || pre.Unsettled() {
+		t.Fatalf("pre-booked seat of a cross-shard order not caught: %+v", pre)
+	}
+	// The same half-booked history on a single shard is rule b's alone.
+	single := RunAudit(all, free(a2, b1, b2), []AuditOrder{{"commit", []Seat{a1, b1}, OutcomeConfirmed, false}})
+	if single.Pass || single.HalfBooked != 0 || single.StillFree != 1 {
+		t.Fatalf("single-shard order counted under rule e: %+v", single)
 	}
 }
 
