@@ -28,6 +28,8 @@ func (s *recordingStore) Save(hs raftpb.HardState, ents []raftpb.Entry, _ raftpb
 	return nil
 }
 
+func (s *recordingStore) SaveSnapshot(raftpb.Snapshot, uint64) error { return nil }
+
 func (s *recordingStore) Load() (raftpb.HardState, raftpb.Snapshot, []raftpb.Entry, error) {
 	return raftpb.HardState{}, raftpb.Snapshot{}, nil, nil
 }

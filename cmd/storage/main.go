@@ -10,6 +10,13 @@
 //	HTTP_ADDR  health and metrics listen address (default :8080)
 //	DATA_DIR   Pebble directory for the Raft log (default /data)
 //	SEED_DIR   directory holding shard{N}.json (default /seed)
+//	RAFT_TICK_MS           Raft tick interval in milliseconds (default 25)
+//	RAFT_ELECTION_TICKS    ticks without a leader before an election (default 10)
+//	RAFT_HEARTBEAT_TICKS   ticks between leader heartbeats (default 1)
+//	RAFT_SNAPSHOT_ENTRIES  applied entries between snapshots (default 100000)
+//	RAFT_CATCHUP_ENTRIES   entries kept before a snapshot for catch-up (default 5000)
+//	GC_RETENTION_MS        how long finished request and txn records are kept
+//	                       for dedup before GC drops them (default 120000, 2 min)
 //	COORDINATOR_PEERS  gRPC addresses of the 2PC coordinator group, e.g.
 //	           coord-1:7000,coord-2:7000,coord-3:7000. The shard leader asks it
 //	           for the decision on a hold that expired without one. Unset:
@@ -76,11 +83,25 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	snapEvery, err := positiveIntEnv("RAFT_SNAPSHOT_ENTRIES", raftnode.DefaultSnapshotEntries)
+	if err != nil {
+		return err
+	}
+	catchUp, err := positiveIntEnv("RAFT_CATCHUP_ENTRIES", raftnode.DefaultCatchUpEntries)
+	if err != nil {
+		return err
+	}
+	retentionMS, err := positiveIntEnv("GC_RETENTION_MS", int(shard.DefaultGCRetention/time.Millisecond))
+	if err != nil {
+		return err
+	}
+	retention := time.Duration(retentionMS) * time.Millisecond
 
 	sm := seatsm.New()
 	node, err := raftnode.Start(raftnode.Config{
 		ID: raftID, Peers: ids, SM: shard.Applier{SM: sm}, Transport: tr, Store: store,
 		TickInterval: timing.tick, ElectionTicks: timing.election, HeartbeatTicks: timing.heartbeat,
+		SnapshotEntries: uint64(snapEvery), CatchUpEntries: uint64(catchUp),
 	})
 	if err != nil {
 		return err
@@ -127,7 +148,7 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	go (&shard.Seeder{Node: node, SM: sm, Load: seedLoader(uint32(shardID)), Logf: log.Printf}).Run(ctx)
-	go (&shard.Collector{Node: node, Logf: log.Printf}).Run(ctx)
+	go (&shard.Collector{Node: node, Logf: log.Printf, Retention: retention}).Run(ctx)
 	if coord := os.Getenv("COORDINATOR_PEERS"); coord != "" {
 		g, err := groupclient.New("coordinator", splitList(coord), groupclient.Config{}, groupclient.NewMetrics(reg))
 		if err != nil {
@@ -142,8 +163,8 @@ func run() error {
 		log.Printf("storage %s: COORDINATOR_PEERS not set; expired 2PC holds will not be resolved", info.NodeID)
 	}
 
-	log.Printf("storage %s: shard %d, raft id %d, peers %v, raft tick %v, election %d ticks, heartbeat %d ticks",
-		info.NodeID, shardID, raftID, addrs, timing.tick, timing.election, timing.heartbeat)
+	log.Printf("storage %s: shard %d, raft id %d, peers %v, raft tick %v, election %d ticks, heartbeat %d ticks, snapshot every %d entries keeping %d, gc retention %v",
+		info.NodeID, shardID, raftID, addrs, timing.tick, timing.election, timing.heartbeat, snapEvery, catchUp, retention)
 	<-ctx.Done()
 
 	log.Printf("storage %s: shutting down", info.NodeID)
@@ -191,12 +212,19 @@ type raftTiming struct {
 	heartbeat int
 }
 
+// Storage nodes tick every 25 ms: heartbeats every 25 ms and an election
+// timeout randomized between 250 and 500 ms (10 ticks). Measured with the
+// chaos tool (docs/results/2026-11-17-election-tuning.md): failover 0.3-0.8 s
+// against 1.2-2.0 s at raftnode's 100 ms default, with no extra elections;
+// at 10 ms ticks elections started without a fault.
+const defaultTickMS = 25
+
 // raftTimingFromEnv reads RAFT_TICK_MS, RAFT_ELECTION_TICKS and
-// RAFT_HEARTBEAT_TICKS. Unset variables keep raftnode's defaults (100 ms, 10
-// ticks, 1 tick). etcd/raft requires the election timeout to be longer than
-// the heartbeat interval.
+// RAFT_HEARTBEAT_TICKS. Unset variables give 25 ms, 10 ticks and 1 tick.
+// etcd/raft requires the election timeout to be longer than the heartbeat
+// interval.
 func raftTimingFromEnv() (raftTiming, error) {
-	tickMS, err := positiveIntEnv("RAFT_TICK_MS", 100)
+	tickMS, err := positiveIntEnv("RAFT_TICK_MS", defaultTickMS)
 	if err != nil {
 		return raftTiming{}, err
 	}
