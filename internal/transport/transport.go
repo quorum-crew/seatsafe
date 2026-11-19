@@ -9,6 +9,8 @@ package transport
 import (
 	"context"
 	"fmt"
+	"log"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,32 +41,33 @@ type Transport struct {
 	self    uint64
 	node    atomic.Pointer[raftnode.Node]
 	peers   map[uint64]*peer
+
+	dialOpts []grpc.DialOption // extra options, for tests
 }
 
 // New creates a transport for member self of group groupID. addrs maps every
 // member's Raft ID to its gRPC address; the entry for self is ignored.
 // Call SetNode once the node has started.
 func New(groupID uint32, self uint64, addrs map[uint64]string) (*Transport, error) {
-	t := &Transport{groupID: groupID, self: self, peers: map[uint64]*peer{}}
+	return newTransport(groupID, self, addrs)
+}
+
+func newTransport(groupID uint32, self uint64, addrs map[uint64]string, extra ...grpc.DialOption) (*Transport, error) {
+	t := &Transport{groupID: groupID, self: self, peers: map[uint64]*peer{}, dialOpts: extra}
 	for id, addr := range addrs {
 		if id == self {
 			continue
 		}
-		conn, err := grpc.NewClient(addr,
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(MaxMsgSize)),
-		)
-		if err != nil {
+		p := &peer{
+			id:    id,
+			addr:  addr,
+			t:     t,
+			queue: make(chan raftpb.Message, queueSize),
+			stop:  make(chan struct{}),
+		}
+		if err := p.dial(); err != nil {
 			t.Close()
 			return nil, fmt.Errorf("transport: peer %d at %s: %w", id, addr, err)
-		}
-		p := &peer{
-			id:     id,
-			t:      t,
-			conn:   conn,
-			client: seatsafev1.NewRaftTransportClient(conn),
-			queue:  make(chan raftpb.Message, queueSize),
-			stop:   make(chan struct{}),
 		}
 		t.peers[id] = p
 		p.wg.Add(1)
@@ -115,20 +118,38 @@ type server struct {
 	t *Transport
 }
 
+// misaddressed starts the error a node returns for a batch meant for another
+// node; the sender then redials (see peer.send).
+const misaddressed = "misaddressed"
+
 func (s *server) Send(ctx context.Context, b *seatsafev1.RaftBatch) (*seatsafev1.RaftAck, error) {
 	if b.GetGroupId() != s.t.groupID {
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"message for Raft group %d sent to a member of group %d", b.GetGroupId(), s.t.groupID)
 	}
-	n := s.t.node.Load()
-	if n == nil {
-		return nil, status.Error(codes.Unavailable, "node not started yet")
-	}
+	// Decode and check every message before stepping any. etcd raft does not
+	// check a message's To, so a message meant for another node would be
+	// taken as this node's own. That happens when a peer's connection still
+	// points at an IP that a restarted container has since handed to another
+	// node: the wrong node then answers for the right one, and the leader
+	// can believe a node stored entries it never received.
+	msgs := make([]raftpb.Message, 0, len(b.GetMessages()))
 	for _, raw := range b.GetMessages() {
 		var m raftpb.Message
 		if err := m.Unmarshal(raw); err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "bad raft message: %v", err)
 		}
+		if m.To != s.t.self {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"%s: message for Raft node %d reached node %d of group %d", misaddressed, m.To, s.t.self, s.t.groupID)
+		}
+		msgs = append(msgs, m)
+	}
+	n := s.t.node.Load()
+	if n == nil {
+		return nil, status.Error(codes.Unavailable, "node not started yet")
+	}
+	for _, m := range msgs {
 		if err := n.Step(ctx, m); err != nil {
 			return nil, status.Errorf(codes.Unavailable, "step: %v", err)
 		}
@@ -150,8 +171,9 @@ func (t *Transport) reportSnapshot(id uint64, ok bool) {
 
 type peer struct {
 	id     uint64
+	addr   string
 	t      *Transport
-	conn   *grpc.ClientConn
+	conn   *grpc.ClientConn // replaced only by the run goroutine (redial)
 	client seatsafev1.RaftTransportClient
 	queue  chan raftpb.Message
 	stop   chan struct{}
@@ -201,10 +223,44 @@ func (p *peer) send(batch []raftpb.Message) {
 	_, err := p.client.Send(ctx, req)
 	if err != nil {
 		p.t.reportUnreachable(p.id)
+		if status.Code(err) == codes.FailedPrecondition && strings.Contains(status.Convert(err).Message(), misaddressed) {
+			// Our connection reaches the wrong node: start a new one, which
+			// looks the peer's name up again.
+			log.Printf("transport: peer %d (%s): %v; reconnecting", p.id, p.addr, err)
+			if derr := p.redial(); derr != nil {
+				log.Printf("transport: peer %d: redial: %v", p.id, derr)
+			}
+		}
 	}
 	if hasSnap {
 		p.t.reportSnapshot(p.id, err == nil)
 	}
+}
+
+// dial connects to the peer. passthrough makes gRPC resolve the name again
+// on every reconnect instead of caching its IP: a restarted container can get
+// a new IP, and its old one can go to another node.
+func (p *peer) dial() error {
+	opts := append([]grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(MaxMsgSize)),
+	}, p.t.dialOpts...)
+	conn, err := grpc.NewClient("passthrough:///"+p.addr, opts...)
+	if err != nil {
+		return err
+	}
+	p.conn, p.client = conn, seatsafev1.NewRaftTransportClient(conn)
+	return nil
+}
+
+// redial replaces the peer's connection. Called only from run, which is the
+// only user of p.client; close waits for run to exit before closing p.conn.
+func (p *peer) redial() error {
+	old := p.conn
+	if err := p.dial(); err != nil {
+		return err
+	}
+	return old.Close()
 }
 
 func (p *peer) close() {
