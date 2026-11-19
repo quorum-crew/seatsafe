@@ -1,0 +1,10 @@
+apiVersion: 1
+providers:
+  - name: seatsafe
+    folder: SeatSafe
+    type: file
+    disableDeletion: true
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false
