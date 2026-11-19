@@ -36,10 +36,40 @@ import (
 // send 2s themselves).
 const DefaultDeadline = 2 * time.Second
 
+// DefaultCoordinatorAttemptTimeout is how long one SubmitOrder attempt may
+// take. A cross-shard order spends up to 300 ms in Prepare and then waits for
+// two Raft commits, so the 500 ms that suits a single-shard Book would cut
+// slow orders off and retry them. The retry would then find the order
+// finished and return its stored answer, marked replayed, to a client that
+// asked only once.
+const DefaultCoordinatorAttemptTimeout = time.Second
+
 // Config tunes a Router.
 type Config struct {
-	Group           groupclient.Config
+	Group groupclient.Config // the shard groups
+	// Coordinator is the coordinator group's client config. Zero fields
+	// take Group's values, except AttemptTimeout, which defaults to
+	// DefaultCoordinatorAttemptTimeout.
+	Coordinator     groupclient.Config
 	DefaultDeadline time.Duration // default DefaultDeadline
+}
+
+// coordinatorConfig fills cfg.Coordinator's zero fields.
+func (c Config) coordinatorConfig() groupclient.Config {
+	out := c.Coordinator
+	if out.AttemptTimeout <= 0 {
+		out.AttemptTimeout = DefaultCoordinatorAttemptTimeout
+	}
+	if out.StatusTimeout <= 0 {
+		out.StatusTimeout = c.Group.StatusTimeout
+	}
+	if len(out.Backoff) == 0 {
+		out.Backoff = c.Group.Backoff
+	}
+	if len(out.DialOptions) == 0 {
+		out.DialOptions = c.Group.DialOptions
+	}
+	return out
 }
 
 // Path label values.
@@ -98,7 +128,7 @@ func New(sm *shardmap.Map, cfg Config, reg *metrics.Registry) (*Router, error) {
 		}
 		r.shards[id] = g
 	}
-	g, err := groupclient.New("coordinator", sm.CoordinatorNodes(), cfg.Group, r.GroupMetrics)
+	g, err := groupclient.New("coordinator", sm.CoordinatorNodes(), cfg.coordinatorConfig(), r.GroupMetrics)
 	if err != nil {
 		r.Close()
 		return nil, err
