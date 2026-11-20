@@ -59,7 +59,7 @@ func TestRaftTimingFromEnv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != (raftTiming{tick: 100 * time.Millisecond, election: 10, heartbeat: 1}) {
+	if got != (raftTiming{tick: 25 * time.Millisecond, election: 10, heartbeat: 1}) {
 		t.Fatalf("defaults: %+v", got)
 	}
 

@@ -10,7 +10,7 @@
 //	HTTP_ADDR  health and metrics listen address (default :8080)
 //	DATA_DIR   Pebble directory for the Raft log (default /data)
 //	SEED_DIR   directory holding shard{N}.json (default /seed)
-//	RAFT_TICK_MS           Raft tick interval in milliseconds (default 100)
+//	RAFT_TICK_MS           Raft tick interval in milliseconds (default 25)
 //	RAFT_ELECTION_TICKS    ticks without a leader before an election (default 10)
 //	RAFT_HEARTBEAT_TICKS   ticks between leader heartbeats (default 1)
 //	RAFT_SNAPSHOT_ENTRIES  applied entries between snapshots (default 100000)
@@ -192,12 +192,19 @@ type raftTiming struct {
 	heartbeat int
 }
 
+// Storage nodes tick every 25 ms: heartbeats every 25 ms and an election
+// timeout randomized between 250 and 500 ms (10 ticks). Measured with the
+// chaos tool (docs/results/2026-11-17-election-tuning.md): failover 0.3-0.8 s
+// against 1.2-2.0 s at raftnode's 100 ms default, with no extra elections;
+// at 10 ms ticks elections started without a fault.
+const defaultTickMS = 25
+
 // raftTimingFromEnv reads RAFT_TICK_MS, RAFT_ELECTION_TICKS and
-// RAFT_HEARTBEAT_TICKS. Unset variables keep raftnode's defaults (100 ms, 10
-// ticks, 1 tick). etcd/raft requires the election timeout to be longer than
-// the heartbeat interval.
+// RAFT_HEARTBEAT_TICKS. Unset variables give 25 ms, 10 ticks and 1 tick.
+// etcd/raft requires the election timeout to be longer than the heartbeat
+// interval.
 func raftTimingFromEnv() (raftTiming, error) {
-	tickMS, err := positiveIntEnv("RAFT_TICK_MS", 100)
+	tickMS, err := positiveIntEnv("RAFT_TICK_MS", defaultTickMS)
 	if err != nil {
 		return raftTiming{}, err
 	}
