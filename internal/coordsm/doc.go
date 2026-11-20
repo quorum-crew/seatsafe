@@ -19,8 +19,11 @@
 //
 // One record per txn_id: the user, the participants (shard and seats, as
 // TxnStarted listed them), the decision with its outcome and unavailable
-// seats, the shards that acked the decision, and when the txn was started and
-// decided (both from now_ms).
+// seats, the shards that acked the decision, and when the txn was started,
+// decided and fully acked (all from now_ms). AckedMs is the now_ms of the
+// ack that completed the set (never before DecidedMs), DecidedMs for a txn
+// with no participants, and 0 exactly while the txn is undecided or missing
+// an ack.
 //
 // # Rules
 //
@@ -43,14 +46,17 @@
 // collected) txn. An ack for an undecided txn or from a shard that is not a
 // participant is refused.
 //
-// Gc drops a txn only if it is decided, was decided before drop_before_ms,
-// and every participant has acked (a record without participants has nobody
-// to wait for). Undecided txns and txns still missing an ack are never
+// Gc drops a txn only if it is decided, every participant has acked (a
+// record without participants has nobody to wait for), and AckedMs is before
+// drop_before_ms: retention counts from the moment everyone is done, not from
+// the decision. Undecided txns and txns still missing an ack are never
 // dropped, whatever their age.
 //
 // # Snapshots
 //
 // Snapshot encodes every record plus AppliedIndex as one format version byte
 // followed by JSON with the txns sorted by id. Restore validates the
-// snapshot, including CheckInvariants, and replaces all state.
+// snapshot, including CheckInvariants, and replaces all state. Format 2 adds
+// acked_ms; Restore still reads format 1, where a decided, fully acked txn
+// takes its DecidedMs as AckedMs.
 package coordsm

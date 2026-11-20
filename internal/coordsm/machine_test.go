@@ -3,6 +3,7 @@ package coordsm
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"reflect"
 	"strings"
@@ -248,7 +249,7 @@ func TestFirstDecisionWins(t *testing.T) {
 func TestDecidedUnknownTxn(t *testing.T) {
 	h := newHarness(t)
 	res := h.ok(abortCmd(70, "ghost"))
-	want := &Txn{ID: "ghost", Decision: decisionAbort, Outcome: outcomeAborted, StartedMs: 70, DecidedMs: 70}
+	want := &Txn{ID: "ghost", Decision: decisionAbort, Outcome: outcomeAborted, StartedMs: 70, DecidedMs: 70, AckedMs: 70}
 	if !res.Won || !reflect.DeepEqual(res.Txn, want) {
 		t.Fatalf("decision for an unknown txn: %+v", res)
 	}
@@ -492,20 +493,26 @@ func TestRestoreRejectsBadSnapshots(t *testing.T) {
 		data []byte
 		want string
 	}{
-		"empty":                 {nil, "empty snapshot"},
-		"format":                {[]byte{9, '{', '}'}, "snapshot format 9"},
-		"not json":              {[]byte{snapshotVersion, 'x'}, "decode snapshot"},
-		"unknown field":         {append([]byte{snapshotVersion}, []byte(`{"applied_index":1,"txns":[],"extra":1}`)...), "decode snapshot"},
-		"empty id":              {txn(`{"id":"","started_ms":1,` + part + `}`), "empty or listed twice"},
-		"listed twice":          {txn(`{"id":"a","started_ms":1,` + part + `},{"id":"a","started_ms":1,` + part + `}`), "empty or listed twice"},
-		"undecided, no shards":  {txn(`{"id":"a","started_ms":1}`), "undecided and has no participants"},
-		"undecided with ack":    {txn(`{"id":"a","started_ms":1,"acked":[1],` + part + `}`), "undecided but has"},
-		"undecided with time":   {txn(`{"id":"a","started_ms":1,"decided_ms":2,` + part + `}`), "undecided but has"},
-		"commit, wrong outcome": {txn(`{"id":"a","started_ms":1,"decision":1,"outcome":3,"decided_ms":2,` + part + `}`), "does not go with"},
-		"unsorted shards":       {txn(`{"id":"a","started_ms":1,"participants":[{"shard":2,"seats":[["e","s","1"]]},{"shard":1,"seats":[["e","s","2"]]}]}`), "not sorted"},
-		"shard without seats":   {txn(`{"id":"a","started_ms":1,"participants":[{"shard":1,"seats":[]}]}`), "no seats on shard 1"},
-		"ack from a stranger":   {txn(`{"id":"a","started_ms":1,"decision":2,"outcome":3,"decided_ms":2,"acked":[7],` + part + `}`), "not a participant"},
-		"unsorted acks":         {txn(`{"id":"a","started_ms":1,"decision":2,"outcome":3,"decided_ms":2,"acked":[2,1],` + part + `}`), "acks not sorted"},
+		"empty":                  {nil, "empty snapshot"},
+		"format":                 {[]byte{9, '{', '}'}, "snapshot format 9"},
+		"not json":               {[]byte{snapshotVersion, 'x'}, "decode snapshot"},
+		"unknown field":          {append([]byte{snapshotVersion}, []byte(`{"applied_index":1,"txns":[],"extra":1}`)...), "decode snapshot"},
+		"empty id":               {txn(`{"id":"","started_ms":1,` + part + `}`), "empty or listed twice"},
+		"listed twice":           {txn(`{"id":"a","started_ms":1,` + part + `},{"id":"a","started_ms":1,` + part + `}`), "empty or listed twice"},
+		"undecided, no shards":   {txn(`{"id":"a","started_ms":1}`), "undecided and has no participants"},
+		"undecided with ack":     {txn(`{"id":"a","started_ms":1,"acked":[1],` + part + `}`), "undecided but has"},
+		"undecided with time":    {txn(`{"id":"a","started_ms":1,"decided_ms":2,` + part + `}`), "undecided but has"},
+		"commit, wrong outcome":  {txn(`{"id":"a","started_ms":1,"decision":1,"outcome":3,"decided_ms":2,` + part + `}`), "does not go with"},
+		"unsorted shards":        {txn(`{"id":"a","started_ms":1,"participants":[{"shard":2,"seats":[["e","s","1"]]},{"shard":1,"seats":[["e","s","2"]]}]}`), "not sorted"},
+		"shard without seats":    {txn(`{"id":"a","started_ms":1,"participants":[{"shard":1,"seats":[]}]}`), "no seats on shard 1"},
+		"ack from a stranger":    {txn(`{"id":"a","started_ms":1,"decision":2,"outcome":3,"decided_ms":2,"acked":[7],` + part + `}`), "not a participant"},
+		"unsorted acks":          {txn(`{"id":"a","started_ms":1,"decision":2,"outcome":3,"decided_ms":2,"acked":[2,1],` + part + `}`), "acks not sorted"},
+		"acked_ms, ack missing":  {txn(`{"id":"a","started_ms":1,"decision":2,"outcome":3,"decided_ms":2,"acked":[1],"acked_ms":3,` + part + `}`), "acked_ms 3 does not match"},
+		"acked, no acked_ms":     {txn(`{"id":"a","started_ms":1,"decision":2,"outcome":3,"decided_ms":2,"acked":[1,2],` + part + `}`), "acked_ms 0 does not match"},
+		"acked_ms too early":     {txn(`{"id":"a","started_ms":1,"decision":2,"outcome":3,"decided_ms":5,"acked":[1,2],"acked_ms":4,` + part + `}`), "before decided_ms"},
+		"undecided, acked_ms":    {txn(`{"id":"a","started_ms":1,"acked_ms":4,` + part + `}`), "acked_ms 4 does not match"},
+		"ghost, no acked_ms":     {txn(`{"id":"a","started_ms":1,"decision":2,"outcome":3,"decided_ms":2}`), "acked_ms 0 does not match"},
+		"format 1 with acked_ms": {append([]byte{snapshotVersionV1}, []byte(`{"applied_index":3,"txns":[{"id":"a","started_ms":1,"decision":2,"outcome":3,"decided_ms":2,"acked":[1,2],"acked_ms":3,`+part+`}]}`)...), "has acked_ms"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			m := New()
@@ -533,6 +540,7 @@ func TestCheckInvariantsCatchesCorruption(t *testing.T) {
 		"missing from unacked":  {func(s *state) { delete(s.unacked, "b") }, "unacked index disagree"},
 		"stray undecided":       {func(s *state) { s.undecided["zz"] = s.txns["a"] }, `undecided index lists unknown txn "zz"`},
 		"stray unacked":         {func(s *state) { s.unacked["zz"] = s.txns["b"] }, `unacked index lists unknown txn "zz"`},
+		"acked_ms, ack missing": {func(s *state) { s.txns["b"].AckedMs = 5 }, `txn "b": acked_ms 5 does not match`},
 	} {
 		t.Run(name, func(t *testing.T) {
 			m := New()
@@ -609,7 +617,12 @@ func TestRandomReplayIsDeterministic(t *testing.T) {
 				now += int64(rng.IntN(20))
 				cmd := randomCommand(rng, now)
 				var pending map[string]bool
+				var ackedMs map[string]int64 // before a gc: every txn's AckedMs
 				if gc := cmd.GetGc(); gc != nil {
+					ackedMs = map[string]int64{}
+					for _, tx := range allTxns(t, replicas[0]) {
+						ackedMs[tx.ID] = tx.AckedMs
+					}
 					pending = map[string]bool{}
 					for _, tx := range replicas[0].Undecided() {
 						pending[tx.ID] = true
@@ -656,6 +669,27 @@ func TestRandomReplayIsDeterministic(t *testing.T) {
 						t.Fatalf("command %d: gc dropped %q, which was undecided or missing an ack", i, id)
 					}
 				}
+				if gc := cmd.GetGc(); gc != nil && res.Err == nil {
+					// Gc drops exactly the txns fully acked before the cutoff.
+					want := 0
+					for id, at := range ackedMs {
+						eligible := at != 0 && at < gc.GetDropBeforeMs()
+						if eligible {
+							want++
+						}
+						if _, kept := replicas[0].Get(id); kept == eligible {
+							t.Fatalf("command %d: gc with cutoff %d kept=%v txn %q acked at %d", i, gc.GetDropBeforeMs(), kept, id, at)
+						}
+					}
+					if res.Dropped != want {
+						t.Fatalf("command %d: gc dropped %d, want %d", i, res.Dropped, want)
+					}
+				}
+				if cmd.GetAcked() != nil && res.Txn != nil {
+					if done := len(res.Txn.MissingAcks()) == 0; done != (res.Txn.AckedMs != 0) || (done && res.Txn.AckedMs < res.Txn.DecidedMs) {
+						t.Fatalf("command %d: ack left %+v", i, res.Txn)
+					}
+				}
 				if cmd.GetGc() != nil {
 					for id := range firstDecision {
 						if _, ok := replicas[0].Get(id); !ok {
@@ -689,5 +723,129 @@ func TestRandomReplayIsDeterministic(t *testing.T) {
 				t.Fatal("the random commands did not exercise every rule")
 			}
 		})
+	}
+}
+
+// allTxns returns every record of m, sorted by id.
+func allTxns(t *testing.T, m *Machine) []*Txn {
+	t.Helper()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return sortedCopies(m.txns)
+}
+
+// Retention counts from the last ack, not from the decision: a txn decided
+// long ago whose last shard only just acked is kept for the whole retention
+// after that ack.
+func TestGcRetentionCountsFromLastAck(t *testing.T) {
+	const minute = int64(60_000)
+	now := 100 * minute
+	h := newHarness(t)
+	h.ok(startedCmd(now-10*minute-1, "late", 1, 2))
+	h.ok(commitCmd(now-10*minute, "late"))
+	if res := h.ok(ackedCmd(now-10*minute+5, "late", 1)); res.Txn.AckedMs != 0 {
+		t.Fatalf("AckedMs %d with shard 2 missing", res.Txn.AckedMs)
+	}
+	if res := h.ok(ackedCmd(now, "late", 2)); res.Txn.AckedMs != now {
+		t.Fatalf("AckedMs %d after the last ack, want %d", res.Txn.AckedMs, now)
+	}
+	if res := h.ok(ackedCmd(now+minute, "late", 2)); res.Txn.AckedMs != now {
+		t.Fatalf("a repeated ack moved AckedMs to %d", res.Txn.AckedMs)
+	}
+	// A txn the coordinator never saw has nobody to wait for: AckedMs is
+	// its DecidedMs.
+	if res := h.ok(abortCmd(now-10*minute, "ghost")); res.Txn.AckedMs != now-10*minute {
+		t.Fatalf("ghost AckedMs %d, want its DecidedMs %d", res.Txn.AckedMs, now-10*minute)
+	}
+
+	if res := h.ok(gcCmd(now, now-2*minute)); res.Dropped != 1 {
+		t.Fatalf("gc with a 2 min cutoff dropped %d, want only the ghost", res.Dropped)
+	}
+	if _, ok := h.m.Get("late"); !ok {
+		t.Fatal("gc dropped a txn acked just now because it was decided 10 min ago")
+	}
+	if _, ok := h.m.Get("ghost"); ok {
+		t.Fatal("gc kept the ghost decided 10 min ago")
+	}
+	if res := h.ok(gcCmd(now+3*minute, now+minute)); res.Dropped != 1 {
+		t.Fatalf("gc after the retention past the last ack dropped %d, want 1", res.Dropped)
+	}
+
+	// A leader whose clock is behind the one that decided cannot put the
+	// ack before the decision and so shorten the retention.
+	h.ok(startedCmd(now, "skew", 1))
+	h.ok(commitCmd(now+10*minute, "skew"))
+	if res := h.ok(ackedCmd(now, "skew", 1)); res.Txn.AckedMs != now+10*minute {
+		t.Fatalf("AckedMs %d from a slow clock, want the DecidedMs %d", res.Txn.AckedMs, now+10*minute)
+	}
+}
+
+// A txn some participant never acks stays at any age, however far the
+// cutoff moves.
+func TestGcNeverDropsWithoutAllAcks(t *testing.T) {
+	h := newHarness(t)
+	h.ok(startedCmd(1, "stuck", 1, 2, 3))
+	h.ok(abortCmd(2, "stuck"))
+	h.ok(ackedCmd(3, "stuck", 1))
+	h.ok(ackedCmd(4, "stuck", 3))
+	for _, cutoff := range []int64{3, 5, 1 << 40, math.MaxInt64} {
+		if res := h.ok(gcCmd(cutoff, cutoff)); res.Dropped != 0 {
+			t.Fatalf("gc with cutoff %d dropped %d", cutoff, res.Dropped)
+		}
+		if tx := h.get("stuck"); tx.AckedMs != 0 || !reflect.DeepEqual(tx.MissingAcks(), []uint32{2}) {
+			t.Fatalf("after gc with cutoff %d: %+v", cutoff, tx)
+		}
+	}
+	if got := ids(h.m.Unacked()); !reflect.DeepEqual(got, []string{"stuck"}) {
+		t.Fatalf("unacked %v", got)
+	}
+}
+
+// A format 1 snapshot (from before AckedMs) restores with AckedMs set to
+// DecidedMs for every decided, fully acked txn and 0 for the rest, and the
+// machine then snapshots in format 2.
+func TestRestoreFormat1Snapshot(t *testing.T) {
+	const part = `"participants":[{"shard":1,"seats":[["e","s","1"]]},{"shard":2,"seats":[["e","s","2"]]}]`
+	v1 := append([]byte{snapshotVersionV1}, []byte(`{"applied_index":9,"txns":[`+
+		`{"id":"done","user":"u","started_ms":10,"decision":1,"outcome":1,"decided_ms":20,"acked":[1,2],`+part+`},`+
+		`{"id":"ghost","started_ms":30,"decision":2,"outcome":3,"decided_ms":30},`+
+		`{"id":"half","user":"u","started_ms":10,"decision":2,"outcome":3,"decided_ms":40,"acked":[2],`+part+`},`+
+		`{"id":"open","user":"u","started_ms":50,`+part+`}]}`)...)
+	m := New()
+	if err := m.Restore(v1); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.CheckInvariants(); err != nil {
+		t.Fatal(err)
+	}
+	for id, want := range map[string]int64{"done": 20, "ghost": 30, "half": 0, "open": 0} {
+		if tx, ok := m.Get(id); !ok || tx.AckedMs != want {
+			t.Fatalf("txn %q restored as %+v, want AckedMs %d", id, tx, want)
+		}
+	}
+	snap, err := m.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap[0] != snapshotVersion || !bytes.Contains(snap, []byte(`"acked_ms":20`)) {
+		t.Fatalf("snapshot after a format 1 restore: %s", snap)
+	}
+	m2 := New()
+	if err := m2.Restore(snap); err != nil {
+		t.Fatal(err)
+	}
+	if again, _ := m2.Snapshot(); !bytes.Equal(snap, again) {
+		t.Fatal("format 2 round trip after a format 1 restore differs")
+	}
+
+	// The last ack of "half" sets its AckedMs; gc then goes by it.
+	if res := m.Apply(10, ackedCmd(500, "half", 1)); res.Err != nil || res.Txn.AckedMs != 500 {
+		t.Fatalf("%+v", res)
+	}
+	if res := m.Apply(11, gcCmd(600, 100)); res.Dropped != 2 {
+		t.Fatalf("gc dropped %d, want done and ghost", res.Dropped)
+	}
+	if _, ok := m.Get("half"); !ok {
+		t.Fatal("gc dropped half, acked at 500, with cutoff 100")
 	}
 }

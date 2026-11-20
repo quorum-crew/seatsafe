@@ -84,6 +84,10 @@ type Txn struct {
 	Acked        []uint32 // participant shards that applied the decision, sorted
 	StartedMs    int64
 	DecidedMs    int64 // 0 while undecided
+	// AckedMs is when the last participant acked: the now_ms of that ack,
+	// never earlier than DecidedMs. For a txn without participants it is
+	// DecidedMs. It is 0 exactly while the txn is undecided or missing an ack.
+	AckedMs int64
 }
 
 // Decided reports whether the txn has a decision.
@@ -184,7 +188,7 @@ func (m *Machine) Apply(index uint64, cmd *seatsafev1.CoordCommand) Result {
 	case *seatsafev1.CoordCommand_Decided:
 		return m.decided(now, op.Decided)
 	case *seatsafev1.CoordCommand_Acked:
-		return m.acked(op.Acked)
+		return m.acked(now, op.Acked)
 	case *seatsafev1.CoordCommand_Gc:
 		return Result{Dropped: m.gc(op.Gc.GetDropBeforeMs())}
 	}
@@ -241,6 +245,8 @@ func (s *state) decided(now int64, op *seatsafev1.TxnDecided) Result {
 	delete(s.undecided, id)
 	if len(t.Participants) > 0 {
 		s.unacked[id] = t
+	} else {
+		t.AckedMs = ackedAt(now, now) // nobody to wait for
 	}
 	return Result{Txn: t.clone(), Won: true}
 }
@@ -258,7 +264,14 @@ func checkDecision(d seatsafev1.Decision, o seatsafev1.BookingOutcome, unavailab
 	return nil
 }
 
-func (s *state) acked(op *seatsafev1.TxnAcked) Result {
+// ackedAt is the AckedMs for a txn decided at decidedMs whose last ack is
+// applied at now. A leader whose clock is behind the one that stamped the
+// decision cannot move it before the decision, and it is never 0 (a real
+// leader always stamps now_ms; the floor keeps the invariant for one that
+// did not).
+func ackedAt(now, decidedMs int64) int64 { return max(now, decidedMs, 1) }
+
+func (s *state) acked(now int64, op *seatsafev1.TxnAcked) Result {
 	id, shard := op.GetTxnId(), op.GetShardId()
 	if id == "" {
 		return Result{Err: errors.New("coordsm: TxnAcked with empty txn_id")}
@@ -276,7 +289,8 @@ func (s *state) acked(op *seatsafev1.TxnAcked) Result {
 	if i, found := slices.BinarySearch(t.Acked, shard); !found {
 		t.Acked = slices.Insert(t.Acked, i, shard)
 	}
-	if len(t.Acked) == len(t.Participants) {
+	if len(t.Acked) == len(t.Participants) && t.AckedMs == 0 {
+		t.AckedMs = ackedAt(now, t.DecidedMs)
 		delete(s.unacked, id)
 	}
 	return Result{Txn: t.clone()}
@@ -285,7 +299,9 @@ func (s *state) acked(op *seatsafev1.TxnAcked) Result {
 func (s *state) gc(cutoff int64) int {
 	n := 0
 	for id, t := range s.txns {
-		if t.Decided() && t.DecidedMs < cutoff && len(t.Acked) == len(t.Participants) {
+		// AckedMs is set only once the txn is decided and fully acked, so
+		// this keeps undecided txns and txns missing an ack at any age.
+		if t.AckedMs != 0 && t.AckedMs < cutoff {
 			delete(s.txns, id)
 			n++
 		}
@@ -339,7 +355,9 @@ func sortedCopies(txns map[string]*Txn) []*Txn {
 // CheckInvariants verifies that every record is well formed: participants
 // sorted by shard with seats, an undecided txn has no outcome, seats, acks or
 // decision time, a decision goes with its outcome, acks are sorted and come
-// only from participants, and both indexes match the records.
+// only from participants, AckedMs is set (and not before DecidedMs) exactly
+// when the txn is decided and fully acked, and both indexes match the
+// records.
 func (m *Machine) CheckInvariants() error {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -381,6 +399,12 @@ func (s *state) check() error {
 			if !slices.ContainsFunc(t.Participants, func(p Participant) bool { return p.Shard == sh }) {
 				bad("txn %q: ack from shard %d, which is not a participant", id, sh)
 			}
+		}
+		done := t.Decided() && len(t.Acked) == len(t.Participants)
+		if (t.AckedMs != 0) != done {
+			bad("txn %q: acked_ms %d does not match decided=%v with %d of %d acks", id, t.AckedMs, t.Decided(), len(t.Acked), len(t.Participants))
+		} else if done && t.AckedMs < t.DecidedMs {
+			bad("txn %q: acked_ms %d before decided_ms %d", id, t.AckedMs, t.DecidedMs)
 		}
 		if (s.undecided[id] == t) != !t.Decided() {
 			bad("txn %q and the undecided index disagree", id)

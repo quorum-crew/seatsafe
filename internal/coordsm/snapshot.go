@@ -10,8 +10,12 @@ import (
 	seatsafev1 "github.com/quorum-crew/seatsafe/gen/seatsafe/v1"
 )
 
-// snapshotVersion is the first byte of a snapshot: its format.
-const snapshotVersion byte = 1
+// snapshotVersion is the first byte of a snapshot: its format. Format 2 adds
+// acked_ms; format 1 (without it) is still read.
+const (
+	snapshotVersion   byte = 2
+	snapshotVersionV1 byte = 1
+)
 
 type snapFile struct {
 	AppliedIndex uint64    `json:"applied_index"`
@@ -36,6 +40,7 @@ type snapTxn struct {
 	Acked        []uint32   `json:"acked,omitempty"`
 	StartedMs    int64      `json:"started_ms"`
 	DecidedMs    int64      `json:"decided_ms,omitempty"`
+	AckedMs      int64      `json:"acked_ms,omitempty"` // format 2
 }
 
 func toSnapRefs(seats []Seat) []snapRef {
@@ -69,7 +74,7 @@ func (m *Machine) Snapshot() ([]byte, error) {
 	for _, t := range m.txns {
 		st := snapTxn{
 			ID: t.ID, User: t.User, Decision: int32(t.Decision), Outcome: int32(t.Outcome),
-			Unavailable: toSnapRefs(t.Unavailable), StartedMs: t.StartedMs, DecidedMs: t.DecidedMs,
+			Unavailable: toSnapRefs(t.Unavailable), StartedMs: t.StartedMs, DecidedMs: t.DecidedMs, AckedMs: t.AckedMs,
 		}
 		if len(t.Acked) > 0 {
 			st.Acked = t.Acked
@@ -93,8 +98,9 @@ func (m *Machine) Restore(data []byte) error {
 	if len(data) == 0 {
 		return errors.New("coordsm: empty snapshot")
 	}
-	if data[0] != snapshotVersion {
-		return fmt.Errorf("coordsm: snapshot format %d, want %d", data[0], snapshotVersion)
+	version := data[0]
+	if version != snapshotVersion && version != snapshotVersionV1 {
+		return fmt.Errorf("coordsm: snapshot format %d, want %d or %d", version, snapshotVersion, snapshotVersionV1)
 	}
 	var f snapFile
 	dec := json.NewDecoder(bytes.NewReader(data[1:]))
@@ -110,13 +116,23 @@ func (m *Machine) Restore(data []byte) error {
 		}
 		t := &Txn{
 			ID: st.ID, User: st.User, Decision: seatsafev1.Decision(st.Decision), Outcome: seatsafev1.BookingOutcome(st.Outcome),
-			Unavailable: fromSnapRefs(st.Unavailable), StartedMs: st.StartedMs, DecidedMs: st.DecidedMs,
+			Unavailable: fromSnapRefs(st.Unavailable), StartedMs: st.StartedMs, DecidedMs: st.DecidedMs, AckedMs: st.AckedMs,
 		}
 		if len(st.Acked) > 0 {
 			t.Acked = st.Acked
 		}
 		for _, p := range st.Participants {
 			t.Participants = append(t.Participants, Participant{Shard: p.Shard, Seats: fromSnapRefs(p.Seats)})
+		}
+		if version == snapshotVersionV1 {
+			if st.AckedMs != 0 {
+				return fmt.Errorf("coordsm: format %d snapshot txn %q has acked_ms", version, st.ID)
+			}
+			// Format 1 predates AckedMs: retention then counted from the
+			// decision, so a fully acked txn keeps that.
+			if t.Decided() && len(t.Acked) == len(t.Participants) {
+				t.AckedMs = ackedAt(t.DecidedMs, t.DecidedMs)
+			}
 		}
 		s.txns[st.ID] = t
 		switch {
