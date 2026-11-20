@@ -155,6 +155,7 @@ type shardNode struct {
 	closeStore func()
 	gs         *grpc.Server
 	stop       context.CancelFunc
+	coord      *groupclient.Group // the hold resolver's client for the coordinator group; nil without one
 }
 
 type coordNode struct {
@@ -180,6 +181,13 @@ type options struct {
 	// twelve nodes fsyncing to one disk, a slow fsync on a leader is enough
 	// to start an election, and most tests here are about something else.
 	durable bool
+	// holdTTL is the hold_ttl_ms the coordinators send with Prepare; 0 is
+	// the real 5 s.
+	holdTTL time.Duration
+	// resolveHolds runs internal/shard's HoldResolver on every storage node,
+	// as cmd/storage does with COORDINATOR_PEERS set: the shard leader asks
+	// the coordinator group for the decision on every expired hold.
+	resolveHolds bool
 }
 
 // cluster is a real coordinator group and three real shards in one process:
@@ -200,6 +208,11 @@ type cluster struct {
 	shards map[uint32]*groupclient.Group // the test's own clients for the shards
 
 	before, after atomic.Pointer[hook]
+
+	// Counters of every storage node's hold resolver, as cmd/storage exports
+	// them: seatsafe_expired_holds_resolved_total and
+	// seatsafe_2pc_decision_refused_total, by decision.
+	resolved, refused *metrics.CounterVec
 }
 
 func startCluster(t testing.TB, opts options) *cluster {
@@ -209,7 +222,12 @@ func startCluster(t testing.TB, opts options) *cluster {
 	}
 	c := &cluster{t: t, opts: opts, shardG: map[uint32]*group{}, shardN: map[uint32]map[uint64]*shardNode{},
 		coordN: map[uint64]*coordNode{}, shards: map[uint32]*groupclient.Group{}}
+	reg := metrics.NewRegistry()
+	c.resolved = reg.NewCounterVec("seatsafe_expired_holds_resolved_total", "Expired 2PC holds resolved, by decision.", "decision")
+	c.refused = reg.NewCounterVec("seatsafe_2pc_decision_refused_total", "Coordinator decisions a shard refused, by decision.", "decision")
 	gm := groupclient.NewMetrics(metrics.NewRegistry())
+	// Bound first: the storage nodes' hold resolvers dial the coordinators.
+	c.coordG = newGroup(t, opts.durable)
 	for _, s := range shardIDs {
 		c.shardG[s] = newGroup(t, opts.durable)
 		c.shardN[s] = map[uint64]*shardNode{}
@@ -222,7 +240,6 @@ func startCluster(t testing.TB, opts options) *cluster {
 		}
 		c.shards[s] = cl
 	}
-	c.coordG = newGroup(t, opts.durable)
 	for _, id := range raftIDs {
 		c.startCoordNode(id)
 	}
@@ -284,8 +301,21 @@ func (c *cluster) startShardNode(s uint32, id uint64) {
 	ctx, cancel := context.WithCancel(context.Background())
 	go (&shard.Seeder{Node: node, SM: sm, Interval: 10 * time.Millisecond,
 		Load: func() (shard.SeedSource, error) { return seedOf(s), nil }, Logf: func(string, ...any) {}}).Run(ctx)
+	var coord *groupclient.Group
+	if c.opts.resolveHolds {
+		var err error
+		coord, err = groupclient.New("coordinator", c.coordG.addrList(), groupclient.Config{}, groupclient.NewMetrics(metrics.NewRegistry()))
+		if err != nil {
+			c.t.Fatal(err)
+		}
+		go (&shard.HoldResolver{Node: node, SM: sm, Decide: shard.CoordinatorDecider(coord), Interval: 100 * time.Millisecond,
+			Logf:       c.logf,
+			OnResolved: func(d string) { c.resolved.Inc(d) },
+			OnRefused:  func(d string) { c.refused.Inc(d) },
+		}).Run(ctx)
+	}
 	c.mu.Lock()
-	c.shardN[s][id] = &shardNode{node: node, sm: sm, closeStore: closeStore, gs: gs, stop: cancel}
+	c.shardN[s][id] = &shardNode{node: node, sm: sm, closeStore: closeStore, gs: gs, stop: cancel, coord: coord}
 	c.mu.Unlock()
 }
 
@@ -301,6 +331,9 @@ func (c *cluster) killShardNode(s uint32, id uint64) {
 	n.gs.Stop()
 	n.node.Stop()
 	n.closeStore()
+	if n.coord != nil {
+		_ = n.coord.Close()
+	}
 }
 
 func (c *cluster) startCoordNode(id uint64) {
@@ -322,13 +355,10 @@ func (c *cluster) startCoordNode(id uint64) {
 	coord, err := New(Config{
 		Node: node, SM: sm, Addrs: g.addrs, Shards: shards,
 		PrepareTimeout: c.opts.prepareTimeout,
+		HoldTTL:        c.opts.holdTTL,
 		GCInterval:     c.opts.gcInterval, GCRetention: c.opts.gcRetention, StuckAfter: c.opts.stuckAfter,
 		LeaderPoll: 5 * time.Millisecond,
-		Logf: func(format string, args ...any) {
-			c.mu.Lock()
-			c.logs = append(c.logs, fmt.Sprintf(format, args...))
-			c.mu.Unlock()
-		},
+		Logf:       c.logf,
 		beforeDecide: func(ctx context.Context, txn string) {
 			if h := c.before.Load(); h != nil {
 				(*h)(ctx, txn)
@@ -399,6 +429,13 @@ func (c *cluster) eventually(within time.Duration, what string, cond func() bool
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+// logf collects the coordinators' and hold resolvers' log lines.
+func (c *cluster) logf(format string, args ...any) {
+	c.mu.Lock()
+	c.logs = append(c.logs, fmt.Sprintf(format, args...))
+	c.mu.Unlock()
 }
 
 func (c *cluster) logText() string {
