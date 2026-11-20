@@ -351,8 +351,8 @@ func Summarize(results []Result) string {
 		}
 		fmed, fmax := medMax(fo)
 		rmed, rmax := medMax(rec)
-		pmed, _ := medMax(p99)
-		mmed, _ := medMax(mx)
+		pmed := medianMillis(p99)
+		mmed := medianMillis(mx)
 		el := "-"
 		if counted > 0 {
 			el = strconv.FormatFloat(float64(elections)/float64(counted), 'f', 1, 64)
@@ -369,6 +369,16 @@ func Summarize(results []Result) string {
 		b.WriteString("\nFailures:\n" + strings.Join(fails, "\n") + "\n")
 	}
 	return b.String()
+}
+
+// medianMillis renders the median of v (seconds) in milliseconds: client
+// latencies are often well under 0.1 s, which "%.1f s" would show as 0.0 s.
+func medianMillis(v []float64) string {
+	if len(v) == 0 {
+		return "-"
+	}
+	slices.Sort(v)
+	return fmt.Sprintf("%.0f ms", v[len(v)/2]*1000)
 }
 
 func medMax(v []float64) (string, string) {

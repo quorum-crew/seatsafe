@@ -202,8 +202,9 @@ func TestSummarize(t *testing.T) {
 		{Run: 2, Kind: KillLeader, Verdict: "PASS", Failover: 4 * time.Second, Recovery: 3 * time.Second, Elections: 2, P99: 100 * time.Millisecond, Max: 900 * time.Millisecond},
 		{Run: 3, Kind: KillLeader, Verdict: "FAIL", Fault: "kill-leader shard 1", Reason: "correctness audit failed"},
 		{Run: 4, Kind: PauseLeader, Verdict: "SKIP", Failover: -1, Recovery: -1},
+		{Run: 5, Kind: None, Verdict: "PASS", Failover: -1, Recovery: -1, Elections: 0, P99: 15 * time.Millisecond, Max: 42 * time.Millisecond},
 	})
-	for _, want := range []string{"4 runs: 2 PASS, 1 FAIL, 1 SKIP", "| kill-leader | 3 | 2 | 1 | 0 | 4.0 s | 4.0 s | 3.0 s | 3.0 s | 1.5 | 0.1 s | 0.9 s |", "| pause-leader | 1 | 0 | 0 | 1 | - | - | - | - | - | - | - |", "run 3: kill-leader shard 1: correctness audit failed"} {
+	for _, want := range []string{"5 runs: 3 PASS, 1 FAIL, 1 SKIP", "| none | 1 | 1 | 0 | 0 | - | - | - | - | 0.0 | 15 ms | 42 ms |", "| kill-leader | 3 | 2 | 1 | 0 | 4.0 s | 4.0 s | 3.0 s | 3.0 s | 1.5 | 100 ms | 900 ms |", "| pause-leader | 1 | 0 | 0 | 1 | - | - | - | - | - | - | - |", "run 3: kill-leader shard 1: correctness audit failed"} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("summary missing %q:\n%s", want, s)
 		}
