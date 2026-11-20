@@ -106,17 +106,26 @@ type electionGate struct {
 	recordingStore
 	node   atomic.Pointer[Node]
 	armed  *atomic.Bool
-	result chan error
+	result chan gateResult
+}
+
+// gateResult is how the proposal made by an electionGate ended: on which
+// node, in which term that node was leading when it proposed, and the error.
+type gateResult struct {
+	node *Node
+	term uint64
+	err  error
 }
 
 func (g *electionGate) Save(hs raftpb.HardState, ents []raftpb.Entry, snap raftpb.Snapshot, mustSync bool) error {
 	n := g.node.Load()
 	if n != nil && len(ents) > 0 && n.Status().IsLeader() && g.armed.CompareAndSwap(true, false) {
+		term := n.Status().Term
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			_, err := n.Propose(ctx, []byte("first-proposal-to-the-new-leader"))
-			g.result <- err
+			g.result <- gateResult{node: n, term: term, err: err}
 		}()
 		for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
 			n.mu.Lock()
@@ -133,12 +142,23 @@ func (g *electionGate) Save(hs raftpb.HardState, ents []raftpb.Entry, snap raftp
 // A node that wins an election has lost nothing. A proposal that reaches it
 // while the Ready carrying its leadership is still being persisted must commit,
 // not fail with ErrLeadershipLost.
+//
+// With 10 ms ticks on a slow machine the new leader can also lose its
+// leadership for real before that entry commits (a third election, a
+// follower's vote arriving late). That fails the proposal correctly, so the
+// test retries the round; it fails only when the node is still leader in the
+// term it proposed in, which is the false loss #28 fixed. At least
+// wantCommitted rounds must reach a new leader and commit.
 func TestProposalDuringElectionIsNotFailed(t *testing.T) {
+	const (
+		wantCommitted   = 10
+		retriesPerRound = 5
+	)
 	net := NewNetwork()
 	t.Cleanup(net.Close)
 	peers := []uint64{1, 2, 3}
 	armed := &atomic.Bool{}
-	result := make(chan error, 1)
+	result := make(chan gateResult, 1)
 	nodes := map[uint64]*Node{}
 	for _, id := range peers {
 		g := &electionGate{armed: armed, result: result}
@@ -154,19 +174,37 @@ func TestProposalDuringElectionIsNotFailed(t *testing.T) {
 	}
 	c := &cluster{t: t, nodes: nodes}
 
-	for round := range 10 {
-		old := c.waitLeader()
-		net.Isolate(old)
-		armed.Store(true) // the isolated leader appends nothing, so only a new leader can trip this
-		select {
-		case err := <-result:
-			if err != nil {
-				t.Fatalf("election %d: proposal to the new leader failed: %v", round, err)
+	realLosses := 0
+	for round := range wantCommitted {
+		for try := 0; ; try++ {
+			if try == retriesPerRound {
+				t.Fatalf("election %d: the new leader really lost its leadership %d times in a row; the machine is too slow for this test", round, try)
 			}
-		case <-time.After(5 * time.Second):
-			t.Fatalf("election %d: no new leader saved its first entry", round)
+			old := c.waitLeader()
+			net.Isolate(old)
+			armed.Store(true) // the isolated leader appends nothing, so only a new leader can trip this
+			var r gateResult
+			select {
+			case r = <-result:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("election %d: no new leader saved its first entry", round)
+			}
+			net.Heal()
+			if r.err == nil {
+				break
+			}
+			if !errors.Is(r.err, ErrLeadershipLost) {
+				t.Fatalf("election %d: proposal to the new leader failed: %v", round, r.err)
+			}
+			if st := r.node.Status(); st.IsLeader() && st.Term == r.term {
+				t.Fatalf("election %d: proposal to the new leader failed with %v, but node %d still leads term %d: a false leadership loss",
+					round, r.err, st.ID, st.Term)
+			}
+			realLosses++ // deposed, or a later term: a real loss, so try again
 		}
-		net.Heal()
+	}
+	if realLosses > 0 {
+		t.Logf("%d elections committed; %d retried after a real leadership loss", wantCommitted, realLosses)
 	}
 }
 
