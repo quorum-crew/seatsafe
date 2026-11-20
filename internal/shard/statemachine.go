@@ -49,5 +49,16 @@ func (a Applier) Apply(index uint64, data []byte) any {
 // Snapshot implements raftnode.StateMachine.
 func (a Applier) Snapshot() ([]byte, error) { return a.SM.Snapshot() }
 
+// CaptureSnapshot implements raftnode.SnapshotCapturer, so a seatsm snapshot
+// is encoded off the apply goroutine. Any other StateMachine is snapshotted
+// right away.
+func (a Applier) CaptureSnapshot() func() ([]byte, error) {
+	if c, ok := a.SM.(interface{ CaptureSnapshot() func() ([]byte, error) }); ok {
+		return c.CaptureSnapshot()
+	}
+	data, err := a.SM.Snapshot()
+	return func() ([]byte, error) { return data, err }
+}
+
 // Restore implements raftnode.StateMachine.
 func (a Applier) Restore(data []byte) error { return a.SM.Restore(data) }

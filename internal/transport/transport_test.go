@@ -1,12 +1,15 @@
 package transport
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -24,9 +27,14 @@ type recordSM struct {
 	entries []string
 }
 
+// Apply records data, ignoring data it already holds (like seatsm's dedup
+// by request ID), so propose can retry after a leader change.
 func (s *recordSM) Apply(_ uint64, data []byte) any {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if i := slices.Index(s.entries, string(data)); i >= 0 {
+		return i + 1
+	}
 	s.entries = append(s.entries, string(data))
 	return len(s.entries)
 }
@@ -143,11 +151,24 @@ func waitSame(t *testing.T, members map[uint64]*member, want int) {
 	}
 }
 
+// propose proposes data through n, retrying like a client while the
+// leadership is moving (raftnode.ErrLeadershipLost, or raft.ErrProposalDropped
+// during an election): slow fsyncs under -race and GOMAXPROCS=2 make a leader
+// step down now and then. The state machines ignore data they already hold,
+// so a retry of an entry that did commit is harmless.
 func propose(t *testing.T, n *raftnode.Node, data string) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if _, err := n.Propose(ctx, []byte(data)); err != nil {
+	for {
+		_, err := n.Propose(ctx, []byte(data))
+		if err == nil {
+			return
+		}
+		if ctx.Err() == nil && (errors.Is(err, raftnode.ErrLeadershipLost) || errors.Is(err, raft.ErrProposalDropped)) {
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
 		t.Fatalf("propose: %v", err)
 	}
 }
@@ -213,5 +234,124 @@ func TestRejectsWrongGroup(t *testing.T) {
 	_, err = seatsafev1.NewRaftTransportClient(conn).Send(context.Background(), &seatsafev1.RaftBatch{GroupId: 2, From: 1})
 	if err == nil {
 		t.Fatal("a batch for group 2 was accepted by a group 1 node")
+	}
+}
+
+// bigSM's snapshot carries pad bytes of padding, like a seatsm shard after a
+// long benchmark (83 MiB at 480,000 requests).
+type bigSM struct {
+	recordSM
+	pad      int
+	restores int
+}
+
+func (s *bigSM) Snapshot() ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pad := make([]byte, s.pad)
+	return append([]byte(strings.Join(s.entries, "\n")+"\x00"), pad...), nil
+}
+
+func (s *bigSM) Restore(data []byte) error {
+	i := bytes.IndexByte(data, 0)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.entries = nil
+	if i > 0 {
+		s.entries = strings.Split(string(data[:i]), "\n")
+	}
+	s.restores++
+	return nil
+}
+
+// A follower that falls behind the compacted log catches up from a snapshot
+// sent over real gRPC (#11). The snapshot is 40 MiB, well over the 16 MiB
+// gRPC message limit, so it only gets through as a stream of chunks.
+func TestSnapshotOverGRPC(t *testing.T) {
+	const group = 1
+	ids := []uint64{1, 2, 3}
+	addrs := map[uint64]string{}
+	lis := map[uint64]net.Listener{}
+	for _, id := range ids {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		lis[id], addrs[id] = l, l.Addr().String()
+	}
+	quiet := &raft.DefaultLogger{Logger: log.New(io.Discard, "", 0)}
+	nodes, sms, servers := map[uint64]*raftnode.Node{}, map[uint64]*bigSM{}, map[uint64]*grpc.Server{}
+	trs := map[uint64]*Transport{}
+	for _, id := range ids {
+		tr, err := New(group, id, addrs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sm := &bigSM{pad: 40 << 20}
+		n, err := raftnode.Start(raftnode.Config{ID: id, Peers: ids, SM: sm, Transport: tr,
+			TickInterval: 20 * time.Millisecond, Logger: quiet, SnapshotEntries: 20, CatchUpEntries: 5})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tr.SetNode(n)
+		gs := grpc.NewServer(grpc.MaxRecvMsgSize(MaxMsgSize))
+		tr.Register(gs)
+		go gs.Serve(lis[id])
+		nodes[id], sms[id], servers[id], trs[id] = n, sm, gs, tr
+	}
+	defer func() {
+		for _, id := range ids {
+			servers[id].Stop()
+			nodes[id].Stop()
+			trs[id].Close()
+		}
+	}()
+	members := map[uint64]*member{}
+	for _, id := range ids {
+		members[id] = &member{node: nodes[id], sm: &sms[id].recordSM, up: true}
+	}
+	lead := waitLeader(t, members)
+	follower := lead%3 + 1
+
+	// Cut the follower off by stopping its gRPC server, then write enough
+	// for the leader to compact past it.
+	servers[follower].Stop()
+	for i := range 60 {
+		propose(t, nodes[lead], fmt.Sprintf("e-%d", i))
+	}
+	l, err := net.Listen("tcp", addrs[follower])
+	if err != nil {
+		t.Fatal(err)
+	}
+	gs := grpc.NewServer(grpc.MaxRecvMsgSize(MaxMsgSize))
+	trs[follower].Register(gs)
+	go gs.Serve(l)
+	servers[follower] = gs
+
+	waitSame(t, members, 60)
+	sms[follower].mu.Lock()
+	restores := sms[follower].restores
+	sms[follower].mu.Unlock()
+	if restores == 0 {
+		t.Fatal("follower caught up without a snapshot; the test did not exercise MsgSnap over gRPC")
+	}
+}
+
+// A snapshot stream addressed to another Raft group is refused, like a batch.
+func TestSnapshotStreamRejectsWrongGroup(t *testing.T) {
+	members, addrs := startGroup(t)
+	waitLeader(t, members)
+	conn, err := grpc.NewClient(addrs[1], grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	stream, err := seatsafev1.NewRaftTransportClient(conn).SendSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = stream.Send(&seatsafev1.SnapshotChunk{GroupId: 2, From: 1, Data: []byte("x")})
+	if _, err := stream.CloseAndRecv(); err == nil {
+		t.Fatal("a snapshot for group 2 was accepted by a group 1 node")
 	}
 }
