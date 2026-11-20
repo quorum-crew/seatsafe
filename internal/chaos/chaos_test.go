@@ -31,7 +31,9 @@ func (d *fakeDocker) Run(_ context.Context, args ...string) (string, error) {
 		}
 		svc := strings.TrimSuffix(strings.TrimPrefix(c, "seatsafe-"), "-1")
 		var shard, node int
-		fmt.Sscanf(svc, "shard%d-node%d", &shard, &node)
+		if _, err := fmt.Sscanf(svc, "coord-%d", &node); err != nil {
+			fmt.Sscanf(svc, "shard%d-node%d", &shard, &node)
+		}
 		applied := uint64(100)
 		if a, ok := d.applied[svc]; ok {
 			applied = a
