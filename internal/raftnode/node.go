@@ -5,6 +5,11 @@
 // StateMachine. The node runs the Ready loop (persist, send, advance) and a
 // separate apply goroutine, and lets callers propose an entry and wait for the
 // result its apply produced.
+//
+// Two things in the loop do not wait for the local write (handleReady): a
+// leader sends a Ready's appends before it persists them, so the followers
+// write in parallel with it, and committed entries that are already on this
+// node's disk are applied before the Ready's own write.
 package raftnode
 
 import (
@@ -173,6 +178,12 @@ type Node struct {
 	snapshotting atomic.Bool
 	snapshots    sync.WaitGroup
 
+	// Owned by the Raft loop. leading is whether this node is leader as of
+	// the last SoftState a Ready carried; hardState is the last HardState
+	// persisted (loaded at a restart).
+	leading   bool
+	hardState raftpb.HardState
+
 	stop     chan struct{}
 	done     chan struct{}
 	stopOnce sync.Once
@@ -278,6 +289,7 @@ func (n *Node) loadState(rc *raft.Config) (bool, error) {
 	if err := n.storage.SetHardState(hs); err != nil {
 		return false, fmt.Errorf("raftnode: load hard state: %w", err)
 	}
+	n.hardState = hs
 	if err := n.storage.Append(ents); err != nil {
 		return false, fmt.Errorf("raftnode: load entries: %w", err)
 	}
@@ -290,6 +302,10 @@ func (n *Node) loadState(rc *raft.Config) (bool, error) {
 // run is the Raft loop. It only persists, sends and hands committed work to
 // the apply goroutine, so a slow apply or snapshot never delays heartbeats
 // or votes: a 2 s snapshot on the loop would cost the group its leader.
+//
+// Advance comes after handleReady has persisted the Ready. That is what
+// makes a leader count its own copy of an entry only once it is on its disk:
+// etcd raft steps the leader's acknowledgement of its own entries at Advance.
 func (n *Node) run() {
 	defer close(n.done)
 	applied := make(chan struct{})
@@ -325,22 +341,56 @@ func (n *Node) run() {
 	}
 }
 
-// applyBatch is the part of one Ready that the apply goroutine handles, in
-// the order the Readies arrived.
+// applyBatch is a part of one Ready that the apply goroutine handles, in the
+// order the loop pushed them. A Ready gives one batch after its Save and, if
+// some of its committed entries were on disk already, one before it.
 type applyBatch struct {
 	snap      raftpb.Snapshot // received from the leader: restore before entries
 	entries   []raftpb.Entry  // committed entries, in log order
 	softState *raft.SoftState // leadership as of this Ready, or nil
+	// early marks the batch pushed before its Ready's Save. It has entries
+	// only, all of them persisted by earlier Readies, and it never starts a
+	// snapshot: the commit index that covers its entries is not on disk yet.
+	early bool
 	// done is closed once the batch is applied, for a batch the loop must
 	// wait for before Advance: one with a membership change, so Raft sees the
 	// new configuration before it hands out more work.
 	done chan struct{}
 }
 
-// handleReady persists a Ready and sends its messages, following the etcd
-// raft contract (persist before send), and returns what is left to apply.
+// handleReady does everything one Ready asks for except the applying, which
+// it hands to the apply goroutine: it returns the batch to push once the
+// Ready is on disk.
+//
+// The order is etcd raft's contract (persist, then send, then apply) with the
+// two exceptions the contract allows, both of which etcd's own server makes:
+//
+//   - A leader sends its messages before it persists, so its followers write
+//     the new entries while it does (Raft thesis 10.2.1). The leader still
+//     counts itself towards the quorum only once its own write is done: etcd
+//     raft delivers a leader's acknowledgement of its own entries at Advance,
+//     which the loop calls after Save. See sendFirst.
+//   - Committed entries that are already on this node's disk are applied
+//     without waiting for this Ready's Save, which is for other entries. See
+//     splitCommitted.
 func (n *Node) handleReady(rd raft.Ready) (applyBatch, error) {
-	// 1. Persist: one batch, fsynced when rd.MustSync (new entries, a term
+	if rd.SoftState != nil {
+		n.leading = rd.SoftState.RaftState == raft.StateLeader
+	}
+	first, rest := n.sendFirst(rd)
+	early, late := n.splitCommitted(rd)
+
+	// 1. As leader: replicate in parallel with the local write.
+	if len(first) > 0 {
+		n.cfg.Transport.Send(first)
+	}
+
+	// 2. Apply what is committed and already persisted here.
+	if len(early) > 0 {
+		n.applyq.push(applyBatch{entries: early, early: true})
+	}
+
+	// 3. Persist: one batch, fsynced when rd.MustSync (new entries, a term
 	//    or vote change) or a snapshot needs it, then the in-memory copy Raft
 	//    reads from.
 	if n.cfg.Store != nil {
@@ -357,29 +407,96 @@ func (n *Node) handleReady(rd raft.Ready) (applyBatch, error) {
 		if err := n.storage.SetHardState(rd.HardState); err != nil {
 			return applyBatch{}, fmt.Errorf("set hard state: %w", err)
 		}
+		n.hardState = rd.HardState
 	}
 	if err := n.storage.Append(rd.Entries); err != nil {
 		return applyBatch{}, fmt.Errorf("append entries: %w", err)
 	}
 
-	// 2. Send.
-	if len(rd.Messages) > 0 {
-		n.cfg.Transport.Send(rd.Messages)
+	// 4. Send what had to wait for the write: everything on a follower or
+	//    candidate, and on a leader snapshots and the answers to other
+	//    nodes' appends and votes.
+	if len(rest) > 0 {
+		n.cfg.Transport.Send(rest)
 	}
 
-	// 3. Hand the rest to the apply goroutine.
-	b := applyBatch{snap: rd.Snapshot, entries: rd.CommittedEntries}
+	// 5. Hand the rest to the apply goroutine.
+	b := applyBatch{snap: rd.Snapshot, entries: late}
 	if rd.SoftState != nil {
 		ss := *rd.SoftState
 		b.softState = &ss
 	}
-	for _, e := range b.entries {
-		if e.Type == raftpb.EntryConfChange || e.Type == raftpb.EntryConfChangeV2 {
-			b.done = make(chan struct{})
-			break
-		}
+	if slices.ContainsFunc(b.entries, isConfChange) {
+		b.done = make(chan struct{})
 	}
 	return b, nil
+}
+
+// sendFirst splits a Ready's messages into those to send before its Save and
+// those to send after it.
+//
+// Only a leader sends anything first, and only what etcd raft itself lets
+// out before the local write: its appends and heartbeats. Everything keeps
+// the order persist, then send when:
+//
+//   - this node is not the leader as of this Ready (rd.SoftState, or the last
+//     one seen): a follower's acknowledgement and a vote promise that
+//     something is on disk;
+//   - the Ready changes the term or the vote: no message may go out before
+//     those are durable;
+//   - the Ready carries a snapshot to install.
+//
+// On a leader, snapshot messages still go after the Save, and so do
+// MsgAppResp, MsgVoteResp and MsgPreVoteResp, the three kinds etcd raft
+// holds back until the local write is durable (raft.send).
+func (n *Node) sendFirst(rd raft.Ready) (first, rest []raftpb.Message) {
+	if len(rd.Messages) == 0 || !n.leading || !raft.IsEmptySnap(rd.Snapshot) {
+		return nil, rd.Messages
+	}
+	if hs := rd.HardState; !raft.IsEmptyHardState(hs) && (hs.Term != n.hardState.Term || hs.Vote != n.hardState.Vote) {
+		return nil, rd.Messages
+	}
+	for _, m := range rd.Messages {
+		switch m.Type {
+		case raftpb.MsgSnap, raftpb.MsgAppResp, raftpb.MsgVoteResp, raftpb.MsgPreVoteResp:
+			rest = append(rest, m)
+		default:
+			first = append(first, m)
+		}
+	}
+	return first, rest
+}
+
+// splitCommitted splits a Ready's committed entries into those that may be
+// applied before its Save (early) and those that must wait for it (late).
+//
+// An entry may go early only if it is already on this node's disk: its index
+// is at most the last index persisted by earlier Readies, and below the
+// first entry this Ready writes (a Ready that rewrites a conflicting tail
+// can commit the new entry at an index the old log also had). Everything
+// waits for the Save when the Ready carries a snapshot, which must be
+// restored first, or a configuration change, which the loop waits for.
+func (n *Node) splitCommitted(rd raft.Ready) (early, late []raftpb.Entry) {
+	ents := rd.CommittedEntries
+	if len(ents) == 0 || !raft.IsEmptySnap(rd.Snapshot) || slices.ContainsFunc(ents, isConfChange) {
+		return nil, ents
+	}
+	persisted, err := n.storage.LastIndex() // also the store's last index: the two are written together
+	if err != nil {
+		return nil, ents
+	}
+	if len(rd.Entries) > 0 {
+		persisted = min(persisted, rd.Entries[0].Index-1)
+	}
+	i := 0
+	for i < len(ents) && ents[i].Index <= persisted {
+		i++
+	}
+	return ents[:i:i], ents[i:]
+}
+
+func isConfChange(e raftpb.Entry) bool {
+	return e.Type == raftpb.EntryConfChange || e.Type == raftpb.EntryConfChangeV2
 }
 
 // applyLoop applies batches in order until the queue is closed. Batches still
@@ -444,9 +561,15 @@ func (n *Node) apply(b applyBatch) error {
 		n.applied.Store(e.Index)
 	}
 
-	// Snapshot and compact once enough entries have been applied.
-	if err := n.maybeSnapshot(); err != nil {
-		return fmt.Errorf("snapshot: %w", err)
+	// Snapshot and compact once enough entries have been applied. Not after
+	// an early batch: a snapshot at index i must not reach the disk before
+	// the HardState whose commit index covers i, or a restart would find a
+	// snapshot ahead of the commit index. The batch pushed after the Save
+	// follows right behind and takes the snapshot.
+	if !b.early {
+		if err := n.maybeSnapshot(); err != nil {
+			return fmt.Errorf("snapshot: %w", err)
+		}
 	}
 
 	// A leadership change after applying, so results committed in this
@@ -460,7 +583,8 @@ func (n *Node) apply(b applyBatch) error {
 
 // maybeSnapshot starts a snapshot once SnapshotEntries entries have been
 // applied since the last one. It runs on the apply goroutine right after
-// applying, so the state it captures matches the applied index exactly. Only
+// applying a batch whose Ready is on disk, so the state it captures matches
+// the applied index exactly and that index is persisted and committed. Only
 // the capture happens here (all of Snapshot, for a state machine without
 // SnapshotCapturer); encoding, storing and compacting run on a separate
 // goroutine, one snapshot at a time, while applying continues.
@@ -470,6 +594,13 @@ func (n *Node) maybeSnapshot() error {
 	}
 	applied := n.applied.Load()
 	if applied-n.snapIndex.Load() < n.cfg.SnapshotEntries || n.snapshotting.Load() {
+		return nil
+	}
+	// Never record an applied index above the last index persisted here.
+	// Entries are applied early only when they are on disk, and this runs
+	// after the Ready's Save, so it always holds; if it ever did not, a
+	// later batch takes the snapshot.
+	if last, err := n.storage.LastIndex(); err != nil || applied > last {
 		return nil
 	}
 	start := time.Now()
