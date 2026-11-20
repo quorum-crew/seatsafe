@@ -8,6 +8,8 @@
 //	           shard2-node1:7000,shard2-node2:7000,shard2-node3:7000
 //	GRPC_ADDR  gRPC listen address (default :7000)
 //	HTTP_ADDR  health and metrics listen address (default :8080)
+//	PPROF      1 serves net/http/pprof on HTTP_ADDR under /debug/pprof/, with
+//	           block and mutex profiling on (default off)
 //	DATA_DIR   Pebble directory for the Raft log (default /data)
 //	SEED_DIR   directory holding shard{N}.json (default /seed)
 //	RAFT_TICK_MS           Raft tick interval in milliseconds (default 25)

@@ -44,7 +44,8 @@ func InfoFromEnv(role string) Info {
 }
 
 // Handler returns the HTTP routes shared by all processes. Each extra
-// function appends its own metrics to /metrics.
+// function appends its own metrics to /metrics. With PPROF=1 it also serves
+// net/http/pprof under /debug/pprof/ and turns on block and mutex profiling.
 func Handler(info Info, extra ...func(io.Writer)) http.Handler {
 	start := time.Now()
 	mux := http.NewServeMux()
@@ -62,6 +63,9 @@ func Handler(info Info, extra ...func(io.Writer)) http.Handler {
 			f(w)
 		}
 	})
+	if pprofEnabled() {
+		mountPprof(mux)
+	}
 	return mux
 }
 

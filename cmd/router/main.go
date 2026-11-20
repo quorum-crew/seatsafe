@@ -4,6 +4,8 @@
 //
 //	GRPC_ADDR  BookingService listen address (default :7000)
 //	HTTP_ADDR  /healthz and /metrics (default :8080)
+//	PPROF      1 serves net/http/pprof on HTTP_ADDR under /debug/pprof/, with
+//	           block and mutex profiling on (default off)
 //	SHARDMAP   shard map file (default /etc/seatsafe/shardmap.json)
 package main
 
