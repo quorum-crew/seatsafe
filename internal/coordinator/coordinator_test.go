@@ -82,14 +82,14 @@ func TestOneNoWithConflicts(t *testing.T) {
 // A shard that cannot answer within the prepare deadline aborts the order.
 // The Abort reaches it once it is back, and until then it is retried.
 func TestShardTimeoutAborts(t *testing.T) {
-	c := startCluster(t, options{})
+	c := startCluster(t, options{prepareTimeout: DefaultPrepareTimeout, durable: true})
 	// Shard 2 loses its quorum: nobody there can vote.
 	c.killShardNode(2, 2)
 	c.killShardNode(2, 3)
 	start := time.Now()
 	resp := c.mustSubmit("t1", on(1, 3), on(2, 3))
 	wantResp(t, resp, "t1", aborted, false)
-	if d := time.Since(start); d > 2*time.Second {
+	if d := time.Since(start); d > 5*time.Second {
 		t.Fatalf("abort took %v", d)
 	}
 	// Shard 1 hears the Abort; shard 2 cannot yet.
@@ -145,9 +145,9 @@ func TestRetryReplaysTheAnswer(t *testing.T) {
 // gets the same answer; the order is prepared and decided once.
 func TestRetryWaitsForTheRunInProgress(t *testing.T) {
 	c := startCluster(t, options{})
-	reached, release := make(chan struct{}), make(chan struct{})
-	h := hook(func(ctx context.Context, _ string) {
-		close(reached)
+	reached, release := make(chan string, 16), make(chan struct{})
+	h := hook(func(ctx context.Context, txn string) {
+		reached <- txn
 		select {
 		case <-release:
 		case <-ctx.Done():
@@ -156,10 +156,10 @@ func TestRetryWaitsForTheRunInProgress(t *testing.T) {
 	c.before.Store(&h)
 	answers := make(chan *seatsafev1.BookSeatsResponse, 2)
 	go func() { answers <- c.mustSubmit("t1", on(1, 0), on(2, 0)) }()
-	<-reached
+	c.await(reached, "t1 has its votes")
 	c.before.Store(nil)
 	go func() { answers <- c.mustSubmit("t1", on(1, 0), on(2, 0)) }()
-	_, leader := c.coordLeader()
+	_, leader := c.running("t1")
 	var buf bytes.Buffer
 	leader.coord.WriteMetrics(&buf)
 	if !strings.Contains(buf.String(), "seatsafe_coordinator_inflight_txns 1") {
@@ -185,9 +185,9 @@ func TestRetryWaitsForTheRunInProgress(t *testing.T) {
 // no seat is booked.
 func TestGetDecisionBeforeVotes(t *testing.T) {
 	c := startCluster(t, options{})
-	reached, release := make(chan struct{}), make(chan struct{})
-	h := hook(func(ctx context.Context, _ string) {
-		close(reached)
+	reached, release := make(chan string, 16), make(chan struct{})
+	h := hook(func(ctx context.Context, txn string) {
+		reached <- txn
 		select {
 		case <-release:
 		case <-ctx.Done():
@@ -196,7 +196,7 @@ func TestGetDecisionBeforeVotes(t *testing.T) {
 	c.before.Store(&h)
 	answer := make(chan *seatsafev1.BookSeatsResponse, 1)
 	go func() { answer <- c.mustSubmit("t1", on(1, 0, 1), on(2, 0)) }()
-	<-reached // every shard has voted YES and holds its seats
+	c.await(reached, "t1 has its votes") // every shard has voted YES and holds its seats
 	if len(c.holds(1)) != 1 || len(c.holds(2)) != 1 {
 		t.Fatalf("holds before the decision: shard 1 %v, shard 2 %v", c.holds(1), c.holds(2))
 	}

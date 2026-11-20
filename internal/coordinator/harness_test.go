@@ -79,15 +79,16 @@ func (s seedOf) Chunk(int) []*seatsafev1.SeatRef {
 // group is the part every in-process Raft group shares: an in-memory Raft
 // network, real gRPC listeners on localhost, and a data directory per node.
 type group struct {
-	t     testing.TB
-	net   *raftnode.Network
-	addrs map[uint64]string
-	dirs  map[uint64]string
-	lis   map[uint64]net.Listener // bound at creation, until the node's first start
+	t       testing.TB
+	durable bool
+	net     *raftnode.Network
+	addrs   map[uint64]string
+	dirs    map[uint64]string
+	lis     map[uint64]net.Listener // bound at creation, until the node's first start
 }
 
-func newGroup(t testing.TB) *group {
-	g := &group{t: t, net: raftnode.NewNetwork(), addrs: map[uint64]string{}, dirs: map[uint64]string{}, lis: map[uint64]net.Listener{}}
+func newGroup(t testing.TB, durable bool) *group {
+	g := &group{t: t, durable: durable, net: raftnode.NewNetwork(), addrs: map[uint64]string{}, dirs: map[uint64]string{}, lis: map[uint64]net.Listener{}}
 	for _, id := range raftIDs {
 		lis, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
@@ -127,36 +128,42 @@ func (g *group) listener(id uint64) net.Listener {
 	}
 }
 
-// raft starts the node's Raft member on its durable store.
-func (g *group) raft(id uint64, sm raftnode.StateMachine) (*raftnode.Node, *raftstore.Pebble) {
-	store, err := raftstore.Open(g.dirs[id])
-	if err != nil {
-		g.t.Fatal(err)
+// raft starts the node's Raft member, on its store if the group is durable.
+// The returned function closes the store.
+func (g *group) raft(id uint64, sm raftnode.StateMachine) (*raftnode.Node, func()) {
+	cfg := raftnode.Config{ID: id, Peers: raftIDs, SM: sm, Transport: g.net, TickInterval: 20 * time.Millisecond, Logger: quiet}
+	closeStore := func() {}
+	if g.durable {
+		store, err := raftstore.Open(g.dirs[id])
+		if err != nil {
+			g.t.Fatal(err)
+		}
+		cfg.Store = store
+		closeStore = func() { store.Close() }
 	}
-	n, err := raftnode.Start(raftnode.Config{ID: id, Peers: raftIDs, SM: sm, Transport: g.net, Store: store,
-		TickInterval: 10 * time.Millisecond, Logger: quiet})
+	n, err := raftnode.Start(cfg)
 	if err != nil {
 		g.t.Fatal(err)
 	}
 	g.net.Add(id, n)
-	return n, store
+	return n, closeStore
 }
 
 type shardNode struct {
-	node  *raftnode.Node
-	sm    *seatsm.Machine
-	store *raftstore.Pebble
-	gs    *grpc.Server
-	stop  context.CancelFunc
+	node       *raftnode.Node
+	sm         *seatsm.Machine
+	closeStore func()
+	gs         *grpc.Server
+	stop       context.CancelFunc
 }
 
 type coordNode struct {
-	node   *raftnode.Node
-	sm     *coordsm.Machine
-	store  *raftstore.Pebble
-	gs     *grpc.Server
-	coord  *Coordinator
-	shards map[uint32]*groupclient.Group
+	node       *raftnode.Node
+	sm         *coordsm.Machine
+	closeStore func()
+	gs         *grpc.Server
+	coord      *Coordinator
+	shards     map[uint32]*groupclient.Group
 }
 
 type hook func(ctx context.Context, txnID string)
@@ -164,10 +171,19 @@ type hook func(ctx context.Context, txnID string)
 // options tune the coordinators of a cluster.
 type options struct {
 	gcInterval, gcRetention, stuckAfter time.Duration
+	// prepareTimeout defaults to 2 s here, not the real 300 ms: on a loaded
+	// test machine a healthy shard can take longer than 300 ms to vote, and
+	// only the tests about that deadline want orders aborted for it.
+	prepareTimeout time.Duration
+	// durable keeps every Raft log on disk, which a node needs to be
+	// restarted. Tests that restart nobody keep the logs in memory: with
+	// twelve nodes fsyncing to one disk, a slow fsync on a leader is enough
+	// to start an election, and most tests here are about something else.
+	durable bool
 }
 
 // cluster is a real coordinator group and three real shards in one process:
-// Raft over in-memory networks with durable logs, every service over gRPC.
+// Raft over in-memory networks, every service over gRPC.
 type cluster struct {
 	t    testing.TB
 	opts options
@@ -188,11 +204,14 @@ type cluster struct {
 
 func startCluster(t testing.TB, opts options) *cluster {
 	t.Helper()
+	if opts.prepareTimeout == 0 {
+		opts.prepareTimeout = 2 * time.Second
+	}
 	c := &cluster{t: t, opts: opts, shardG: map[uint32]*group{}, shardN: map[uint32]map[uint64]*shardNode{},
 		coordN: map[uint64]*coordNode{}, shards: map[uint32]*groupclient.Group{}}
 	gm := groupclient.NewMetrics(metrics.NewRegistry())
 	for _, s := range shardIDs {
-		c.shardG[s] = newGroup(t)
+		c.shardG[s] = newGroup(t, opts.durable)
 		c.shardN[s] = map[uint64]*shardNode{}
 		for _, id := range raftIDs {
 			c.startShardNode(s, id)
@@ -203,7 +222,7 @@ func startCluster(t testing.TB, opts options) *cluster {
 		}
 		c.shards[s] = cl
 	}
-	c.coordG = newGroup(t)
+	c.coordG = newGroup(t, opts.durable)
 	for _, id := range raftIDs {
 		c.startCoordNode(id)
 	}
@@ -253,8 +272,11 @@ func (c *cluster) close() {
 
 func (c *cluster) startShardNode(s uint32, id uint64) {
 	g := c.shardG[s]
+	if _, first := g.lis[id]; !first && !g.durable {
+		c.t.Fatal("restarting a node needs options.durable")
+	}
 	sm := seatsm.New()
-	node, store := g.raft(id, shard.Applier{SM: sm})
+	node, closeStore := g.raft(id, shard.Applier{SM: sm})
 	gs := grpc.NewServer()
 	shard.NewService(node, sm, g.addrs).Register(gs)
 	transport.NewStatusServer(fmt.Sprintf("shard%d-node%d", s, id), s, node, g.addrs).Register(gs)
@@ -263,7 +285,7 @@ func (c *cluster) startShardNode(s uint32, id uint64) {
 	go (&shard.Seeder{Node: node, SM: sm, Interval: 10 * time.Millisecond,
 		Load: func() (shard.SeedSource, error) { return seedOf(s), nil }, Logf: func(string, ...any) {}}).Run(ctx)
 	c.mu.Lock()
-	c.shardN[s][id] = &shardNode{node: node, sm: sm, store: store, gs: gs, stop: cancel}
+	c.shardN[s][id] = &shardNode{node: node, sm: sm, closeStore: closeStore, gs: gs, stop: cancel}
 	c.mu.Unlock()
 }
 
@@ -278,13 +300,16 @@ func (c *cluster) killShardNode(s uint32, id uint64) {
 	n.stop()
 	n.gs.Stop()
 	n.node.Stop()
-	n.store.Close()
+	n.closeStore()
 }
 
 func (c *cluster) startCoordNode(id uint64) {
 	g := c.coordG
+	if _, first := g.lis[id]; !first && !g.durable {
+		c.t.Fatal("restarting a node needs options.durable")
+	}
 	sm := coordsm.New()
-	node, store := g.raft(id, Applier{SM: sm})
+	node, closeStore := g.raft(id, Applier{SM: sm})
 	shards := map[uint32]*groupclient.Group{}
 	gm := groupclient.NewMetrics(metrics.NewRegistry())
 	for _, s := range shardIDs {
@@ -296,7 +321,8 @@ func (c *cluster) startCoordNode(id uint64) {
 	}
 	coord, err := New(Config{
 		Node: node, SM: sm, Addrs: g.addrs, Shards: shards,
-		GCInterval: c.opts.gcInterval, GCRetention: c.opts.gcRetention, StuckAfter: c.opts.stuckAfter,
+		PrepareTimeout: c.opts.prepareTimeout,
+		GCInterval:     c.opts.gcInterval, GCRetention: c.opts.gcRetention, StuckAfter: c.opts.stuckAfter,
 		LeaderPoll: 5 * time.Millisecond,
 		Logf: func(format string, args ...any) {
 			c.mu.Lock()
@@ -323,7 +349,7 @@ func (c *cluster) startCoordNode(id uint64) {
 	go gs.Serve(g.listener(id))
 	coord.Start()
 	c.mu.Lock()
-	c.coordN[id] = &coordNode{node: node, sm: sm, store: store, gs: gs, coord: coord, shards: shards}
+	c.coordN[id] = &coordNode{node: node, sm: sm, closeStore: closeStore, gs: gs, coord: coord, shards: shards}
 	c.allMetrics = append(c.allMetrics, coord.Metrics)
 	c.mu.Unlock()
 }
@@ -342,7 +368,7 @@ func (c *cluster) killCoord(id uint64) {
 	n.coord.Close()
 	n.gs.Stop()
 	n.node.Stop()
-	n.store.Close()
+	n.closeStore()
 	for _, cl := range n.shards {
 		_ = cl.Close()
 	}
@@ -431,6 +457,33 @@ func (c *cluster) shardLeader(s uint32) (uint64, *shardNode) {
 		return n != nil
 	})
 	return id, n
+}
+
+// await waits for a hook to report a txn, and fails the test instead of
+// hanging if it never does.
+func (c *cluster) await(reached <-chan string, what string) string {
+	c.t.Helper()
+	select {
+	case txn := <-reached:
+		return txn
+	case <-time.After(30 * time.Second):
+		c.t.Fatalf("not within 30s: %s\ncoordinator log:\n%s", what, c.logText())
+		return ""
+	}
+}
+
+// running returns the coordinator node that is running txn.
+func (c *cluster) running(txn string) (uint64, *coordNode) {
+	c.t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for id, n := range c.coordN {
+		if n.coord.inFlight(txn) {
+			return id, n
+		}
+	}
+	c.t.Fatalf("no coordinator node is running %s", txn)
+	return 0, nil
 }
 
 // submit sends SubmitOrder the way the router does, following the leader,
