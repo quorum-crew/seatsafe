@@ -64,3 +64,23 @@ func TestPanics(t *testing.T) {
 		}()
 	}
 }
+
+// Init creates a series at 0 without touching one that already counts.
+func TestInit(t *testing.T) {
+	r := NewRegistry()
+	c := r.NewCounterVec("c_total", "c", "group")
+	h := r.NewHistogramVec("h_seconds", "h", []float64{1}, "group")
+	c.Inc("a")
+	c.Init("a")
+	c.Init("b")
+	h.Observe(0.5, "a")
+	h.Init("a")
+	h.Init("b")
+	var b strings.Builder
+	r.Write(&b)
+	for _, want := range []string{`c_total{group="a"} 1`, `c_total{group="b"} 0`, `h_seconds_count{group="a"} 1`, `h_seconds_count{group="b"} 0`, `h_seconds_bucket{group="b",le="+Inf"} 0`} {
+		if !strings.Contains(b.String(), want+"\n") {
+			t.Errorf("missing %s in:\n%s", want, b.String())
+		}
+	}
+}
