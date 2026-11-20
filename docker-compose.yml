@@ -22,6 +22,16 @@ x-storage: &storage
     timeout: 2s
     retries: 30
 
+# Coordinator nodes report healthy once their Raft group has a leader.
+x-coordinator: &coordinator
+  <<: *seatsafe
+  command: ["coordinator"]
+  healthcheck:
+    test: ["CMD", "wget", "-qO-", "http://localhost:8080/readyz"]
+    interval: 2s
+    timeout: 2s
+    retries: 30
+
 # gRPC addresses (port 7000). They must match deploy/shardmap.json exactly:
 # the router matches leader redirects against the shard map's node lists.
 x-shard1: &shard1 "shard1-node1:7000,shard1-node2:7000,shard1-node3:7000"
@@ -53,10 +63,11 @@ services:
   shard3-node1: { <<: *storage, environment: { NODE_ID: shard3-node1, SHARD_ID: "3", COORDINATOR_PEERS: *coord, PEERS: *shard3 }, volumes: ["./deploy/seed:/seed:ro", "shard3-node1:/data"] }
   shard3-node2: { <<: *storage, environment: { NODE_ID: shard3-node2, SHARD_ID: "3", COORDINATOR_PEERS: *coord, PEERS: *shard3 }, volumes: ["./deploy/seed:/seed:ro", "shard3-node2:/data"] }
   shard3-node3: { <<: *storage, environment: { NODE_ID: shard3-node3, SHARD_ID: "3", COORDINATOR_PEERS: *coord, PEERS: *shard3 }, volumes: ["./deploy/seed:/seed:ro", "shard3-node3:/data"] }
-  # ---- 2PC coordinator (Raft group 0; still a placeholder) ----
-  coord-1: { <<: *seatsafe, command: ["coordinator"], environment: { NODE_ID: coord-1, PEERS: *coord } }
-  coord-2: { <<: *seatsafe, command: ["coordinator"], environment: { NODE_ID: coord-2, PEERS: *coord } }
-  coord-3: { <<: *seatsafe, command: ["coordinator"], environment: { NODE_ID: coord-3, PEERS: *coord } }
+  # ---- 2PC coordinator (Raft group 0). Each node keeps its Raft log in its own
+  # volume and reads the shards' addresses from the shard map. ----
+  coord-1: { <<: *coordinator, environment: { NODE_ID: coord-1, PEERS: *coord }, volumes: ["./deploy/shardmap.json:/etc/seatsafe/shardmap.json:ro", "coord-1:/data"] }
+  coord-2: { <<: *coordinator, environment: { NODE_ID: coord-2, PEERS: *coord }, volumes: ["./deploy/shardmap.json:/etc/seatsafe/shardmap.json:ro", "coord-2:/data"] }
+  coord-3: { <<: *coordinator, environment: { NODE_ID: coord-3, PEERS: *coord }, volumes: ["./deploy/shardmap.json:/etc/seatsafe/shardmap.json:ro", "coord-3:/data"] }
 
   # ---- Monitoring ----
   prometheus:
@@ -88,3 +99,6 @@ volumes:
   shard3-node1: {}
   shard3-node2: {}
   shard3-node3: {}
+  coord-1: {}
+  coord-2: {}
+  coord-3: {}

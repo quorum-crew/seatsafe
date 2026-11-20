@@ -76,8 +76,25 @@ cluster as it is, and `go run ./cmd/chaos -h` lists the rest.
 go vet ./... && go test -race ./...
 ```
 
+## Cross-shard orders
+
+An order with seats on two or more shards goes from the router to the coordinator group (Raft
+group 0), which runs two-phase commit: it logs the order, asks every shard to hold its seats
+(300 ms), logs COMMIT if all of them did and ABORT otherwise, and then tells the shards. The
+decision is in the coordinator's Raft log before any shard hears it, so a new coordinator leader
+finishes what the old one started: it resends logged decisions and aborts orders that had none.
+
+The load generator sends such orders with `-cross-shard-frac 0.2`, and its audit then also checks
+that every cross-shard order is all or nothing.
+
+Settings (environment): `HOLD_TTL_MS` (coordinator, default 5000), `GC_RETENTION_MS` (coordinator,
+default 120000), `ROUTER_COORD_ATTEMPT_MS` (router, default 1000). Metrics are
+`seatsafe_coordinator_*` on the coordinator nodes' `/metrics`;
+`seatsafe_coordinator_protocol_violations_total` must stay 0.
+
 ## Layout
 
 - `cmd/router`, `cmd/storage`, `cmd/coordinator`: entry points for each node type
+- `internal/coordinator`, `internal/coordsm`: the 2PC coordinator and its replicated state machine
 - `internal/server`: shared health and metrics endpoints
 - `deploy/`: Prometheus and Grafana config
