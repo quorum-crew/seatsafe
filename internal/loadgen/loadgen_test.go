@@ -1,11 +1,13 @@
 package loadgen
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -610,11 +612,40 @@ func TestHistoryRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h.Write(3, "r1", []Seat{{"e", "s", "a"}}, base.Add(time.Millisecond), base.Add(2*time.Millisecond),
+	h.Write(3, "r1", Order{Seats: []Seat{{"e", "s", "a"}}}, base.Add(time.Millisecond), base.Add(2*time.Millisecond),
 		&seatsafev1.BookSeatsResponse{Outcome: seatsafev1.BookingOutcome_BOOKING_OUTCOME_CONFIRMED, Replayed: true}, codes.OK)
-	h.Write(3, "r2", nil, base, base, nil, codes.Unavailable)
-	if n, err := h.Close(); n != 2 || err != nil {
+	h.Write(3, "r2", Order{}, base, base, nil, codes.Unavailable)
+	h.WriteListing(PhaseBrowse, Section{"e", "s"}, []string{"b", "c"}, base.Add(-time.Millisecond), base.Add(time.Millisecond))
+	h.WriteListing(PhaseFinal, Section{"e", "s"}, nil, base.Add(3*time.Millisecond), base.Add(4*time.Millisecond))
+	h.Write(4, "r3", Order{Seats: []Seat{{"e", "s", "a"}, {"e", "t", "b"}}, Cross: true}, base, base.Add(time.Millisecond),
+		&seatsafev1.BookSeatsResponse{Outcome: seatsafev1.BookingOutcome_BOOKING_OUTCOME_SEAT_UNAVAILABLE,
+			UnavailableSeats: []*seatsafev1.SeatRef{{EventId: "e", SectionId: "s", SeatId: "a"}}}, codes.OK)
+	if n, err := h.Close(); n != 3 || err != nil {
 		t.Fatalf("%d %v", n, err)
+	}
+	// The whole file: attempts and listings, and what an old reader sees.
+	if b, err := os.ReadFile(path); err != nil {
+		t.Fatal(err)
+	} else if full, err := ReadFullHistory(bytes.NewReader(b)); err != nil || len(full.Attempts) != 3 || len(full.Listings) != 2 {
+		t.Fatalf("%+v %v", full, err)
+	} else {
+		want := []Listing{{PhaseBrowse, "e", "s", []string{"b", "c"}, -1e6, 1e6}, {PhaseFinal, "e", "s", []string{}, 3e6, 4e6}}
+		if !reflect.DeepEqual(full.Listings, want) {
+			t.Fatalf("listings %+v, want %+v", full.Listings, want)
+		}
+		a := full.Attempts[2]
+		if !reflect.DeepEqual(a.Unavailable, []string{"e/s/a"}) || a.Cross == nil || !*a.Cross || *full.Attempts[0].Cross {
+			t.Fatalf("%+v", a)
+		}
+	}
+	// A history from before listings, unavailable_seats and cross existed.
+	old := `{"client_id":1,"request_id":"r","seats":["e/s/a"],"call_ns":1,"return_ns":2,"outcome":"SEAT_UNAVAILABLE","replayed":false,"code":"OK"}` + "\n"
+	if full, err := ReadFullHistory(strings.NewReader(old)); err != nil || len(full.Attempts) != 1 || len(full.Listings) != 0 ||
+		full.Attempts[0].Cross != nil || full.Attempts[0].Unavailable != nil {
+		t.Fatalf("old history: %+v %v", full, err)
+	}
+	if _, err := ReadFullHistory(strings.NewReader(`{"kind":"other"}`)); err == nil {
+		t.Fatal("unknown kind of line accepted")
 	}
 	f, err := os.Open(path)
 	if err != nil {
@@ -622,7 +653,7 @@ func TestHistoryRoundTrip(t *testing.T) {
 	}
 	defer f.Close()
 	got, err := ReadHistory(f)
-	if err != nil || len(got) != 2 {
+	if err != nil || len(got) != 3 {
 		t.Fatalf("%v %v", got, err)
 	}
 	if a := got[0]; a.ClientID != 3 || a.Seats[0] != "e/s/a" || a.CallNs != 1e6 || a.ReturnNs != 2e6 || a.Outcome != OutcomeConfirmed || !a.Replayed || a.Code != "OK" {
@@ -743,6 +774,24 @@ func TestIntegrationFlash(t *testing.T) {
 		if v := check.Run(history); len(v) != 0 {
 			t.Errorf("%s: %v", check.Name, v[0])
 		}
+	}
+	// The history also holds the audit's two reads, section by section.
+	if _, err := f.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	full, err := ReadFullHistory(f)
+	if err != nil || len(full.Attempts) != len(history) {
+		t.Fatalf("%d attempts: %v", len(full.Attempts), err)
+	}
+	phases := map[string]int{}
+	for _, l := range full.Listings {
+		phases[l.Phase]++
+		if (l.Phase == PhaseBaseline) != (l.ReturnNs <= 0) || l.Event != FlashEvent || (l.Phase == PhaseBaseline && len(l.Free) != 20*50) {
+			t.Fatalf("listing %s of %s/%s: %d free, [%d, %d]", l.Phase, l.Event, l.Section, len(l.Free), l.CallNs, l.ReturnNs)
+		}
+	}
+	if phases[PhaseBaseline] != 30 || phases[PhaseFinal] != 30 || len(phases) != 2 {
+		t.Fatalf("listings by phase: %v", phases)
 	}
 
 	b, err := os.ReadFile(filepath.Join(c.Out, "summary.json"))

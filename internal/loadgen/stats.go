@@ -181,6 +181,7 @@ type Summary struct {
 	SeatsExhausted  bool    `json:"seats_exhausted"`
 	Audit           *Audit  `json:"audit,omitempty"`
 	HistoryAttempts int64   `json:"history_attempts,omitempty"`
+	Browses         int64   `json:"browses,omitempty"` // answered ListAvailableSeats calls during the load
 }
 
 // sortedKeys returns m's keys in order.

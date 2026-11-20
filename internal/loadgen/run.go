@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strings"
@@ -209,6 +210,95 @@ func (r *run) ramp(ctx context.Context) (*Recorder, []Step, float64, string) {
 	return total, steps, best, stopped
 }
 
+// listed is one answered ListAvailableSeats call.
+type listed struct {
+	section   Section
+	free      []string
+	call, ret time.Time
+}
+
+// listRecorder keeps the answered calls of a ListFunc for the history.
+type listRecorder struct {
+	mu  sync.Mutex
+	got []listed
+}
+
+// wrap returns list with every answered call recorded. A nil recorder
+// records nothing.
+func (r *listRecorder) wrap(list ListFunc) ListFunc {
+	if r == nil {
+		return list
+	}
+	return func(ctx context.Context, s Section) ([]string, error) {
+		call := time.Now()
+		free, err := list(ctx, s)
+		ret := time.Now()
+		if err == nil {
+			r.mu.Lock()
+			r.got = append(r.got, listed{s, free, call, ret})
+			r.mu.Unlock()
+		}
+		return free, err
+	}
+}
+
+// take returns what was recorded since the last take.
+func (r *listRecorder) take() []listed {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	got := r.got
+	r.got = nil
+	return got
+}
+
+// browse calls ListAvailableSeats for one section at a time, rate times a
+// second, until ctx ends, and writes every answer to the history. Sections
+// are picked the way orders pick theirs, so browses land where the bookings
+// are. A browse that fails or times out is not recorded: it says nothing.
+func (r *run) browse(ctx context.Context, list ListFunc, sections []Section) int64 {
+	var wg sync.WaitGroup
+	var n atomic.Int64
+	rng := rand.New(rand.NewPCG(r.cfg.Seed, 11))
+	var worker *Worker
+	if r.cfg.Workload != WorkloadFresh { // a fresh worker would use up seats
+		worker = r.workload.Worker(1 << 40)
+	}
+	tick := time.NewTicker(time.Duration(float64(time.Second) / r.cfg.BrowseRate))
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			wg.Wait()
+			return n.Load()
+		case <-tick.C:
+		}
+		s := sections[rng.IntN(len(sections))]
+		if worker != nil {
+			if o, ok := worker.Next(); ok && len(o.Seats) > 0 {
+				s = Section{o.Seats[0].Event, o.Seats[0].Section}
+			}
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cctx, cancel := context.WithTimeout(context.Background(), r.cfg.CallTimeout)
+			defer cancel()
+			call := time.Now()
+			free, err := list(cctx, s)
+			if err != nil {
+				return
+			}
+			n.Add(1)
+			if r.client.History != nil {
+				r.client.History.WriteListing(PhaseBrowse, s, free, call, time.Now())
+			}
+		}()
+	}
+}
+
 // Env is what a run talks to. Run builds it from Config when empty.
 type Env struct {
 	Book BookFunc
@@ -239,12 +329,20 @@ func Run(ctx context.Context, cfg Config, u *Universe, env Env) (*Summary, error
 	if err != nil {
 		return nil, err
 	}
+	// With a history, the availability reads go into it: the linearizability
+	// check uses the one before the run and the last one after it.
+	var lists *listRecorder
+	if cfg.History {
+		lists = &listRecorder{}
+	}
+	list := lists.wrap(env.List)
 	var before map[Seat]bool
 	if cfg.Audit || cfg.Workload == WorkloadFresh {
-		if before, err = Availability(ctx, env.List, probe.Touchable()); err != nil {
+		if before, err = Availability(ctx, list, probe.Touchable()); err != nil {
 			return nil, err
 		}
 	}
+	baseline := lists.take()
 	workload, err := NewWorkload(cfg, u, before)
 	if err != nil {
 		return nil, err
@@ -256,6 +354,9 @@ func Run(ctx context.Context, cfg Config, u *Universe, env Env) (*Summary, error
 		if client.History, err = NewHistoryWriter(filepath.Join(cfg.Out, "history.jsonl"), begin); err != nil {
 			return nil, err
 		}
+		for _, l := range baseline {
+			client.History.WriteListing(PhaseBaseline, l.section, l.free, l.call, l.ret)
+		}
 	}
 	s, err := newSeries(filepath.Join(cfg.Out, "timeseries.csv"), cfg.Quiet)
 	if err != nil {
@@ -265,6 +366,14 @@ func Run(ctx context.Context, cfg Config, u *Universe, env Env) (*Summary, error
 	r := newRun(cfg, workload, client, s)
 
 	sum := &Summary{Config: cfg, GitCommit: cfg.GitCommit, StartedAt: begin.UTC().Format(time.RFC3339), Seats: u.Seats}
+	browsed := make(chan int64, 1)
+	bctx, stopBrowsing := context.WithCancel(ctx)
+	defer stopBrowsing()
+	if cfg.BrowseRate > 0 && env.List != nil {
+		go func() { browsed <- r.browse(bctx, env.List, probe.Touchable()) }()
+	} else {
+		browsed <- 0
+	}
 	var rec *Recorder
 	switch cfg.Mode {
 	case ModeOpen:
@@ -277,19 +386,27 @@ func Run(ctx context.Context, cfg Config, u *Universe, env Env) (*Summary, error
 	if err := s.stop(); err != nil {
 		return nil, err
 	}
+	stopBrowsing()
+	sum.Browses = <-browsed
 	sum.Results = rec.Results()
 	sum.SeatsExhausted = r.out.Load()
-	if client.History != nil {
-		if sum.HistoryAttempts, err = client.History.Close(); err != nil {
-			return nil, err
+	closeHistory := func() error {
+		if client.History == nil {
+			return nil
 		}
+		var err error
+		sum.HistoryAttempts, err = client.History.Close()
+		client.History = nil
+		return err
 	}
+	defer closeHistory()
 
 	if cfg.Audit {
-		after, err := Availability(context.Background(), env.List, probe.Touchable())
+		after, err := Availability(context.Background(), list, probe.Touchable())
 		if err != nil {
 			return nil, err
 		}
+		final := lists.take()
 		sum.Audit = RunAudit(before, after, r.orders)
 		// An aborted cross-shard order's seats stay HELD until the
 		// coordinator's Abort arrives, which is after the order was
@@ -297,15 +414,28 @@ func Run(ctx context.Context, cfg Config, u *Universe, env Env) (*Summary, error
 		// unexplained.
 		for reads := 1; sum.Audit.Unsettled() && reads <= auditRereads; reads++ {
 			time.Sleep(auditRereadEvery)
-			if after, err = Availability(context.Background(), env.List, probe.Touchable()); err != nil {
+			if after, err = Availability(context.Background(), list, probe.Touchable()); err != nil {
 				return nil, err
 			}
+			final = lists.take()
 			sum.Audit = RunAudit(before, after, r.orders)
 			sum.Audit.Rereads = reads
+		}
+		// The history gets the read the audit's verdict is based on.
+		if client.History != nil {
+			for _, l := range final {
+				client.History.WriteListing(PhaseFinal, l.section, l.free, l.call, l.ret)
+			}
+		}
+		if err := closeHistory(); err != nil {
+			return nil, err
 		}
 		if err := writeJSON(filepath.Join(cfg.Out, "audit.json"), sum.Audit); err != nil {
 			return nil, err
 		}
+	}
+	if err := closeHistory(); err != nil {
+		return nil, err
 	}
 	if err := writeJSON(filepath.Join(cfg.Out, "summary.json"), sum); err != nil {
 		return nil, err
