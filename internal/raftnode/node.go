@@ -152,12 +152,16 @@ type Node struct {
 	applyq  applyQueue
 
 	mu      sync.Mutex
-	waiters map[uint64]chan outcome
+	waiters map[uint64]waiter
 
 	// Owned by the apply goroutine: the leader and role from the last
 	// SoftState it processed.
 	lead     uint64
 	isLeader bool
+	// knownLead is lead for Propose to read without a round trip to the
+	// Raft goroutine. Written by the apply goroutine before it fails
+	// pending proposals for that SoftState.
+	knownLead atomic.Uint64
 	// Owned by the apply goroutine: the current membership (for snapshot
 	// metadata).
 	confState raftpb.ConfState
@@ -226,7 +230,7 @@ func Start(cfg Config) (*Node, error) {
 		cfg:     cfg,
 		log:     cfg.Logger,
 		storage: storage,
-		waiters: make(map[uint64]chan outcome),
+		waiters: make(map[uint64]waiter),
 		stop:    make(chan struct{}),
 		done:    make(chan struct{}),
 	}
@@ -566,25 +570,52 @@ func (n *Node) leadershipChanged(ss *raft.SoftState) bool {
 	gained := n.lead == raft.None && ss.Lead == n.cfg.ID
 	changed := (ss.Lead != n.lead && !gained) || (wasLeader && ss.RaftState != raft.StateLeader)
 	n.lead, n.isLeader = ss.Lead, ss.RaftState == raft.StateLeader
+	n.knownLead.Store(ss.Lead)
 	return changed
 }
 
 // Propose appends data to the log and waits until this node has applied it,
 // returning the result of StateMachine.Apply.
 //
-// If the leader changes before the entry is applied here, Propose returns
+// If no leader is known, Propose returns raft.ErrProposalDropped at once
+// (etcd raft would otherwise hold the proposal until a leader appears). If
+// the leader changes before the entry is applied here, it returns
 // ErrLeadershipLost right away rather than waiting for ctx: the entry may
-// have been lost. Callers retry with the same request ID, and the state
-// machine's dedup makes the retry safe.
+// have been lost. Either way callers retry with the same request ID, and the
+// state machine's dedup makes the retry safe.
 func (n *Node) Propose(ctx context.Context, data []byte) (any, error) {
-	id, ch := n.register()
+	return n.propose(ctx, data, true)
+}
+
+// propose is Propose; checkLeader=false skips the no-leader check, so tests
+// can reach a proposal blocked inside raft.Propose.
+func (n *Node) propose(ctx context.Context, data []byte, checkLeader bool) (any, error) {
+	// failPending cancels pctx, which releases a raft.Propose that is
+	// blocked because the leader went away after the check below (#27).
+	pctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	id, ch := n.register(cancel)
 	defer n.forget(id)
 
-	if err := n.raft.Propose(ctx, encode(id, data)); err != nil {
+	// Registered first, so a leader lost after this check is caught: its
+	// SoftState reaches failPending only after this waiter exists. The
+	// cached leader is enough while one is known; only when it shows none
+	// does Propose ask Raft, whose view is ahead of the applied SoftState
+	// (a node that just won an election accepts proposals before its first
+	// leader SoftState is applied).
+	if checkLeader && n.knownLead.Load() == raft.None && n.raft.Status().Lead == raft.None {
+		return nil, raft.ErrProposalDropped
+	}
+	if err := n.raft.Propose(pctx, encode(id, data)); err != nil {
+		select {
+		case out := <-ch: // failed by failPending while blocked
+			return out.val, out.err
+		default:
+		}
 		if errors.Is(err, raft.ErrStopped) {
 			return nil, ErrStopped
 		}
-		return nil, err // e.g. raft.ErrProposalDropped when there is no leader
+		return nil, err
 	}
 	select {
 	case out := <-ch:
@@ -651,17 +682,23 @@ type outcome struct {
 	err error
 }
 
+// waiter is a Propose waiting for its entry to be applied.
+type waiter struct {
+	ch     chan outcome       // buffered (1)
+	cancel context.CancelFunc // releases its raft.Propose call; may be nil
+}
+
 // register picks a random proposal ID. IDs only need to be unique among the
 // proposals currently waiting on this node; 64 random bits make a clash with
 // an older entry still in the log vanishingly unlikely.
-func (n *Node) register() (uint64, chan outcome) {
+func (n *Node) register(cancel context.CancelFunc) (uint64, chan outcome) {
 	ch := make(chan outcome, 1)
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	for {
 		id := rand.Uint64()
 		if _, taken := n.waiters[id]; id != 0 && !taken {
-			n.waiters[id] = ch
+			n.waiters[id] = waiter{ch: ch, cancel: cancel}
 			return id, ch
 		}
 	}
@@ -675,20 +712,24 @@ func (n *Node) forget(id uint64) {
 
 func (n *Node) deliver(id uint64, res any) {
 	n.mu.Lock()
-	ch, ok := n.waiters[id]
+	w, ok := n.waiters[id]
 	delete(n.waiters, id)
 	n.mu.Unlock()
 	if ok {
-		ch <- outcome{val: res} // buffered, never blocks
+		w.ch <- outcome{val: res} // buffered, never blocks
 	}
 }
 
-// failPending fails every proposal still waiting on this node.
+// failPending fails every proposal still waiting on this node, including
+// one still blocked in raft.Propose.
 func (n *Node) failPending(err error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	for id, ch := range n.waiters {
-		ch <- outcome{err: err} // buffered, never blocks
+	for id, w := range n.waiters {
+		w.ch <- outcome{err: err} // buffered, never blocks
+		if w.cancel != nil {
+			w.cancel()
+		}
 		delete(n.waiters, id)
 	}
 }
