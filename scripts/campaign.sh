@@ -16,9 +16,11 @@
 # when less than 3 GiB of memory is free before a run. A run that breaks (the
 # cluster does not come up, the load generator dies) is recorded as such and
 # the campaign goes on. results/chaos-<stamp>/summary.md has one row per run
-# (fault, target, failover, audit rules a to e, linearizable
-# PASS/FAIL/TIMEOUT, check time, UNKNOWN orders, elections) and the totals;
-# it is rewritten after every run, so it is complete up to the last finished
+# (fault, target, failover, audit rules a to e, the bookings verdict
+# PASS/FAIL/TIMEOUT, stale browses, check time, UNKNOWN orders, elections)
+# and the totals. A run passes or fails on the bookings verdict (orders,
+# baseline and final read); stale browses are reported only. The summary
+# is rewritten after every run, so it is complete up to the last finished
 # run even if the campaign is stopped.
 #
 # Knobs: RUNS, RATE, COMPOSE_PROJECT. Further arguments go to cmd/chaos

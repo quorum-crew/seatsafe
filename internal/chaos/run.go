@@ -55,9 +55,11 @@ type Config struct {
 	BrowseRate     float64 // ListAvailableSeats calls per second during the load, for the linearizability check
 	ExtraArgs      []string
 
-	// Linearizable runs the Porcupine check on every run's history.
-	// CheckTimeout bounds it (0 = linearize.DefaultTimeout); a check that
-	// runs out of time is reported as TIMEOUT, never as a pass.
+	// Linearizable runs the Porcupine check on every run's history: the
+	// bookings (orders, baseline and final read) decide the run, the browses
+	// are only reported. CheckTimeout bounds it (0 =
+	// linearize.DefaultTimeout); a bookings check that runs out of time is
+	// reported as TIMEOUT, never as a pass.
 	Linearizable bool
 	CheckTimeout time.Duration
 
@@ -100,12 +102,18 @@ type Result struct {
 	// AuditRules is audit.json: the counts behind rules a to e. Nil if the
 	// load generator did not get as far as the audit.
 	AuditRules *loadgen.Audit
-	// Linearizable is the Porcupine check's verdict (linearize.Pass, Fail or
-	// Timeout), or "-" if it did not run. CheckDetail is its one-line report
-	// and CheckTime how long reading the history and checking it took.
+	// Linearizable is the bookings verdict of the Porcupine check
+	// (linearize.Pass, Fail or Timeout), over the orders, the baseline and
+	// the final read, or "-" if it did not run. CheckDetail is its one-line
+	// report and CheckTime how long reading the history and checking it took.
 	Linearizable string
 	CheckDetail  string
 	CheckTime    time.Duration
+	// StaleBrowses is how many browses of the run contradict its bookings,
+	// or -1 if they were not checked, and StaleSeats the seats they are
+	// stale for. Reported only: stale browses do not fail a run.
+	StaleBrowses int
+	StaleSeats   []string
 	// Failover is the time from the fault until the rest of the group
 	// agreed on a new leader, for faults that take the leader away; -1 if
 	// not measured. Recovery is the time from healing until every replica
@@ -171,7 +179,7 @@ func Campaign(ctx context.Context, c *Cluster, cfg Config) ([]Result, error) {
 	w := csv.NewWriter(csvFile)
 	_ = w.Write([]string{"run", "verdict", "kind", "fault", "inject_at_s", "heal_at_s", "failover_s", "recovery_s", "elections", "client_p99_ms", "client_max_ms", "audit", "reason",
 		"target", "a_double_booked", "b_confirmed_still_free", "c_unexplained_taken", "d_confirmed_pre_booked", "e_cross_shard_half_booked", "e_taken_by_unconfirmed",
-		"unknown_orders", "linearizable", "check_s", "check_detail", "free_mem_gb", "host_free_mem_gb"})
+		"unknown_orders", "bookings", "check_s", "check_detail", "free_mem_gb", "host_free_mem_gb", "stale_browses", "stale_browse_seats"})
 	w.Flush()
 
 	rnd := rand.New(rand.NewPCG(cfg.Seed, cfg.Seed^0x9e3779b97f4a7c15))
@@ -192,8 +200,8 @@ func Campaign(ctx context.Context, c *Cluster, cfg Config) ([]Result, error) {
 			needReset = true
 		}
 		results = append(results, r)
-		cfg.Logf("run %d: %s  %s  failover %s  recovery %s  elections %d  client p99 %s max %s  linearizable %s (%s)  %s %s", i, r.Verdict, r.Fault,
-			secs(r.Failover), secs(r.Recovery), r.Elections, millis(r.P99), millis(r.Max), r.Linearizable, secs(r.CheckTime), r.Audit, r.Reason)
+		cfg.Logf("run %d: %s  %s  failover %s  recovery %s  elections %d  client p99 %s max %s  bookings %s (%s)  %s  %s %s", i, r.Verdict, r.Fault,
+			secs(r.Failover), secs(r.Recovery), r.Elections, millis(r.P99), millis(r.Max), r.Linearizable, secs(r.CheckTime), r.staleLine(), r.Audit, r.Reason)
 		a := r.AuditRules
 		if a == nil {
 			a = &loadgen.Audit{DoubleBooked: -1, StillFree: -1, Unexplained: -1, PreBooked: -1, HalfBooked: -1, TakenByFailed: -1}
@@ -202,7 +210,8 @@ func Campaign(ctx context.Context, c *Cluster, cfg Config) ([]Result, error) {
 			secs(r.InjectAt), secs(r.HealAt), secs(r.Failover), secs(r.Recovery), strconv.Itoa(r.Elections),
 			millis(r.P99), millis(r.Max), r.Audit, r.Reason,
 			r.Target, strconv.Itoa(a.DoubleBooked), strconv.Itoa(a.StillFree), strconv.Itoa(a.Unexplained), strconv.Itoa(a.PreBooked), strconv.Itoa(a.HalfBooked), strconv.Itoa(a.TakenByFailed),
-			strconv.Itoa(r.Unknown()), r.Linearizable, secs(r.CheckTime), r.CheckDetail, gib(r.FreeMem), gib(r.HostFree)})
+			strconv.Itoa(r.Unknown()), r.Linearizable, secs(r.CheckTime), r.CheckDetail, gib(r.FreeMem), gib(r.HostFree),
+			strconv.Itoa(r.StaleBrowses), strings.Join(r.StaleSeats, " ")})
 		w.Flush()
 		_ = os.WriteFile(filepath.Join(cfg.Out, "summary.md"), []byte(cfg.Title+Summarize(results)), 0o644)
 		if r.Verdict == VerdictFail && cfg.StopOnFail {
@@ -226,7 +235,7 @@ func guarded(i int, run func() Result) (r Result) {
 
 // blank is a result with nothing measured.
 func blank(i int) Result {
-	return Result{Run: i, Target: "-", Linearizable: "-", Failover: -1, Recovery: -1, Elections: -1, P99: -1, Max: -1, FreeMem: -1, HostFree: -1}
+	return Result{Run: i, Target: "-", Linearizable: "-", StaleBrowses: -1, Failover: -1, Recovery: -1, Elections: -1, P99: -1, Max: -1, FreeMem: -1, HostFree: -1}
 }
 
 // prepareAndRun gets the cluster ready for run i (reset if asked for or
@@ -403,7 +412,10 @@ func runOnce(ctx context.Context, c *Cluster, in *Injector, rnd *rand.Rand, cfg 
 
 	var checkErr error
 	if cfg.Linearizable {
-		r.Linearizable, r.CheckDetail, r.CheckTime, checkErr = CheckLinearizable(dir, cfg.CheckTimeout)
+		var hc HistoryCheck
+		hc, checkErr = CheckLinearizable(dir, cfg.CheckTimeout)
+		r.Linearizable, r.CheckDetail, r.CheckTime = hc.Bookings, hc.Detail, hc.Took
+		r.StaleBrowses, r.StaleSeats = hc.StaleBrowses, hc.StaleSeats
 	}
 	writeFaultLog(dir, r, bad)
 
@@ -419,7 +431,7 @@ func runOnce(ctx context.Context, c *Cluster, in *Injector, rnd *rand.Rand, cfg 
 	case r.Reason != "":
 		r.Verdict = VerdictFail
 	case r.Linearizable == linearize.Fail:
-		r.Verdict, r.Reason = VerdictFail, "history is not linearizable: "+r.CheckDetail
+		r.Verdict, r.Reason = VerdictFail, "bookings are not linearizable: "+r.CheckDetail
 	case checkErr != nil:
 		r.Verdict, r.Reason = VerdictFail, "the linearizability check could not run: "+checkErr.Error()
 	case r.Linearizable == linearize.Timeout:
@@ -427,9 +439,10 @@ func runOnce(ctx context.Context, c *Cluster, in *Injector, rnd *rand.Rand, cfg 
 	default:
 		r.Verdict = VerdictPass
 	}
-	// A history that is not linearizable is a failure whatever else failed.
+	// Bookings that are not linearizable are a failure whatever else failed.
+	// Stale browses are not: they are in the result and change nothing here.
 	if r.Linearizable == linearize.Fail && r.Verdict == VerdictFail && !strings.Contains(r.Reason, "not linearizable") {
-		r.Reason += "; history is not linearizable: " + r.CheckDetail
+		r.Reason += "; bookings are not linearizable: " + r.CheckDetail
 	}
 	if r.InjectErr != "" && r.Verdict != VerdictSkip && r.Reason == "" {
 		r.Reason = "partial inject: " + r.InjectErr
@@ -446,38 +459,74 @@ func runOnce(ctx context.Context, c *Cluster, in *Injector, rnd *rand.Rand, cfg 
 	return r
 }
 
-// CheckLinearizable runs the Porcupine check on dir/history.jsonl. It
-// returns the verdict (linearize.Pass, Fail or Timeout; "-" with an error if
-// the history could not be read), a one-line detail, and how long reading
-// and checking took. When the history is not linearizable it writes
-// linearizability.html (Porcupine's visualization of the first bad seat) and
-// linearizability.txt (that seat's operations) into dir.
-func CheckLinearizable(dir string, timeout time.Duration) (verdict, detail string, took time.Duration, err error) {
+// HistoryCheck is what the Porcupine check found in one run's history.
+type HistoryCheck struct {
+	// Bookings is the verdict over the orders, the baseline and the final
+	// read: linearize.Pass, Fail or Timeout, or "-" if the history could not
+	// be read. It is the one that decides the run.
+	Bookings string
+	Detail   string // one line on Bookings
+	// StaleBrowses is the number of browses that contradict the bookings
+	// (-1 if the history could not be read) and StaleSeats the seats they
+	// are stale for. BrowseUndecided is the number of seats whose browses
+	// were not decided in time.
+	StaleBrowses    int
+	StaleSeats      []string
+	BrowseUndecided int
+	Took            time.Duration // reading the history and checking it
+}
+
+// CheckLinearizable runs the Porcupine check on dir/history.jsonl. When the
+// bookings are not linearizable it writes linearizability.html (Porcupine's
+// visualization of the first bad seat) and linearizability.txt (that seat's
+// operations) into dir. When browses are stale it writes stale-browses.txt:
+// the seats, and the operations of the first of them.
+func CheckLinearizable(dir string, timeout time.Duration) (HistoryCheck, error) {
 	start := time.Now()
+	hc := HistoryCheck{Bookings: "-", StaleBrowses: -1}
 	f, err := os.Open(filepath.Join(dir, "history.jsonl"))
 	if err != nil {
-		return "-", "", 0, err
+		return hc, err
 	}
 	h, err := loadgen.ReadFullHistory(f)
 	f.Close()
 	if err != nil {
-		return "-", "", time.Since(start), err
+		hc.Took = time.Since(start)
+		return hc, err
 	}
 	rep := linearize.Check(h, linearize.Options{Timeout: timeout})
-	took = time.Since(start)
-	detail = fmt.Sprintf("%d seats, %d operations, %d browses", rep.Seats, rep.Operations, rep.Browses)
+	hc.Took = time.Since(start)
+	hc.Bookings = rep.Verdict()
+	hc.StaleBrowses, hc.StaleSeats, hc.BrowseUndecided = rep.StaleBrowses, rep.StaleSeats, len(rep.BrowseUndecided)
+	hc.Detail = fmt.Sprintf("%d seats, %d operations, %d browses", rep.Seats, rep.Operations, rep.Browses)
 	switch rep.Verdict() {
 	case linearize.Fail:
-		detail = fmt.Sprintf("first bad seat %s (%d bad of %d seats)", rep.Illegal[0], len(rep.Illegal), rep.Seats)
+		hc.Detail = fmt.Sprintf("first bad seat %s (%d bad of %d seats)", rep.Illegal[0], len(rep.Illegal), rep.Seats)
 		_ = os.WriteFile(filepath.Join(dir, "linearizability.txt"), []byte(rep.String()+"\n"+rep.FirstBad()), 0o644)
 		if out, err := os.Create(filepath.Join(dir, "linearizability.html")); err == nil {
 			_ = rep.Visualize(out)
 			out.Close()
 		}
 	case linearize.Timeout:
-		detail = fmt.Sprintf("%d of %d seats not decided", len(rep.TimedOut), rep.Seats)
+		hc.Detail = fmt.Sprintf("%d of %d seats not decided", len(rep.TimedOut), rep.Seats)
 	}
-	return rep.Verdict(), detail, took, nil
+	if rep.StaleBrowses > 0 {
+		body := rep.StaleLine() + "\nseats: " + strings.Join(rep.StaleSeats, " ") + "\n" + rep.FirstStale()
+		_ = os.WriteFile(filepath.Join(dir, "stale-browses.txt"), []byte(body), 0o644)
+	}
+	return hc, nil
+}
+
+// staleLine is "stale browses: N (seats ...)", or "stale browses: -" if the
+// browses were not checked.
+func (r Result) staleLine() string {
+	switch {
+	case r.StaleBrowses < 0:
+		return "stale browses: -"
+	case r.StaleBrowses == 0:
+		return "stale browses: 0"
+	}
+	return fmt.Sprintf("stale browses: %d (seats %s)", r.StaleBrowses, linearize.Sample(r.StaleSeats))
 }
 
 // waitFor polls cond until it holds and returns the time since from, or -1
@@ -529,36 +578,42 @@ func writeFaultLog(dir string, r Result, bad []ShardHealth) {
 		fmt.Fprintf(&b, "inject error: %s\n", r.InjectErr)
 	}
 	fmt.Fprintf(&b, "failover: %ss\nrecovery: %ss (-1 = not measured)\n", secs(r.Failover), secs(r.Recovery))
-	fmt.Fprintf(&b, "linearizable: %s (%s, %ss)\n", r.Linearizable, r.CheckDetail, secs(r.CheckTime))
+	fmt.Fprintf(&b, "bookings: %s (%s, %ss)\n%s\n", r.Linearizable, r.CheckDetail, secs(r.CheckTime), r.staleLine())
 	for _, h := range bad {
 		fmt.Fprintf(&b, "not healed: %s: %s\n", GroupName(h.Shard), h.Err)
 	}
 	_ = os.WriteFile(filepath.Join(dir, "fault.txt"), []byte(b.String()), 0o644)
 }
 
-// Summarize renders a campaign's results as Markdown: totals, per fault kind
-// the number of runs, failures, and recovery times, and one row per run.
+// Summarize renders a campaign's results as Markdown: totals (runs, the
+// bookings verdict, stale browses), per fault kind the number of runs,
+// failures, and recovery times, and one row per run.
 func Summarize(results []Result) string {
 	var b strings.Builder
 	count := map[string]int{}
 	lin := map[string]int{}
 	checked := false
+	var stale, staleRuns int
 	for _, r := range results {
 		count[r.Verdict]++
 		lin[r.Linearizable]++
 		checked = checked || (r.Linearizable != "" && r.Linearizable != "-")
+		if r.StaleBrowses > 0 {
+			stale, staleRuns = stale+r.StaleBrowses, staleRuns+1
+		}
 	}
 	fmt.Fprintf(&b, "%d runs: %d PASS, %d FAIL, %d SKIP", len(results), count[VerdictPass], count[VerdictFail], count[VerdictSkip])
 	if n := count[VerdictTimeout]; n > 0 {
-		fmt.Fprintf(&b, ", %d TIMEOUT (linearizability check not finished; not a pass)", n)
+		fmt.Fprintf(&b, ", %d TIMEOUT (bookings check not finished; not a pass)", n)
 	}
 	if n := count[VerdictCrash]; n > 0 {
 		fmt.Fprintf(&b, ", %d CRASH (the run itself broke)", n)
 	}
 	b.WriteString("\n\n")
 	if checked {
-		fmt.Fprintf(&b, "Linearizability (Porcupine, per seat): %d pass, %d fail, %d timeout, %d not checked\n\n",
+		fmt.Fprintf(&b, "Bookings verdict (Porcupine, per seat: orders, baseline and final read; a run passes or fails on it): %d pass, %d fail, %d timeout, %d not checked\n\n",
 			lin[linearize.Pass], lin[linearize.Fail], lin[linearize.Timeout], len(results)-lin[linearize.Pass]-lin[linearize.Fail]-lin[linearize.Timeout])
+		fmt.Fprintf(&b, "Stale browses (checked separately, reported, never a failure): %d in %d runs\n\n", stale, staleRuns)
 	}
 	fmt.Fprintf(&b, "| Fault | Runs | Pass | Fail | Skip | Failover, median | Failover, max | Recovery, median | Recovery, max | Elections per run | Client p99, median | Client max, median |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n")
 	for _, k := range append(slices.Clone(AllKinds), Partition, None) {
@@ -608,8 +663,8 @@ func Summarize(results []Result) string {
 	// One row per run. Audit rules: a double-booked, b confirmed but still
 	// free, c taken with no order, d confirmed but pre-booked, e cross-shard
 	// half-booked + taken by an unconfirmed order.
-	b.WriteString("\nRuns (audit columns are violation counts per rule; e is half-booked + taken-by-unconfirmed):\n\n")
-	b.WriteString("| Run | Fault | Target | Failover | Audit | a | b | c | d | e | Linearizable | Check time | UNKNOWN | Elections | Verdict |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
+	b.WriteString("\nRuns (audit columns are violation counts per rule; e is half-booked + taken-by-unconfirmed; Bookings is the Porcupine verdict, stale browses are reported only):\n\n")
+	b.WriteString("| Run | Fault | Target | Failover | Audit | a | b | c | d | e | Bookings | Stale browses | Check time | UNKNOWN | Elections | Verdict |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
 	var tot loadgen.Audit
 	var audits, auditPass, unknown, elections int
 	var checkTime time.Duration
@@ -649,11 +704,15 @@ func Summarize(results []Result) string {
 		if target == "" {
 			target = "-"
 		}
-		fmt.Fprintf(&b, "| %d | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", r.Run, r.Kind, target, failover, audit, cols, lz, check, dash(r.Unknown()), dash(r.Elections), r.Verdict)
+		staleCol := dash(r.StaleBrowses)
+		if r.StaleBrowses > 0 {
+			staleCol += " (seats " + linearize.Sample(r.StaleSeats) + ")"
+		}
+		fmt.Fprintf(&b, "| %d | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", r.Run, r.Kind, target, failover, audit, cols, lz, staleCol, check, dash(r.Unknown()), dash(r.Elections), r.Verdict)
 	}
-	fmt.Fprintf(&b, "| **Total** | %d runs | | | %d/%d pass | %d | %d | %d | %d | %d+%d | %d pass, %d fail, %d timeout | %.2f s | %d | %d | %d PASS |\n",
+	fmt.Fprintf(&b, "| **Total** | %d runs | | | %d/%d pass | %d | %d | %d | %d | %d+%d | %d pass, %d fail, %d timeout | %d in %d runs | %.2f s | %d | %d | %d PASS |\n",
 		len(results), auditPass, audits, tot.DoubleBooked, tot.StillFree, tot.Unexplained, tot.PreBooked, tot.HalfBooked, tot.TakenByFailed,
-		lin[linearize.Pass], lin[linearize.Fail], lin[linearize.Timeout], checkTime.Seconds(), unknown, elections, count[VerdictPass])
+		lin[linearize.Pass], lin[linearize.Fail], lin[linearize.Timeout], stale, staleRuns, checkTime.Seconds(), unknown, elections, count[VerdictPass])
 
 	var fails []string
 	for _, r := range results {

@@ -7,10 +7,12 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/anishathalye/porcupine"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
@@ -104,10 +106,6 @@ func TestRejects(t *testing.T) {
 			new(hb).list(baseline, -20, -10, "e/s1", "a").
 				order("o1", 10, 20, unavailable, one(seatA), seatA).
 				order("x1", 30, 40, aborted, []string{seatA, seatX}), seatA},
-		"stale browse: seat listed free after a CONFIRMED that returned before the browse started": {
-			new(hb).order("o1", 10, 20, confirmed, one(seatA)).list(browse, 30, 40, "e/s1", "a", "b"), seatA},
-		"stale browse: seat listed taken, then free again with nothing releasing it": {
-			new(hb).order("o1", 10, 20, confirmed, one(seatA)).list(browse, 30, 40, "e/s1", "b").list(browse, 50, 60, "e/s1", "a", "b"), seatA},
 		"CONFIRMED seat still free in the final read": {
 			new(hb).order("o1", 10, 20, confirmed, one(seatA)).list(final, 30, 40, "e/s1", "a"), seatA},
 		"CONFIRMED for a seat the baseline says was taken": {
@@ -226,8 +224,12 @@ func TestAccepts(t *testing.T) {
 			list(final, 70, 80, "e/s1", "b"),
 	} {
 		t.Run(name, func(t *testing.T) {
-			if r := h.check(t); r.Verdict() != Pass {
+			r := h.check(t)
+			if r.Verdict() != Pass {
 				t.Fatalf("%s\n%s", r, r.FirstBad())
+			}
+			if r.StaleBrowses != 0 || len(r.StaleSeats) != 0 || len(r.BrowseUndecided) != 0 || !r.BrowsesChecked {
+				t.Fatalf("%s\n%s", r.StaleLine(), r.FirstStale())
 			}
 		})
 	}
@@ -359,16 +361,96 @@ func TestTimeoutIsNotAPass(t *testing.T) {
 	}
 }
 
+// A stale browse is reported and does not change the bookings verdict; a
+// double booking in the same history still fails it.
+func TestStaleBrowses(t *testing.T) {
+	for name, c := range map[string]struct {
+		h     *hb
+		stale int
+		seats []string
+	}{
+		"seat listed free after a CONFIRMED that returned before the browse started": {
+			new(hb).list(baseline, -20, -10, "e/s1", "a", "b").
+				order("o1", 10, 20, confirmed, one(seatA)).
+				list(browse, 30, 40, "e/s1", "a", "b").
+				list(final, 50, 60, "e/s1", "b"), 1, []string{seatA}},
+		"seat listed taken, then free again with nothing releasing it": {
+			new(hb).order("o1", 10, 20, confirmed, one(seatA)).
+				list(browse, 30, 40, "e/s1", "b").
+				list(browse, 50, 60, "e/s1", "a", "b").
+				list(browse, 70, 80, "e/s1", "b"), 1, []string{seatA}},
+		"one browse stale for two seats is one stale browse": {
+			new(hb).order("o1", 10, 20, confirmed, []string{seatA, seatB}).
+				list(browse, 30, 40, "e/s1", "a", "b"), 1, []string{seatA, seatB}},
+		"two stale browses of one seat": {
+			new(hb).order("o1", 10, 20, confirmed, one(seatA)).
+				list(browse, 30, 40, "e/s1", "a").
+				list(browse, 50, 60, "e/s1", "a"), 2, []string{seatA}},
+		"seat no order names, listed taken by one browse only": {
+			new(hb).list(baseline, -20, -10, "e/s1", "a", "b").
+				order("o1", 10, 20, confirmed, one(seatA)).
+				list(browse, 30, 40, "e/s1").
+				list(final, 50, 60, "e/s1", "b"), 1, []string{seatB}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := c.h.check(t)
+			if r.Verdict() != Pass || len(r.Illegal) != 0 {
+				t.Fatalf("bookings verdict %s, want PASS\n%s\n%s", r.Verdict(), r, r.FirstBad())
+			}
+			if r.StaleBrowses != c.stale || !reflect.DeepEqual(r.StaleSeats, c.seats) {
+				t.Fatalf("%s, want %d stale (seats %v)", r.StaleLine(), c.stale, c.seats)
+			}
+			want := "stale browses: " + strconv.Itoa(c.stale) + " (seats " + strings.Join(c.seats, ", ") + ")"
+			if !strings.HasPrefix(r.StaleLine(), want) {
+				t.Fatalf("%q, want it to start with %q", r.StaleLine(), want)
+			}
+			if d := r.FirstStale(); !strings.Contains(d, "seat "+c.seats[0]+" has") || strings.Count(d, "<- stale") == 0 {
+				t.Fatalf("FirstStale: %q", d)
+			}
+			if err := r.Visualize(new(bytes.Buffer)); err == nil {
+				t.Fatal("a visualization of a seat whose bookings are linearizable")
+			}
+		})
+	}
+
+	// A double booking next to a stale browse: the bookings verdict fails,
+	// and the stale browse of the other seat is still reported.
+	b := new(hb).order("o1", 10, 20, confirmed, one(seatA)).order("o2", 30, 40, confirmed, one(seatA)).
+		order("o3", 10, 20, confirmed, one(seatB)).
+		list(browse, 50, 60, "e/s1", "b")
+	r := b.check(t)
+	if r.Verdict() != Fail || !reflect.DeepEqual(r.Illegal, []string{seatA}) {
+		t.Fatalf("%s", r)
+	}
+	if r.StaleBrowses != 1 || !reflect.DeepEqual(r.StaleSeats, []string{seatB}) {
+		t.Fatalf("%s", r.StaleLine())
+	}
+}
+
+// A browse check that runs out of time is reported as such; it is neither
+// counted as stale nor allowed to change the bookings verdict.
+func TestBrowseTimeout(t *testing.T) {
+	c := &seatCheck{seat: seatA, browses: []browseRead{{0, porcupine.Operation{Input: input{kind: opRead}, Output: output{free: true}, Call: 1, Return: 2}}}}
+	c.checkBrowses(Model(nil), time.Now().Add(-time.Second))
+	if !c.undecided || len(c.stale) != 0 {
+		t.Fatalf("%+v", c)
+	}
+}
+
 func TestNoBrowsesOption(t *testing.T) {
 	b := new(hb).list(baseline, -20, -10, "e/s1", "a").
 		order("o1", 10, 20, confirmed, one(seatA)).
 		list(browse, 30, 40, "e/s1", "a"). // stale
 		list(final, 50, 60, "e/s1")
-	if r := b.check(t); r.Verdict() != Fail || r.Browses != 1 {
-		t.Fatalf("%s", r)
+	if r := b.check(t); r.Verdict() != Pass || r.Browses != 1 || r.StaleBrowses != 1 || r.Listings != 3 {
+		t.Fatalf("%s; %s", r, r.StaleLine())
 	}
-	if r := Check(&b.h, Options{NoBrowses: true}); r.Verdict() != Pass || r.Browses != 0 || r.Listings != 2 {
-		t.Fatalf("%s", r)
+	r := Check(&b.h, Options{NoBrowses: true})
+	if r.Verdict() != Pass || r.Browses != 0 || r.Listings != 2 || r.StaleBrowses != 0 || r.BrowsesChecked {
+		t.Fatalf("%s; %s", r, r.StaleLine())
+	}
+	if r.StaleLine() != "stale browses: not checked" || r.FirstStale() != "" {
+		t.Fatalf("%q", r.StaleLine())
 	}
 }
 
@@ -441,6 +523,10 @@ func TestRealHistory(t *testing.T) {
 	t.Log(r)
 	if r.Verdict() != Pass {
 		t.Fatalf("%s\n%s", r, r.FirstBad())
+	}
+	t.Log(r.StaleLine())
+	if r.StaleBrowses != 0 || len(r.BrowseUndecided) != 0 {
+		t.Fatalf("%s\n%s", r.StaleLine(), r.FirstStale())
 	}
 	if r.Orders != 1000 || r.Cross < 100 || r.Browses < 20 || r.Listings < 60+r.Browses || r.Seats < 250 {
 		t.Fatalf("the run did not exercise the check: %s", r)

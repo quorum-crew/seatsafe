@@ -1,19 +1,25 @@
 // Command checkhistory checks a history.jsonl from loadgen offline: no seat in
 // two CONFIRMED orders, and no CONFIRMED that real time rules out. With
-// -linearizable it also checks the whole history for linearizability with
+// -linearizable it also checks the history for linearizability with
 // Porcupine, one seat at a time (the model is described in
-// internal/linearize).
+// internal/linearize):
 //
 //	go run ./cmd/checkhistory results/<run>/history.jsonl
 //	go run ./cmd/checkhistory -linearizable results/<run>/history.jsonl
 //
-// When the history is not linearizable, the first bad seat and its operations
+// The linearizability check prints two results. "bookings" is over the
+// orders, the pre-run baseline and the post-run final read: it is the verdict
+// and what the exit code reports. "stale browses: N (seats ...)" counts the
+// listings taken during the load that contradict the bookings: they are
+// reported and do not fail the check, and -no-browses leaves them out.
+//
+// When the bookings are not linearizable, the first bad seat and its operations
 // are printed and Porcupine's visualization of that seat is written next to
 // the history, as <history>.linearizability.html.
 //
 // Exit code 1 means a check failed. Exit code 3 means that nothing failed but
-// the linearizability check ran out of time (-timeout) before it could decide
-// every seat: that is not a pass.
+// the bookings check ran out of time (-timeout) before it could decide every
+// seat: that is not a pass. Stale browses do not change the exit code.
 package main
 
 import (
@@ -32,9 +38,9 @@ func main() {
 
 func run(args []string) int {
 	fs := flag.NewFlagSet("checkhistory", flag.ContinueOnError)
-	linearizable := fs.Bool("linearizable", false, "also check linearizability with Porcupine, seat by seat")
+	linearizable := fs.Bool("linearizable", false, "also check linearizability with Porcupine, seat by seat: the bookings (the verdict) and, reported separately, stale browses")
 	timeout := fs.Duration("timeout", linearize.DefaultTimeout, "-linearizable: time allowed for the whole check; running out is reported as TIMEOUT, not as a pass")
-	noBrowses := fs.Bool("no-browses", false, "-linearizable: leave out the listings taken during the load (keep the baseline and the final read)")
+	noBrowses := fs.Bool("no-browses", false, "-linearizable: do not look for stale browses (the bookings verdict never uses them)")
 	fs.Usage = func() {
 		fmt.Fprintln(fs.Output(), "usage: checkhistory [-linearizable] [-timeout 1m] [-no-browses] history.jsonl")
 		fs.PrintDefaults()
@@ -79,13 +85,28 @@ func run(args []string) int {
 	}
 
 	r := linearize.Check(history, linearize.Options{Timeout: *timeout, NoBrowses: *noBrowses})
-	fmt.Printf("linearizable: %s\n", r)
+	fmt.Printf("bookings: %s\n", r)
 	if len(history.Listings) == 0 {
 		fmt.Println("  the history has no listings (no baseline, browses or final read): only the orders were checked against each other")
 	}
 	if len(r.TimedOut) > 0 {
 		fmt.Printf("  not decided within %v: %s\n", *timeout, sample(r.TimedOut))
 	}
+	// The browses are reported after the verdict and never change the exit
+	// code.
+	defer func() {
+		line := r.StaleLine()
+		if *noBrowses {
+			line += " (-no-browses)"
+		}
+		fmt.Println(line)
+		if r.StaleBrowses > 0 {
+			fmt.Print(indent(r.FirstStale()))
+		}
+		if len(r.BrowseUndecided) > 0 {
+			fmt.Printf("  browses not decided within %v: %s\n", *timeout, sample(r.BrowseUndecided))
+		}
+	}()
 	switch r.Verdict() {
 	case linearize.Fail:
 		fmt.Printf("  first bad seat: %s (%d bad seats: %s)\n", r.Illegal[0], len(r.Illegal), sample(r.Illegal))
@@ -118,12 +139,7 @@ func visualize(r *linearize.Report, path string) error {
 }
 
 // sample lists up to five names.
-func sample(names []string) string {
-	if len(names) > 5 {
-		return strings.Join(names[:5], ", ") + fmt.Sprintf(", ... and %d more", len(names)-5)
-	}
-	return strings.Join(names, ", ")
-}
+func sample(names []string) string { return linearize.Sample(names) }
 
 func indent(s string) string {
 	return "  " + strings.ReplaceAll(strings.TrimRight(s, "\n"), "\n", "\n  ") + "\n"

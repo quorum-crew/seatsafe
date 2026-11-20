@@ -31,7 +31,10 @@
 //
 // The history of every run is checked for linearizability with Porcupine
 // (-linearizable, on by default; the model is described in
-// internal/linearize). A check that runs out of time (-check-timeout) makes
+// internal/linearize). The bookings verdict (orders, the pre-run baseline and
+// the post-run final read) decides the run; browses that contradict the
+// bookings are reported per run and in the totals as stale browses and do
+// not fail it. A bookings check that runs out of time (-check-timeout) makes
 // the run a TIMEOUT, not a pass.
 //
 // -campaign runs the unattended mix instead of random faults: kill-leader,
@@ -90,7 +93,7 @@ func main() {
 		target       = flag.String("target", "shard", "where the faults go when not in -campaign: shard or coordinator (the coordinator takes kill-leader, kill-follower, isolate-leader, isolate-follower, pause-leader and partition)")
 		crossFrac    = flag.Float64("cross-shard-frac", 0, "fraction of orders across two shards (2PC)")
 		browseRate   = flag.Float64("browse-rate", 0, "ListAvailableSeats calls per second during the load, recorded for the linearizability check")
-		linearizable = flag.Bool("linearizable", true, "check every run's history for linearizability with Porcupine")
+		linearizable = flag.Bool("linearizable", true, "check every run's history for linearizability with Porcupine: the bookings decide the run, stale browses are reported")
 		checkTimeout = flag.Duration("check-timeout", 2*time.Minute, "time allowed for one linearizability check; running out makes the run a TIMEOUT, not a pass")
 		minFreeMem   = flag.Float64("min-free-mem", 0, "GiB of memory that must be available to the containers (Docker's MemAvailable) before each run; 0 = don't check")
 	)

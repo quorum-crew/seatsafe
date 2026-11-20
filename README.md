@@ -51,7 +51,7 @@ injects one fault into each run, picked at random:
 
 A run passes only if the load generator's correctness audit passes (no seat
 double-booked, every confirmed seat taken, nothing taken without an order),
-the run's history is linearizable (below), and every shard and the
+the run's bookings are linearizable (below), and every shard and the
 coordinator heal after the load: one leader that every replica agrees on, and
 all three replicas at the same applied index.
 
@@ -86,14 +86,24 @@ Abort arrived. The history also records what `ListAvailableSeats` returned
 before the run, after it, and during it (`loadgen -browse-rate`), and each
 listing is a read of every seat it covers.
 
+The check gives two results:
+
+- **Bookings**: the orders, the pre-run baseline and the post-run final read
+  (both taken while the cluster is quiet). This is the verdict: a run, and
+  `checkhistory`'s exit code, pass or fail on it.
+- **Stale browses**: the listings taken during the load are checked
+  separately, against the bookings. A browse that contradicts them is
+  reported as `stale browses: N (seats ...)` and does not fail anything.
+  `-no-browses` skips this.
+
 ```bash
 go run ./cmd/checkhistory -linearizable results/<run>/history.jsonl
 ```
 
-On a failure it prints the first bad seat with its operations and writes
-Porcupine's visualization of that seat next to the history. The check is
-bounded by `-timeout`; a check that runs out of time is reported as
-`TIMEOUT` (exit code 3), never as a pass. Histories written before listings
+When the bookings fail it prints the first bad seat with its operations and
+writes Porcupine's visualization of that seat next to the history. The check
+is bounded by `-timeout`; a bookings check that runs out of time is reported
+as `TIMEOUT` (exit code 3), never as a pass. Histories written before listings
 were recorded are still checked, more weakly (orders against each other).
 
 ### Unattended campaign
@@ -110,9 +120,9 @@ cluster is wiped every 5 runs, after a run that did not finish, and when less
 than 3 GiB of memory is free before a run. A run that breaks (the cluster
 does not come up, the load generator dies) is recorded as `CRASH` or `FAIL`
 and the campaign carries on. `summary.md` is rewritten after every run with
-one row per run (fault, target, failover, the audit's rules a to e,
-linearizable PASS/FAIL/TIMEOUT, check time, UNKNOWN orders, elections) and
-the totals.
+one row per run (fault, target, failover, the audit's rules a to e, the
+bookings verdict PASS/FAIL/TIMEOUT, stale browses, check time, UNKNOWN
+orders, elections) and the totals of each.
 
 ## Run tests
 

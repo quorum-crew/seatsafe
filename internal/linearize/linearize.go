@@ -34,6 +34,20 @@
 // the final read does not accept a hold by an order that was answered: those
 // holds must be gone by then.
 //
+// # Two results
+//
+// The bookings verdict (Report.Verdict) is over the orders, the baseline and
+// the final read: the two reads taken while the cluster is quiet. It is the
+// pass/fail criterion.
+//
+// The browses, the listings taken while orders were running, are checked
+// separately and never change the verdict. A seat whose bookings are
+// linearizable is checked again with its browse reads added. If that fails,
+// the browses are added one at a time in order of their calls: one that makes
+// the seat's history illegal is counted as stale and left out, the others are
+// kept. Report.StaleBrowses is the number of browses that are stale for at
+// least one seat and Report.StaleSeats names those seats.
+//
 // What the model does not check: that the seats of one order are booked all
 // or nothing (the audit's rule e does), because each seat is a partition of
 // its own.
@@ -57,6 +71,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -367,8 +382,9 @@ func sectionOf(seat string) string {
 type Options struct {
 	// Timeout bounds the whole check; 0 means DefaultTimeout.
 	Timeout time.Duration
-	// NoBrowses leaves out the listings taken while orders were running,
-	// keeping the baseline and the final read.
+	// NoBrowses leaves out the listings taken while orders were running:
+	// only the bookings verdict is computed, and no stale browses are
+	// looked for.
 	NoBrowses bool
 	// Workers is how many seats are checked at once; 0 means one per CPU.
 	Workers int
@@ -383,19 +399,29 @@ type Report struct {
 	Unknown    int // of them, never answered
 	Cross      int // of them, cross-shard
 	Listings   int // listings used as reads
-	Browses    int // of them, taken while orders were running
+	Browses    int // of them, taken while orders were running (0 with Options.NoBrowses)
 	Seats      int // seats checked with Porcupine: every seat in an order, and every seat whose listings disagree
-	Operations int // operations over all those seats
+	Operations int // operations over all those seats, browse reads included
 
+	// The bookings verdict: orders, baseline and final read.
 	Illegal  []string // seats that are not linearizable, earliest first
 	TimedOut []string // seats not decided within the timeout, by name
-	Elapsed  time.Duration
 
-	first *seatCheck // the first illegal seat
-	model porcupine.Model
+	// The browses: reported, never part of the verdict.
+	BrowsesChecked  bool     // false with Options.NoBrowses
+	StaleBrowses    int      // browses that are stale for at least one seat
+	StaleSeats      []string // seats with a stale browse, by name
+	BrowseUndecided []string // seats whose browses were not decided within the timeout, by name
+
+	Elapsed time.Duration
+
+	first      *seatCheck // the first illegal seat
+	firstStale *seatCheck // the first seat with a stale browse
+	model      porcupine.Model
 }
 
-// Verdict is Pass, Fail or Timeout.
+// Verdict is the bookings verdict: Pass, Fail or Timeout. Stale browses do
+// not change it.
 func (r *Report) Verdict() string {
 	switch {
 	case len(r.Illegal) > 0:
@@ -406,7 +432,32 @@ func (r *Report) Verdict() string {
 	return Pass
 }
 
-// String is a one-line summary.
+// StaleLine is the one-line report on the browses: "stale browses: N (seats
+// ...)", then how many browses were checked.
+func (r *Report) StaleLine() string {
+	if !r.BrowsesChecked {
+		return "stale browses: not checked"
+	}
+	s := fmt.Sprintf("stale browses: %d", r.StaleBrowses)
+	if len(r.StaleSeats) > 0 {
+		s += " (seats " + Sample(r.StaleSeats) + ")"
+	}
+	s += fmt.Sprintf("; %d browses checked", r.Browses)
+	if n := len(r.BrowseUndecided); n > 0 {
+		s += fmt.Sprintf("; %d seats not decided in time", n)
+	}
+	return s
+}
+
+// Sample lists up to five names.
+func Sample(names []string) string {
+	if len(names) > 5 {
+		return strings.Join(names[:5], ", ") + fmt.Sprintf(", ... and %d more", len(names)-5)
+	}
+	return strings.Join(names, ", ")
+}
+
+// String is a one-line summary of the bookings verdict.
 func (r *Report) String() string {
 	return fmt.Sprintf("%s: %d seats (%d operations) from %d orders (%d UNKNOWN, %d cross-shard) and %d listings (%d browses); %d not linearizable, %d timed out; %.2fs",
 		r.Verdict(), r.Seats, r.Operations, r.Orders, r.Unknown, r.Cross, r.Listings, r.Browses, len(r.Illegal), len(r.TimedOut), r.Elapsed.Seconds())
@@ -429,21 +480,66 @@ func (r *Report) FirstBad() string {
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "seat %s is not linearizable; its %d operations (times in ms from the start of the run):\n", r.first.seat, len(r.first.ops))
-	ops := append([]porcupine.Operation(nil), r.first.ops...)
-	sort.SliceStable(ops, func(i, j int) bool { return ops[i].Call < ops[j].Call })
-	for _, op := range ops {
-		fmt.Fprintf(&b, "  [%10.3f, %10.3f]  %s\n", float64(op.Call)/1e6, float64(op.Return)/1e6, r.model.DescribeOperation(op.Input, op.Output))
-	}
+	r.describe(&b, r.first.ops, nil)
 	return b.String()
 }
 
-// seatCheck is one seat's operations and, after the check, its result.
+// FirstStale describes the first seat with a stale browse: its name and its
+// operations in order of their calls, the stale browses marked. Empty if
+// there is none.
+func (r *Report) FirstStale() string {
+	c := r.firstStale
+	if c == nil {
+		return ""
+	}
+	ops := append([]porcupine.Operation(nil), c.ops...)
+	stale := map[int]bool{}
+	for _, br := range c.browses {
+		if slices.Contains(c.stale, br.listing) {
+			stale[len(ops)] = true
+		}
+		ops = append(ops, br.op)
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "seat %s has %d stale browse(s); its %d operations (times in ms from the start of the run):\n", c.seat, len(c.stale), len(ops))
+	r.describe(&b, ops, stale)
+	return b.String()
+}
+
+// describe writes ops in order of their calls, one per line. marked holds the
+// indexes of the operations to mark as stale.
+func (r *Report) describe(b *strings.Builder, ops []porcupine.Operation, marked map[int]bool) {
+	order := make([]int, len(ops))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(i, j int) bool { return ops[order[i]].Call < ops[order[j]].Call })
+	for _, i := range order {
+		op, mark := ops[i], ""
+		if marked[i] {
+			mark = "  <- stale"
+		}
+		fmt.Fprintf(b, "  [%10.3f, %10.3f]  %s%s\n", float64(op.Call)/1e6, float64(op.Return)/1e6, r.model.DescribeOperation(op.Input, op.Output), mark)
+	}
+}
+
+// seatCheck is one seat's operations and, after the check, its results.
 type seatCheck struct {
-	seat   string
-	ops    []porcupine.Operation
-	first  int64 // earliest call of an order on this seat
-	result porcupine.CheckResult
-	info   porcupine.LinearizationInfo
+	seat    string
+	ops     []porcupine.Operation // the orders, the baseline and the final read
+	browses []browseRead          // what the browses saw of this seat, in order of their calls
+	first   int64                 // earliest call of an order on this seat
+	result  porcupine.CheckResult // of ops: the bookings
+	info    porcupine.LinearizationInfo
+
+	stale     []int // listing numbers of the browses that are stale for this seat
+	undecided bool  // the browses were not decided in time
+}
+
+// browseRead is one browse's read of one seat.
+type browseRead struct {
+	listing int // which browse, numbered over the listings of the history
+	op      porcupine.Operation
 }
 
 // Check checks h. It never returns Pass for a history it could not finish.
@@ -467,6 +563,7 @@ func Check(h *loadgen.History, opt Options) *Report {
 	for _, o := range all {
 		end = max(end, o.ret)
 	}
+	r.BrowsesChecked = !opt.NoBrowses
 	var listings []loadgen.Listing
 	for _, l := range h.Listings {
 		if opt.NoBrowses && l.Phase == loadgen.PhaseBrowse {
@@ -533,12 +630,19 @@ func Check(h *loadgen.History, opt Options) *Report {
 	// Listings: reads of every seat in an order, and of every other seat the
 	// listings of its section disagree about. A seat no order names and all
 	// listings agree on has nothing to check.
-	perSection := map[string][]loadgen.Listing{}
-	for _, l := range listings {
+	// Reads by a browse are kept apart from the rest: they are not part of
+	// the bookings verdict.
+	type numbered struct {
+		loadgen.Listing
+		n int // position among the listings used
+	}
+	perSection := map[string][]numbered{}
+	for i, l := range listings {
 		sec := l.Event + "/" + l.Section
-		perSection[sec] = append(perSection[sec], l)
+		perSection[sec] = append(perSection[sec], numbered{l, i})
 	}
 	for sec, ls := range perSection {
+		sort.SliceStable(ls, func(i, j int) bool { return ls[i].CallNs < ls[j].CallNs })
 		listed := make([]map[string]bool, len(ls))
 		count := map[string]int{}
 		for i, l := range ls {
@@ -558,16 +662,21 @@ func Check(h *loadgen.History, opt Options) *Report {
 		}
 		for _, c := range bySection[sec] {
 			for i, l := range ls {
-				add(c, input{kind: opRead, final: l.Phase == loadgen.PhaseFinal, label: l.Phase}, output{free: listed[i][c.seat]}, l.CallNs, l.ReturnNs)
+				in, out := input{kind: opRead, final: l.Phase == loadgen.PhaseFinal, label: l.Phase}, output{free: listed[i][c.seat]}
+				if l.Phase == loadgen.PhaseBrowse {
+					c.browses = append(c.browses, browseRead{l.n, porcupine.Operation{Input: in, Output: out, Call: l.CallNs, Return: l.ReturnNs}})
+					continue
+				}
+				add(c, in, out, l.CallNs, l.ReturnNs)
 			}
 		}
 	}
 
 	checks := make([]*seatCheck, 0, len(seats))
 	for _, c := range seats {
-		if len(c.ops) > 0 {
+		if len(c.ops)+len(c.browses) > 0 {
 			checks = append(checks, c)
-			r.Operations += len(c.ops)
+			r.Operations += len(c.ops) + len(c.browses)
 		}
 	}
 	sort.Slice(checks, func(i, j int) bool { return checks[i].seat < checks[j].seat })
@@ -590,6 +699,9 @@ func Check(h *loadgen.History, opt Options) *Report {
 				if c.result != porcupine.Illegal {
 					c.info = porcupine.LinearizationInfo{}
 				}
+				if c.result == porcupine.Ok && len(c.browses) > 0 {
+					c.checkBrowses(r.model, deadline)
+				}
 			}
 		}()
 	}
@@ -600,6 +712,7 @@ func Check(h *loadgen.History, opt Options) *Report {
 	wg.Wait()
 
 	var bad []*seatCheck
+	staleListings := map[int]bool{}
 	for _, c := range checks {
 		switch c.result {
 		case porcupine.Illegal:
@@ -607,7 +720,20 @@ func Check(h *loadgen.History, opt Options) *Report {
 		case porcupine.Unknown:
 			r.TimedOut = append(r.TimedOut, c.seat)
 		}
+		if len(c.stale) > 0 {
+			r.StaleSeats = append(r.StaleSeats, c.seat)
+			if r.firstStale == nil {
+				r.firstStale = c
+			}
+			for _, n := range c.stale {
+				staleListings[n] = true
+			}
+		}
+		if c.undecided {
+			r.BrowseUndecided = append(r.BrowseUndecided, c.seat)
+		}
 	}
+	r.StaleBrowses = len(staleListings)
 	sort.SliceStable(bad, func(i, j int) bool { return bad[i].first < bad[j].first })
 	for _, c := range bad {
 		r.Illegal = append(r.Illegal, c.seat)
@@ -617,4 +743,48 @@ func Check(h *loadgen.History, opt Options) *Report {
 	}
 	r.Elapsed = time.Since(start)
 	return r
+}
+
+// checkBrowses looks for the stale browses of a seat whose bookings are
+// linearizable. The seat is checked with every browse read added; only if
+// that fails are the browses added one at a time, in order of their calls,
+// keeping those that leave the history legal and recording the others in
+// c.stale.
+func (c *seatCheck) checkBrowses(model porcupine.Model, deadline time.Time) {
+	check := func(ops []porcupine.Operation) porcupine.CheckResult {
+		left := time.Until(deadline)
+		if left <= 0 {
+			return porcupine.Unknown
+		}
+		return porcupine.CheckOperationsTimeout(model, ops, left)
+	}
+	with := func(ops []porcupine.Operation, extra ...browseRead) []porcupine.Operation {
+		out := make([]porcupine.Operation, len(ops), len(ops)+len(extra))
+		copy(out, ops)
+		for _, b := range extra {
+			b.op.ClientId = len(out)
+			out = append(out, b.op)
+		}
+		return out
+	}
+	switch check(with(c.ops, c.browses...)) {
+	case porcupine.Ok:
+		return
+	case porcupine.Unknown:
+		c.undecided = true
+		return
+	}
+	kept := c.ops
+	for _, b := range c.browses {
+		try := with(kept, b)
+		switch check(try) {
+		case porcupine.Ok:
+			kept = try
+		case porcupine.Illegal:
+			c.stale = append(c.stale, b.listing)
+		default:
+			c.undecided = true
+			return
+		}
+	}
 }

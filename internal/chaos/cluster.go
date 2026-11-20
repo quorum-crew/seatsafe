@@ -1,7 +1,8 @@
 // Package chaos injects faults into the Docker Compose cluster while the load
 // generator runs, and checks after every run that no seat was double-booked
-// (the load generator's audit), that the run's history is linearizable
-// (internal/linearize, a Porcupine model of one seat) and that every Raft
+// (the load generator's audit), that the run's bookings are linearizable
+// (internal/linearize, a Porcupine model of one seat; stale browses are
+// reported separately and do not fail a run) and that every Raft
 // group healed: a leader, all three replicas back, and all of them at the
 // same applied index.
 //

@@ -141,6 +141,13 @@ const (
 {"client_id":2,"request_id":"o2","seats":["e/s/a"],"call_ns":30,"return_ns":40,"outcome":"SEAT_UNAVAILABLE","replayed":false,"code":"OK","cross":false,"unavailable_seats":["e/s/a"]}
 {"kind":"list","phase":"final","event":"e","section":"s","free":[],"call_ns":50,"return_ns":60}
 `
+	// goodHistory with a browse that lists seat a as free after it was
+	// confirmed.
+	staleHistory = `{"kind":"list","phase":"baseline","event":"e","section":"s","free":["a"],"call_ns":-20,"return_ns":-10}
+{"client_id":1,"request_id":"o1","seats":["e/s/a"],"call_ns":10,"return_ns":20,"outcome":"CONFIRMED","replayed":false,"code":"OK","cross":false}
+{"kind":"list","phase":"browse","event":"e","section":"s","free":["a"],"call_ns":30,"return_ns":40}
+{"kind":"list","phase":"final","event":"e","section":"s","free":[],"call_ns":50,"return_ns":60}
+`
 	// The same seat confirmed twice.
 	badHistory = `{"client_id":1,"request_id":"o1","seats":["e/s/a"],"call_ns":10,"return_ns":20,"outcome":"CONFIRMED","replayed":false,"code":"OK","cross":false}
 {"client_id":2,"request_id":"o2","seats":["e/s/a"],"call_ns":30,"return_ns":40,"outcome":"CONFIRMED","replayed":false,"code":"OK","cross":false}
@@ -182,6 +189,8 @@ func TestCampaignSurvivesCrashes(t *testing.T) {
 		case 6:
 			writeRun(t, dir, auditPass, goodHistory)
 			panicNext = true
+		case 8: // a stale browse: reported, and the run still passes
+			writeRun(t, dir, auditPass, staleHistory)
 		default:
 			writeRun(t, dir, auditPass, goodHistory)
 		}
@@ -237,6 +246,18 @@ func TestCampaignSurvivesCrashes(t *testing.T) {
 	if !strings.Contains(r(5).Reason, "cluster reset failed 3 times") || !strings.Contains(r(5).Reason, "no space left") {
 		t.Fatalf("run 5: %+v", r(5))
 	}
+	if r(8).Verdict != VerdictPass || r(8).Linearizable != linearize.Pass || r(8).StaleBrowses != 1 || !slices.Equal(r(8).StaleSeats, []string{"e/s/a"}) || r(8).Reason != "" {
+		t.Fatalf("run 8: %+v", r(8))
+	}
+	if b, err := os.ReadFile(filepath.Join(out, "run-0008", "stale-browses.txt")); err != nil || !strings.Contains(string(b), "stale browses: 1 (seats e/s/a)") {
+		t.Fatalf("stale-browses.txt: %v\n%s", err, b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(out, "run-0008", "fault.txt")); !strings.Contains(string(b), "bookings: PASS") || !strings.Contains(string(b), "stale browses: 1 (seats e/s/a)") {
+		t.Fatalf("fault.txt:\n%s", b)
+	}
+	if r(1).StaleBrowses != 0 || r(2).StaleBrowses != -1 {
+		t.Fatalf("stale browses of runs 1 and 2: %d %d", r(1).StaleBrowses, r(2).StaleBrowses)
+	}
 	if r(7).Reason != "panic: boom" {
 		t.Fatalf("run 7: %+v", r(7))
 	}
@@ -259,13 +280,16 @@ func TestCampaignSurvivesCrashes(t *testing.T) {
 	}
 	for _, want := range []string{
 		"# test\n\n9 runs: 4 PASS, 3 FAIL, 0 SKIP, 2 CRASH (the run itself broke)",
-		"Linearizability (Porcupine, per seat): 5 pass, 1 fail, 0 timeout, 3 not checked",
+		"a run passes or fails on it): 5 pass, 1 fail, 0 timeout, 3 not checked",
+		"Stale browses (checked separately, reported, never a failure): 1 in 1 runs",
+		"| 8 | none | - | - | PASS | 0 | 0 | 0 | 0 | 0+0 | PASS | 1 (seats e/s/a) |",
+		"| Bookings | Stale browses |",
 		"| 2 | pause-leader | shard ",
-		"| - | - | - | - | - | - | - | - | - | - | 0 | FAIL |",
-		"| 4 | none | - | - | FAIL | 1 | 0 | 0 | 0 | 1+2 | PASS |",
-		"| 6 | pause-leader | coordinator | - | PASS | 0 | 0 | 0 | 0 | 0+0 | PASS |",
+		"| - | - | - | - | - | - | - | - | - | - | - | 0 | FAIL |",
+		"| 4 | none | - | - | FAIL | 1 | 0 | 0 | 0 | 1+2 | PASS | 0 |",
+		"| 6 | pause-leader | coordinator | - | PASS | 0 | 0 | 0 | 0 | 0+0 | PASS | 0 |",
 		"| - | - | CRASH |",
-		"| **Total** | 9 runs | | | 5/6 pass | 1 | 0 | 0 | 0 | 1+2 | 5 pass, 1 fail, 0 timeout |",
+		"| **Total** | 9 runs | | | 5/6 pass | 1 | 0 | 0 | 0 | 1+2 | 5 pass, 1 fail, 0 timeout | 1 in 1 runs |",
 		"- run 3: partition shard ",
 		"- run 5: not started: cluster reset failed 3 times",
 		"- run 7: not started: panic: boom",
@@ -287,15 +311,15 @@ func TestCampaignSurvivesCrashes(t *testing.T) {
 func TestCheckTimeoutIsNotAPass(t *testing.T) {
 	dir := t.TempDir()
 	writeRun(t, dir, auditPass, goodHistory)
-	verdict, detail, _, err := CheckLinearizable(dir, time.Nanosecond)
-	if err != nil || verdict != linearize.Timeout || detail != "1 of 1 seats not decided" {
-		t.Fatalf("%s %q %v", verdict, detail, err)
+	hc, err := CheckLinearizable(dir, time.Nanosecond)
+	if err != nil || hc.Bookings != linearize.Timeout || hc.Detail != "1 of 1 seats not decided" {
+		t.Fatalf("%+v %v", hc, err)
 	}
-	if verdict, _, _, err := CheckLinearizable(dir, time.Minute); err != nil || verdict != linearize.Pass {
-		t.Fatalf("%s %v", verdict, err)
+	if hc, err := CheckLinearizable(dir, time.Minute); err != nil || hc.Bookings != linearize.Pass || hc.StaleBrowses != 0 {
+		t.Fatalf("%+v %v", hc, err)
 	}
-	if verdict, _, _, err := CheckLinearizable(t.TempDir(), time.Minute); err == nil || verdict != "-" {
-		t.Fatalf("missing history: %s %v", verdict, err)
+	if hc, err := CheckLinearizable(t.TempDir(), time.Minute); err == nil || hc.Bookings != "-" || hc.StaleBrowses != -1 {
+		t.Fatalf("missing history: %+v %v", hc, err)
 	}
 
 	d := &campaignDocker{fakeDocker: &fakeDocker{leader: 2}}
@@ -312,7 +336,7 @@ func TestCheckTimeoutIsNotAPass(t *testing.T) {
 		t.Fatalf("%+v %v", results, err)
 	}
 	s := Summarize(results)
-	for _, want := range []string{"1 runs: 0 PASS, 0 FAIL, 0 SKIP, 1 TIMEOUT (linearizability check not finished; not a pass)", "0 pass, 0 fail, 1 timeout, 0 not checked", "| none | 1 | 0 | 0 | 0 |", "| TIMEOUT |"} {
+	for _, want := range []string{"1 runs: 0 PASS, 0 FAIL, 0 SKIP, 1 TIMEOUT (bookings check not finished; not a pass)", "0 pass, 0 fail, 1 timeout, 0 not checked", "| none | 1 | 0 | 0 | 0 |", "| TIMEOUT |"} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("summary missing %q:\n%s", want, s)
 		}
