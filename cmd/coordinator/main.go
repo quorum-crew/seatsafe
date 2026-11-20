@@ -17,8 +17,9 @@
 //	HOLD_TTL_MS      hold_ttl_ms sent with every Prepare (default 5000)
 //	GC_RETENTION_MS  how long a finished txn is kept, so a retried order
 //	                 still finds its answer (default 120000, 2 min)
-//	RAFT_TICK_MS, RAFT_ELECTION_TICKS, RAFT_HEARTBEAT_TICKS
-//	           Raft timing (defaults 100 ms, 10 ticks, 1 tick)
+//	RAFT_TICK_MS           Raft tick interval in milliseconds (default 25)
+//	RAFT_ELECTION_TICKS    ticks without a leader before an election (default 10)
+//	RAFT_HEARTBEAT_TICKS   ticks between leader heartbeats (default 1)
 package main
 
 import (
@@ -202,6 +203,17 @@ func parsePeers(nodeID, peers string) (self uint64, ids []uint64, addrs map[uint
 	return self, ids, addrs, nil
 }
 
+// The coordinator group uses the storage nodes' Raft timing (cmd/storage,
+// #41): 25 ms ticks, heartbeats every tick, an election timeout of 10 ticks
+// (randomized over 250-500 ms). A cross-shard order waits on this group as
+// well as on its shards, so a slower coordinator failover would be the
+// slowest part of recovering from a crash.
+const (
+	defaultTickMS         = 25
+	defaultElectionTicks  = 10
+	defaultHeartbeatTicks = 1
+)
+
 type config struct {
 	tick                time.Duration
 	election, heartbeat int
@@ -226,9 +238,9 @@ func configFromEnv() (config, error) {
 		}
 		return n
 	}
-	c.tick = ms("RAFT_TICK_MS", 100)
-	c.election = ticks("RAFT_ELECTION_TICKS", 10)
-	c.heartbeat = ticks("RAFT_HEARTBEAT_TICKS", 1)
+	c.tick = ms("RAFT_TICK_MS", defaultTickMS)
+	c.election = ticks("RAFT_ELECTION_TICKS", defaultElectionTicks)
+	c.heartbeat = ticks("RAFT_HEARTBEAT_TICKS", defaultHeartbeatTicks)
 	c.holdTTL = ms("HOLD_TTL_MS", int(coordinator.DefaultHoldTTL/time.Millisecond))
 	c.retention = ms("GC_RETENTION_MS", int(coordinator.DefaultGCRetention/time.Millisecond))
 	if err != nil {

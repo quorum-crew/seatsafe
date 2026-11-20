@@ -27,14 +27,14 @@ func TestConfigFromEnv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.tick != 100*time.Millisecond || c.election != 10 || c.heartbeat != 1 || c.holdTTL != 5*time.Second || c.retention != 2*time.Minute {
+	if c.tick != 25*time.Millisecond || c.election != 10 || c.heartbeat != 1 || c.holdTTL != 5*time.Second || c.retention != 2*time.Minute {
 		t.Fatalf("defaults: %+v", c)
 	}
 
 	t.Setenv("HOLD_TTL_MS", "1500")
 	t.Setenv("GC_RETENTION_MS", "60000")
-	t.Setenv("RAFT_TICK_MS", "25")
-	if c, err = configFromEnv(); err != nil || c.holdTTL != 1500*time.Millisecond || c.retention != time.Minute || c.tick != 25*time.Millisecond {
+	t.Setenv("RAFT_TICK_MS", "50")
+	if c, err = configFromEnv(); err != nil || c.holdTTL != 1500*time.Millisecond || c.retention != time.Minute || c.tick != 50*time.Millisecond {
 		t.Fatalf("from env: %+v, %v", c, err)
 	}
 
