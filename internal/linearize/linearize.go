@@ -116,48 +116,115 @@ type output struct{ free bool }
 
 // step returns every state the seat can be in after op, or none if op is
 // illegal in state s.
-func step(s state, in input, out output) []state {
-	same := []state{s}
+func step(s state, in input, out output) []state { return appendStep(nil, s, in, out) }
+
+// appendStep appends to dst every state the seat can be in after op in state
+// s; it appends nothing if op is illegal there.
+func appendStep(dst []state, s state, in input, out output) []state {
 	switch in.kind {
 	case opBook:
 		if s.kind == free {
-			return []state{{booked, in.order}}
+			return append(dst, state{booked, in.order})
 		}
-		return nil
+		return dst
 	case opTaken:
 		if s.kind == free {
-			return nil
+			return dst
 		}
-		return same
 	case opHold:
 		if s.kind == free {
-			return []state{s, {held, in.order}}
+			return append(dst, s, state{held, in.order})
 		}
-		return same
 	case opRelease:
 		if (s.kind == held || s.kind == heldUnknown) && s.order == in.order {
-			return []state{{free, 0}}
+			return append(dst, state{free, 0})
 		}
-		return same
 	case opUnknown:
-		if s.kind != free {
-			return same
+		if s.kind == free {
+			dst = append(dst, s, state{booked, in.order})
+			if in.cross {
+				dst = append(dst, state{heldUnknown, in.order})
+			}
+			return dst
 		}
-		next := []state{s, {booked, in.order}}
-		if in.cross {
-			next = append(next, state{heldUnknown, in.order})
-		}
-		return next
 	case opRead:
 		switch {
 		case out.free != (s.kind == free):
-			return nil
+			return dst
 		case in.final && s.kind == held:
-			return nil // an answered order's hold must be gone by the final read
+			return dst // an answered order's hold must be gone by the final read
 		}
-		return same
+	default:
+		return dst
 	}
-	return nil
+	return append(dst, s)
+}
+
+// states is what Porcupine sees as the model's state: the set of states the
+// seat may be in, given the operations linearized so far. The model of one
+// seat is nondeterministic (an UNKNOWN order may or may not have booked, a
+// failed cross-shard order may or may not have held), and tracking the set
+// makes it deterministic. Each member is stateSize bytes (kind, then order
+// big-endian); members are sorted and distinct, so equal sets are equal
+// strings.
+type states string
+
+const stateSize = 5
+
+func (ss states) len() int { return len(ss) / stateSize }
+
+func (ss states) at(i int) state {
+	b := ss[i*stateSize : (i+1)*stateSize]
+	return state{stateKind(b[0]), int32(uint32(b[1])<<24 | uint32(b[2])<<16 | uint32(b[3])<<8 | uint32(b[4]))}
+}
+
+func less(a, b state) bool {
+	if a.kind != b.kind {
+		return a.kind < b.kind
+	}
+	return uint32(a.order) < uint32(b.order)
+}
+
+// encode sorts set in place, drops duplicates and returns it as states.
+func encode(set []state) states {
+	for i := 1; i < len(set); i++ {
+		for j := i; j > 0 && less(set[j], set[j-1]); j-- {
+			set[j], set[j-1] = set[j-1], set[j]
+		}
+	}
+	b := make([]byte, 0, len(set)*stateSize)
+	for i, x := range set {
+		if i > 0 && x == set[i-1] {
+			continue
+		}
+		o := uint32(x.order)
+		b = append(b, byte(x.kind), byte(o>>24), byte(o>>16), byte(o>>8), byte(o))
+	}
+	return states(b)
+}
+
+// stepSet applies op to every state in ss. ok is false if op is illegal in
+// all of them. same says that the set did not change, which is the common
+// case (reads, refusals) and lets the caller keep the value it has.
+func stepSet(ss states, in input, out output) (next states, ok, same bool) {
+	var buf [16]state
+	set := buf[:0]
+	same = true
+	for i := range ss.len() {
+		s := ss.at(i)
+		before := len(set)
+		set = appendStep(set, s, in, out)
+		if len(set) != before+1 || set[before] != s {
+			same = false
+		}
+	}
+	switch {
+	case len(set) == 0:
+		return "", false, false
+	case same:
+		return ss, true, true
+	}
+	return encode(set), true, false
 }
 
 // Model returns the Porcupine model of one seat. requests maps order indexes
@@ -172,18 +239,16 @@ func Model(requests []string) porcupine.Model {
 		}
 		return fmt.Sprintf("order %d", i)
 	}
-	nm := porcupine.NondeterministicModel{
-		Init: func() []any { return []any{state{free, 0}, state{booked, -1}} },
-		Step: func(s, in, out any) []any {
-			next := step(s.(state), in.(input), out.(output))
-			res := make([]any, len(next))
-			for i, n := range next {
-				res[i] = n
+	return porcupine.Model{
+		Init: func() any { return encode([]state{{free, 0}, {booked, -1}}) },
+		Step: func(s, in, out any) (bool, any) {
+			next, ok, same := stepSet(s.(states), in.(input), out.(output))
+			if same {
+				return true, s // no new value to allocate
 			}
-			return res
+			return ok, next
 		},
-		Equal: func(a, b any) bool { return a.(state) == b.(state) },
-		Hash:  func(s any) uint64 { x := s.(state); return uint64(x.kind)<<32 | uint64(uint32(x.order)) },
+		Equal: func(a, b any) bool { return a.(states) == b.(states) },
 		DescribeOperation: func(in, out any) string {
 			i, o := in.(input), out.(output)
 			switch i.kind {
@@ -204,16 +269,21 @@ func Model(requests []string) porcupine.Model {
 			return i.label + " listing -> not free"
 		},
 		DescribeState: func(s any) string {
-			switch x := s.(state); x.kind {
-			case booked:
-				return "booked by " + name(x.order)
-			case held, heldUnknown:
-				return "held by " + name(x.order)
+			ss := s.(states)
+			parts := make([]string, ss.len())
+			for i := range parts {
+				switch x := ss.at(i); x.kind {
+				case booked:
+					parts[i] = "booked by " + name(x.order)
+				case held, heldUnknown:
+					parts[i] = "held by " + name(x.order)
+				default:
+					parts[i] = "free"
+				}
 			}
-			return "free"
+			return strings.Join(parts, " or ")
 		},
 	}
-	return nm.ToModel()
 }
 
 func short(id string) string {

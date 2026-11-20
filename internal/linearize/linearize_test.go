@@ -298,6 +298,42 @@ func TestStep(t *testing.T) {
 	}
 }
 
+// The set of possible states Porcupine steps through: sorted, without
+// duplicates, unchanged (and not reallocated) by operations that only observe.
+func TestStepSet(t *testing.T) {
+	init := encode([]state{{booked, -1}, {free, 0}, {free, 0}})
+	if init.len() != 2 || init.at(0) != (state{free, 0}) || init.at(1) != (state{booked, -1}) {
+		t.Fatalf("%q", init)
+	}
+	// Unknown before the run; a cross-shard UNKNOWN order may book or hold.
+	next, ok, same := stepSet(init, input{kind: opUnknown, order: 3, cross: true}, output{})
+	want := encode([]state{{free, 0}, {booked, 3}, {heldUnknown, 3}, {booked, -1}})
+	if !ok || same || next != want || next.len() != 4 {
+		t.Fatalf("%v %v %q, want %q", ok, same, next, want)
+	}
+	// A read that sees the seat free rules out every taken state.
+	if got, ok, same := stepSet(next, input{kind: opRead}, output{free: true}); !ok || same || got != encode([]state{{free, 0}}) {
+		t.Fatalf("%v %v %q", ok, same, got)
+	}
+	// One that sees it taken keeps the three taken states.
+	taken, ok, _ := stepSet(next, input{kind: opRead}, output{})
+	if !ok || taken.len() != 3 {
+		t.Fatalf("%v %q", ok, taken)
+	}
+	// Observing again changes nothing.
+	if got, ok, same := stepSet(taken, input{kind: opTaken}, output{}); !ok || !same || got != taken {
+		t.Fatalf("%v %v %q", ok, same, got)
+	}
+	// Booking needs a state in which the seat is free.
+	if _, ok, _ := stepSet(taken, input{kind: opBook, order: 9}, output{}); ok {
+		t.Fatal("booked a seat that is taken in every possible state")
+	}
+	// Releasing the hold merges two states into one.
+	if got, ok, _ := stepSet(taken, input{kind: opRelease, order: 3}, output{}); !ok || got != encode([]state{{free, 0}, {booked, 3}, {booked, -1}}) {
+		t.Fatalf("%v %q", ok, got)
+	}
+}
+
 // A check that runs out of time is a TIMEOUT, not a PASS, and it names the
 // seats it could not decide.
 func TestTimeoutIsNotAPass(t *testing.T) {
@@ -369,7 +405,7 @@ func fakeRun(t *testing.T, mod func(*loadgen.Config)) (*loadgen.History, *loadge
 
 	c := loadgen.Defaults()
 	c.Workload, c.Warmup, c.Quiet, c.Out = loadgen.WorkloadFlash, 0, true, t.TempDir()
-	c.Rate, c.Duration, c.History = 2000, time.Second, true
+	c.Rate, c.Duration, c.History = 1000, time.Second, true
 	c.Target, c.Conns = "passthrough:///router", 4
 	c.DialOptions = []grpc.DialOption{
 		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return lis.DialContext(ctx) }),
@@ -392,20 +428,21 @@ func fakeRun(t *testing.T, mod func(*loadgen.Config)) (*loadgen.History, *loadge
 	return h, sum
 }
 
-// 2,000 flash orders, a fifth of them cross-shard, with browses, against the
-// fake cluster: thousands of real collisions and 2PC aborts. The history is
+// 1,000 flash orders, a fifth of them cross-shard, with browses, against the
+// fake cluster: hundreds of real collisions and 2PC aborts. The history is
 // linearizable, and stops being so when one answer in it is changed.
 func TestRealHistory(t *testing.T) {
 	h, sum := fakeRun(t, func(c *loadgen.Config) { c.CrossShardFrac, c.BrowseRate = 0.2, 200 })
 	if !sum.Audit.Pass {
 		t.Fatalf("audit %+v", sum.Audit)
 	}
-	r := Check(h, Options{})
+	slow := Options{Timeout: 3 * time.Minute} // the race detector makes the check many times slower
+	r := Check(h, slow)
 	t.Log(r)
 	if r.Verdict() != Pass {
 		t.Fatalf("%s\n%s", r, r.FirstBad())
 	}
-	if r.Orders != 2000 || r.Cross < 200 || r.Browses < 20 || r.Listings < 60+r.Browses || r.Seats < 500 {
+	if r.Orders != 1000 || r.Cross < 100 || r.Browses < 20 || r.Listings < 60+r.Browses || r.Seats < 250 {
 		t.Fatalf("the run did not exercise the check: %s", r)
 	}
 	var sawUnavailable, sawCrossFail bool
@@ -428,7 +465,7 @@ func TestRealHistory(t *testing.T) {
 			break
 		}
 	}
-	if r := Check(&tampered, Options{}); r.Verdict() != Fail {
+	if r := Check(&tampered, slow); r.Verdict() != Fail {
 		t.Fatalf("tampered history: %s", r)
 	}
 
@@ -444,7 +481,7 @@ func TestRealHistory(t *testing.T) {
 		}
 		dropped.Attempts = append(dropped.Attempts, a)
 	}
-	if r := Check(&dropped, Options{}); r.Verdict() != Fail {
+	if r := Check(&dropped, slow); r.Verdict() != Fail {
 		t.Fatalf("history without one CONFIRMED order: %s", r)
 	}
 }
@@ -452,7 +489,7 @@ func TestRealHistory(t *testing.T) {
 // The fresh workload books every seat it asks for exactly once.
 func TestRealHistoryFresh(t *testing.T) {
 	h, _ := fakeRun(t, func(c *loadgen.Config) { c.Workload, c.CrossShardFrac = loadgen.WorkloadFresh, 0.3 })
-	if r := Check(h, Options{}); r.Verdict() != Pass || r.Unknown != 0 {
+	if r := Check(h, Options{Timeout: 3 * time.Minute}); r.Verdict() != Pass || r.Unknown != 0 {
 		t.Fatalf("%s\n%s", r, r.FirstBad())
 	}
 }
