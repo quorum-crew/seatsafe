@@ -103,6 +103,10 @@ const (
 	// VerdictCrash: the run itself broke (the cluster would not start, the
 	// campaign code panicked). It says nothing about the system under test.
 	VerdictCrash = "CRASH"
+	// VerdictIdempotency: one request_id was answered in two different ways
+	// (two completed attempts with different outcomes or different
+	// unavailable seats), and nothing else failed. A failure.
+	VerdictIdempotency = loadgen.VerdictIdempotency
 )
 
 // Result is the outcome of one run.
@@ -148,8 +152,11 @@ type Result struct {
 	P99, Max time.Duration
 	FreeMem  int64  // bytes available to the containers when the run started; -1 if not checked
 	HostFree int64  // bytes available on the host then; -1 if not checked or unknown
-	Verdict  string // VerdictPass, VerdictFail, VerdictSkip, VerdictTimeout or VerdictCrash
-	Reason   string
+	Verdict  string // VerdictPass, VerdictFail, VerdictSkip, VerdictTimeout, VerdictIdempotency or VerdictCrash
+	// Idempotency describes a request that was answered in two different
+	// ways; empty if there is none.
+	Idempotency string
+	Reason      string
 }
 
 // Unknown is the number of orders that ended UNKNOWN, or -1 if there was no
@@ -241,7 +248,7 @@ func Campaign(ctx context.Context, c *Cluster, cfg Config) ([]Result, error) {
 			strconv.Itoa(r.StaleBrowses), strings.Join(r.StaleSeats, " ")})
 		w.Flush()
 		_ = os.WriteFile(filepath.Join(cfg.Out, "summary.md"), []byte(cfg.Title+Summarize(results)), 0o644)
-		if r.Verdict == VerdictFail && cfg.StopOnFail {
+		if (r.Verdict == VerdictFail || r.Verdict == VerdictIdempotency) && cfg.StopOnFail {
 			cfg.Logf("stopping after a failure; the cluster is left as it is for inspection")
 			break
 		}
@@ -443,11 +450,12 @@ func runOnce(ctx context.Context, c *Cluster, in *Injector, rnd *rand.Rand, cfg 
 		hc, checkErr = CheckLinearizable(dir, cfg.CheckTimeout)
 		r.Linearizable, r.CheckDetail, r.CheckTime = hc.Bookings, hc.Detail, hc.Took
 		r.StaleBrowses, r.StaleSeats = hc.StaleBrowses, hc.StaleSeats
+		r.Idempotency = hc.Idempotency
 	}
 	writeFaultLog(dir, r, bad)
 
 	r.decide(ld.err, herr, bad, checkErr)
-	if r.Verdict == VerdictFail {
+	if r.Verdict == VerdictFail || r.Verdict == VerdictIdempotency {
 		// Keep the evidence: the next run may reset the cluster, which
 		// deletes the containers and their logs.
 		lctx, cancel := context.WithTimeout(context.Background(), time.Minute)
@@ -492,6 +500,17 @@ func (r *Result) decide(loadErr, healErr error, bad []ShardHealth, checkErr erro
 	if r.Linearizable == linearize.Fail && r.Verdict == VerdictFail && !strings.Contains(r.Reason, "not linearizable") {
 		r.Reason += "; bookings are not linearizable: " + r.CheckDetail
 	}
+	// One request answered in two ways is a failure of its own kind. With
+	// another failure it is added to the reason; otherwise it decides the
+	// run, whatever the fault did.
+	if r.Idempotency != "" {
+		why := "one request, two different answers: " + r.Idempotency
+		if r.Verdict == VerdictFail {
+			r.Reason += "; " + why
+		} else {
+			r.Verdict, r.Reason = VerdictIdempotency, why
+		}
+	}
 	// A fault that was not (fully) injected is noted on any other verdict.
 	if r.InjectErr != "" && r.Verdict != VerdictSkip {
 		note := "partial inject: "
@@ -519,7 +538,10 @@ type HistoryCheck struct {
 	StaleBrowses    int
 	StaleSeats      []string
 	BrowseUndecided int
-	Took            time.Duration // reading the history and checking it
+	// Idempotency describes the requests that were answered in two
+	// different ways; empty if there are none.
+	Idempotency string
+	Took        time.Duration // reading the history and checking it
 }
 
 // CheckLinearizable runs the Porcupine check on dir/history.jsonl. When the
@@ -539,6 +561,17 @@ func CheckLinearizable(dir string, timeout time.Duration) (HistoryCheck, error) 
 	if err != nil {
 		hc.Took = time.Since(start)
 		return hc, err
+	}
+	if cs := loadgen.IdempotencyConflicts(h.Attempts); len(cs) > 0 {
+		hc.Idempotency = fmt.Sprintf("request %s %s", cs[0].Request, cs[0].Detail)
+		if len(cs) > 1 {
+			hc.Idempotency += fmt.Sprintf(" (and %d more requests)", len(cs)-1)
+		}
+		var b strings.Builder
+		for _, c := range cs {
+			fmt.Fprintf(&b, "request %s %s\n", c.Request, c.Detail)
+		}
+		_ = os.WriteFile(filepath.Join(dir, "idempotency.txt"), []byte(b.String()), 0o644)
 	}
 	rep := linearize.Check(h, linearize.Options{Timeout: timeout})
 	hc.Took = time.Since(start)
@@ -652,6 +685,9 @@ func Summarize(results []Result) string {
 	if n := count[VerdictTimeout]; n > 0 {
 		fmt.Fprintf(&b, ", %d TIMEOUT (bookings check not finished; not a pass)", n)
 	}
+	if n := count[VerdictIdempotency]; n > 0 {
+		fmt.Fprintf(&b, ", %d IDEMPOTENCY (one request answered in two different ways; a failure)", n)
+	}
 	if n := count[VerdictCrash]; n > 0 {
 		fmt.Fprintf(&b, ", %d CRASH (the run itself broke)", n)
 	}
@@ -686,7 +722,7 @@ func Summarize(results []Result) string {
 				if r.P99 >= 0 {
 					p99, mx = append(p99, r.P99.Seconds()), append(mx, r.Max.Seconds())
 				}
-			case VerdictFail:
+			case VerdictFail, VerdictIdempotency:
 				fail++
 			case VerdictSkip:
 				skip++

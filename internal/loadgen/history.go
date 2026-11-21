@@ -192,6 +192,8 @@ type Violation struct {
 type Check struct {
 	Name string
 	Run  func([]Attempt) []Violation
+	// Verdict is what a history with violations is called; "" means FAIL.
+	Verdict string
 }
 
 // Checks are what cmd/checkhistory runs, in order.
@@ -199,8 +201,9 @@ type Check struct {
 // The linearizability check (a Porcupine model of one seat) is in
 // internal/linearize; cmd/checkhistory -linearizable runs it.
 var Checks = []Check{
-	{"no-double-booking", CheckNoDoubleBooking},
-	{"real-time-order", CheckRealTime},
+	{Name: "no-double-booking", Run: CheckNoDoubleBooking},
+	{Name: "real-time-order", Run: CheckRealTime},
+	{Name: "idempotency", Run: CheckIdempotency, Verdict: VerdictIdempotency},
 }
 
 // confirmed is one order confirmed for one seat.

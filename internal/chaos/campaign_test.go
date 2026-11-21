@@ -442,3 +442,65 @@ func TestCampaignWaitsForHolds(t *testing.T) {
 		t.Fatalf("%d compose ups, want 2 (before run 1, after the failed run 3)", d.ups)
 	}
 }
+
+// One request answered in two different ways makes the run IDEMPOTENCY,
+// naming the request, when nothing else failed; with another failure it is
+// added to that failure's reason. Identical replayed answers pass.
+func TestIdempotencyVerdict(t *testing.T) {
+	// Seat a was booked before the run. Either answer alone is linearizable.
+	const twoAnswers = `{"kind":"list","phase":"baseline","event":"e","section":"s","free":[],"call_ns":-20,"return_ns":-10}
+{"client_id":1,"request_id":"o1","seats":["e/s/a"],"call_ns":10,"return_ns":20,"outcome":"SEAT_UNAVAILABLE","replayed":false,"code":"OK","cross":false,"unavailable_seats":["e/s/a"]}
+{"client_id":1,"request_id":"o1","seats":["e/s/a"],"call_ns":30,"return_ns":40,"outcome":"ABORTED","replayed":false,"code":"OK","cross":false}
+{"kind":"list","phase":"final","event":"e","section":"s","free":[],"call_ns":50,"return_ns":60}
+`
+	const replayed = `{"kind":"list","phase":"baseline","event":"e","section":"s","free":["a"],"call_ns":-20,"return_ns":-10}
+{"client_id":1,"request_id":"o1","seats":["e/s/a"],"call_ns":10,"return_ns":20,"outcome":"CONFIRMED","replayed":false,"code":"OK","cross":false}
+{"client_id":1,"request_id":"o1","seats":["e/s/a"],"call_ns":25,"return_ns":28,"outcome":"","replayed":false,"code":"DeadlineExceeded","cross":false}
+{"client_id":1,"request_id":"o1","seats":["e/s/a"],"call_ns":30,"return_ns":40,"outcome":"CONFIRMED","replayed":true,"code":"OK","cross":false}
+{"kind":"list","phase":"final","event":"e","section":"s","free":[],"call_ns":50,"return_ns":60}
+`
+	d := &campaignDocker{fakeDocker: &fakeDocker{leader: 2}}
+	d.load = func(run int, dir string) (string, error) {
+		switch run {
+		case 1:
+			writeRun(t, dir, auditPass, twoAnswers)
+		case 2:
+			writeRun(t, dir, auditPass, replayed)
+		case 3:
+			writeRun(t, dir, auditFail, twoAnswers)
+			return "  audit FAIL: 3 orders\n", nil
+		}
+		return consolePass, nil
+	}
+	out := t.TempDir()
+	results, err := Campaign(context.Background(), &Cluster{Docker: d, Project: "seatsafe"}, Config{
+		Runs: 3, Kinds: []Kind{None}, HealTimeout: time.Second, Duration: time.Second, Linearizable: true,
+		Out: out, Logf: func(string, ...any) {},
+	})
+	if err != nil || len(results) != 3 {
+		t.Fatalf("%d results, %v", len(results), err)
+	}
+	const why = "one request, two different answers: request o1 answered SEAT_UNAVAILABLE (e/s/a) at 0.000 ms, then ABORTED at 0.000 ms"
+	if r := results[0]; r.Verdict != VerdictIdempotency || r.Reason != why || r.Linearizable != linearize.Pass {
+		t.Fatalf("run 1: %s %q (bookings %s)", r.Verdict, r.Reason, r.Linearizable)
+	}
+	if b, err := os.ReadFile(filepath.Join(out, "run-0001", "idempotency.txt")); err != nil || !strings.HasPrefix(string(b), "request o1 answered SEAT_UNAVAILABLE") {
+		t.Fatalf("idempotency.txt: %v %q", err, b)
+	}
+	if r := results[1]; r.Verdict != VerdictPass || r.Idempotency != "" {
+		t.Fatalf("run 2 (identical replayed answer): %s %q", r.Verdict, r.Reason)
+	}
+	if r := results[2]; r.Verdict != VerdictFail || r.Reason != "correctness audit failed; "+why {
+		t.Fatalf("run 3: %s %q", r.Verdict, r.Reason)
+	}
+	// The cluster is reset after the IDEMPOTENCY run, like after any failure.
+	if d.ups != 2 {
+		t.Fatalf("%d compose ups, want 2 (before run 1 and after run 1)", d.ups)
+	}
+	s := Summarize(results)
+	for _, want := range []string{"3 runs: 1 PASS, 1 FAIL, 0 SKIP, 1 IDEMPOTENCY (one request answered in two different ways; a failure)", "| IDEMPOTENCY |", "- run 1: ", ": " + why} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("summary missing %q:\n%s", want, s)
+		}
+	}
+}

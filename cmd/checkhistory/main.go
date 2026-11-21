@@ -70,6 +70,9 @@ func run(args []string) int {
 		verdict := "PASS"
 		if len(v) > 0 {
 			verdict, code = "FAIL", 1
+			if c.Verdict != "" {
+				verdict = c.Verdict
+			}
 		}
 		fmt.Printf("%s: %s, %d violations, %d attempts\n", c.Name, verdict, len(v), len(history.Attempts))
 		for i, x := range v {

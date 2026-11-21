@@ -122,3 +122,24 @@ func TestRun(t *testing.T) {
 		}
 	}
 }
+
+// One request answered in two ways: the idempotency check names it and the
+// exit code is 1. The same answer replayed passes.
+func TestIdempotency(t *testing.T) {
+	const first = `{"client_id":1,"request_id":"o1","seats":["e/s/a"],"call_ns":10,"return_ns":20,"outcome":"CONFIRMED","replayed":false,"code":"OK"}` + "\n"
+	write := func(second string) string {
+		p := filepath.Join(t.TempDir(), "history.jsonl")
+		if err := os.WriteFile(p, []byte(first+second+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	code, out := capture(t, []string{"-linearizable", write(`{"client_id":1,"request_id":"o1","seats":["e/s/a"],"call_ns":30,"return_ns":40,"outcome":"SEAT_UNAVAILABLE","replayed":false,"code":"OK","unavailable_seats":["e/s/a"]}`)})
+	if code != 1 || !strings.Contains(out, "idempotency: IDEMPOTENCY, 1 violations") || !strings.Contains(out, "request o1: answered CONFIRMED at 0.000 ms, then SEAT_UNAVAILABLE (e/s/a) at 0.000 ms") {
+		t.Fatalf("exit %d\n%s", code, out)
+	}
+	code, out = capture(t, []string{"-linearizable", write(`{"client_id":1,"request_id":"o1","seats":["e/s/a"],"call_ns":30,"return_ns":40,"outcome":"CONFIRMED","replayed":true,"code":"OK"}`)})
+	if code != 0 || !strings.Contains(out, "idempotency: PASS, 0 violations") {
+		t.Fatalf("exit %d\n%s", code, out)
+	}
+}
