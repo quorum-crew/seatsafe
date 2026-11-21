@@ -1,7 +1,7 @@
 # SeatSafe on AWS
 
 Terraform for the AWS cluster: one EC2 instance per SeatSafe process, in three
-availability zones of us-west-2, plus `push-image.sh` to put the image on every
+availability zones of us-east-1, plus `push-image.sh` to put the image on every
 host. The result is `deploy/aws/inventory.yaml`, which the bench and chaos
 drivers read.
 
@@ -26,7 +26,7 @@ cluster.
 
 ## Cost
 
-About $2 an hour with everything running (us-west-2 on-demand; c6id.large is
+About $2 an hour with everything running (us-east-1 on-demand; c6id.large is
 about $0.10/h). Nothing here costs much when it is destroyed, so destroy it
 between sessions:
 
@@ -41,7 +41,7 @@ Cross-zone traffic is billed per GB as well, which is small at our rates.
 1. **vCPU quota.** The cluster needs 42 vCPUs of standard instances. New
    accounts often have a lower limit. In the console, Service Quotas → Amazon
    EC2 → "Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances",
-   region us-west-2: request 64. It can take a few hours to a day.
+   region us-east-1 (quotas are per region): request 48. Ours is already 48 there.
 2. **Credentials.** `aws configure` (or `AWS_PROFILE`) with an IAM user that
    can manage EC2, VPC, key pairs and budgets. Don't use the root user.
 3. **Keys.** Each of us makes a key, e.g.
@@ -78,9 +78,9 @@ ssh_user: ec2-user
 ssh_key: ~/.ssh/seatsafe
 image: seatsafe:latest
 hosts:
-  - {name: coord-1, role: coordinator, node: 1, az: us-west-2a, public_ip: ..., private_ip: ...}
-  - {name: shard1-node1, role: storage, shard: 1, node: 1, az: us-west-2a, public_ip: ..., private_ip: ...}
-  - {name: router-1, role: router, node: 1, az: us-west-2a, public_ip: ..., private_ip: ...}
+  - {name: coord-1, role: coordinator, node: 1, az: us-east-1a, public_ip: ..., private_ip: ...}
+  - {name: shard1-node1, role: storage, shard: 1, node: 1, az: us-east-1a, public_ip: ..., private_ip: ...}
+  - {name: router-1, role: router, node: 1, az: us-east-1a, public_ip: ..., private_ip: ...}
 ```
 
 Generated on every apply, and git-ignored. SeatSafe processes reach each other

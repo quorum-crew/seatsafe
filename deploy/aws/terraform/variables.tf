@@ -1,7 +1,7 @@
 variable "region" {
-  description = "AWS region. us-west-2 (Oregon) is the closest to Phoenix and offers c6id in at least three zones."
+  description = "AWS region. us-east-1 (N. Virginia) is where our vCPU quota was raised to 48; quotas are per region. Zones are picked among those that offer the storage type."
   type        = string
-  default     = "us-west-2"
+  default     = "us-east-1"
 }
 
 variable "admin_cidrs" {
