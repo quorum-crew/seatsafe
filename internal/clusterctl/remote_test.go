@@ -32,7 +32,7 @@ func newRemote(t *testing.T, f *Fake) *Remote {
 	c := newCtl(t, f)
 	UseLayout(c.Inv)
 	t.Cleanup(func() { chaos.ShardIDs, chaos.NodeIDs = []int{1, 2, 3}, []int{1, 2, 3} })
-	return &Remote{C: c}
+	return &Remote{C: c, Token: func() string { return "tok1" }}
 }
 
 // Kill, pause and their heals are docker commands on the host of the node.
@@ -113,7 +113,7 @@ func TestRemotePartition(t *testing.T) {
 		}
 	}
 	// The dead-man timer is set up before the first rule.
-	timer := "(nohup sh -c 'sleep 300; " + healPartition + "' >/dev/null 2>&1 &); "
+	timer := "echo tok1 > /tmp/seatsafe-chaos-token; (nohup sh -c 'sleep 300; [ \"$(cat /tmp/seatsafe-chaos-token 2>/dev/null)\" = tok1 ] || exit 0; " + healPartition + "' >/dev/null 2>&1 &); "
 	if !strings.HasPrefix(cmd, timer) {
 		t.Fatalf("the partition does not start with its own removal:\n%s", cmd)
 	}

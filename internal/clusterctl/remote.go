@@ -24,6 +24,8 @@ type Remote struct {
 	// removes it by itself after that long, whatever happens to this
 	// program. 0 means 5 minutes.
 	PartitionMax time.Duration
+	// Token names a partition; nil means the time. Replaced in tests.
+	Token func() string
 }
 
 var _ chaos.Remote = (*Remote)(nil)
@@ -101,9 +103,13 @@ func (r *Remote) Unpause(ctx context.Context, service string) error {
 // is ever touched.
 const chain = "SEATSAFE_CHAOS"
 
+// tokenFile holds the token of the partition that is in place, so that the
+// timer of an earlier partition cannot end a later one early.
+const tokenFile = "/tmp/seatsafe-chaos-token"
+
 // healPartition removes the chain. It is safe to run when there is none.
 const healPartition = "sudo iptables -D INPUT -j " + chain + " 2>/dev/null; sudo iptables -D OUTPUT -j " + chain + " 2>/dev/null; " +
-	"sudo iptables -F " + chain + " 2>/dev/null; sudo iptables -X " + chain + " 2>/dev/null; true"
+	"sudo iptables -F " + chain + " 2>/dev/null; sudo iptables -X " + chain + " 2>/dev/null; rm -f " + tokenFile + "; true"
 
 // partitionCmd cuts a host off from the other nodes of the cluster, in both
 // directions, by dropping packets from and to their private addresses.
@@ -112,16 +118,26 @@ const healPartition = "sudo iptables -D INPUT -j " + chain + " 2>/dev/null; sudo
 // other storage, coordinator and router hosts, never the machine this runs
 // from, a load generator or the monitor, and no policy or other chain is
 // changed. Before any rule is added, the host is told to remove the chain by
-// itself after max, so the partition ends even if this program is killed or
-// loses its connection.
-func partitionCmd(peers []string, limit time.Duration) string {
+// itself after limit, so the partition ends even if this program is killed
+// or loses its connection. The timer acts only if this partition (its
+// token) is still the one in place.
+func partitionCmd(peers []string, limit time.Duration, token string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "(nohup sh -c 'sleep %d; %s' >/dev/null 2>&1 &); ", int(math.Ceil(limit.Seconds())), healPartition)
+	fmt.Fprintf(&b, "echo %s > %s; (nohup sh -c 'sleep %d; [ \"$(cat %s 2>/dev/null)\" = %s ] || exit 0; %s' >/dev/null 2>&1 &); ",
+		token, tokenFile, int(math.Ceil(limit.Seconds())), tokenFile, token, healPartition)
 	fmt.Fprintf(&b, "sudo iptables -N %s 2>/dev/null || sudo iptables -F %s; ", chain, chain)
 	fmt.Fprintf(&b, "for ip in %s; do sudo iptables -A %s -s $ip -j DROP && sudo iptables -A %s -d $ip -j DROP || exit 1; done; ", strings.Join(peers, " "), chain, chain)
 	fmt.Fprintf(&b, "sudo iptables -C INPUT -j %s 2>/dev/null || sudo iptables -I INPUT 1 -j %s; ", chain, chain)
 	fmt.Fprintf(&b, "sudo iptables -C OUTPUT -j %s 2>/dev/null || sudo iptables -I OUTPUT 1 -j %s", chain, chain)
 	return b.String()
+}
+
+// token names one partition.
+func (r *Remote) token() string {
+	if r.Token != nil {
+		return r.Token()
+	}
+	return strconv.FormatInt(time.Now().UnixNano(), 36)
 }
 
 func (r *Remote) hostNetwork() bool { return r.C.Inv.Network == inventory.NetworkHost }
@@ -148,7 +164,7 @@ func (r *Remote) Partition(ctx context.Context, service string) error {
 	if limit <= 0 {
 		limit = 5 * time.Minute
 	}
-	_, err = r.C.Exec.Run(ctx, h, partitionCmd(peers, limit))
+	_, err = r.C.Exec.Run(ctx, h, partitionCmd(peers, limit, r.token()))
 	return err
 }
 

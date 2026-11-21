@@ -85,6 +85,10 @@ type Config struct {
 	// every return later, for histories merged from machines whose clocks
 	// differ (linearize.Options.Widen). 0 on one machine.
 	Widen time.Duration
+	// WidenFor, if set, gives the widening of one run instead: it is called
+	// with the run's directory after the load, when the clocks of the
+	// machines that ran it have been measured.
+	WidenFor func(dir string) time.Duration
 	// Resume continues a campaign that was stopped: the runs recorded in
 	// Out/runs.jsonl are kept and not run again. With it every run draws
 	// its fault from a random stream of its own (seed and run number), so a
@@ -582,7 +586,11 @@ func runOnce(ctx context.Context, c *Cluster, in *Injector, rnd *rand.Rand, cfg 
 	var checkErr error
 	if cfg.Linearizable {
 		var hc HistoryCheck
-		hc, checkErr = CheckHistory(dir, linearize.Options{Timeout: cfg.CheckTimeout, Widen: cfg.Widen})
+		widen := cfg.Widen
+		if cfg.WidenFor != nil {
+			widen = cfg.WidenFor(dir)
+		}
+		hc, checkErr = CheckHistory(dir, linearize.Options{Timeout: cfg.CheckTimeout, Widen: widen})
 		r.Linearizable, r.CheckDetail, r.CheckTime = hc.Bookings, hc.Detail, hc.Took
 		r.StaleBrowses, r.StaleSeats = hc.StaleBrowses, hc.StaleSeats
 		r.Idempotency = hc.Idempotency

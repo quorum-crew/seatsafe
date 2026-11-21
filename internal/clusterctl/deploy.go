@@ -22,6 +22,11 @@ type Ctl struct {
 	// ReadyTimeout bounds the wait for every node's /readyz; 0 means 3 minutes.
 	ReadyTimeout time.Duration
 	Logf         func(format string, args ...any)
+	// Timing of a load on several load generator hosts (Load).
+	Timing LoadTiming
+	// Full is the whole inventory Inv is a layout of. A benchmark that
+	// compares layouts or settings generates and pushes again from it.
+	Full *inventory.Inventory
 
 	// newID makes the cluster id of a reset; replaced in tests.
 	newID func() string
@@ -39,7 +44,7 @@ func New(inv *inventory.Inventory, dir string, exec Executor) (*Ctl, error) {
 		cp.ConfigDir = filepath.ToSlash(abs)
 		inv = &cp
 	}
-	return &Ctl{Inv: inv, Exec: exec, Dir: dir, Logf: func(string, ...any) {},
+	return &Ctl{Inv: inv, Full: inv, Exec: exec, Dir: dir, Logf: func(string, ...any) {},
 		newID: func() string { return time.Now().UTC().Format("20060102T150405.000000000Z") }}, nil
 }
 

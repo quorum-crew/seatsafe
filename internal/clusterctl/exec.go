@@ -191,6 +191,8 @@ type Fake struct {
 	Reply func(h inventory.Host, cmd string) (string, error)
 	// OnFetch, if set, creates what a Fetch would have copied.
 	OnFetch func(h inventory.Host, remote, local string) error
+	// OnCopy, if set, is told of every Copy.
+	OnCopy func(h inventory.Host, local, remote string)
 
 	mu    sync.Mutex
 	calls []Call
@@ -212,6 +214,9 @@ func (f *Fake) Run(_ context.Context, h inventory.Host, cmd string) (string, err
 
 func (f *Fake) Copy(_ context.Context, h inventory.Host, local, remote string) error {
 	f.add(h, "copy "+filepath.ToSlash(local)+" -> "+remote)
+	if f.OnCopy != nil {
+		f.OnCopy(h, local, remote)
+	}
 	return nil
 }
 
