@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -108,7 +109,7 @@ func (r *run) schedule(ctx context.Context, rate float64, start, end time.Time) 
 		id := r.next.Add(1)
 		go func() {
 			defer r.wg.Done()
-			res := r.client.Book(id, order)
+			res := r.client.Book(r.cfg.clientBase()+id, order)
 			r.inflight.Add(-1)
 			r.done(res, intended)
 		}()
@@ -148,7 +149,7 @@ func (r *run) closed(ctx context.Context) *Recorder {
 				intended := time.Now()
 				r.attempt(intended, false)
 				r.series.setInflight(r.inflight.Add(1))
-				res := r.client.Book(uint64(u)+1, order)
+				res := r.client.Book(r.cfg.clientBase()+uint64(u)+1, order)
 				r.inflight.Add(-1)
 				r.done(res, intended)
 				if r.cfg.Think > 0 {
@@ -261,7 +262,7 @@ func (r *listRecorder) take() []listed {
 func (r *run) browse(ctx context.Context, list ListFunc, sections []Section) int64 {
 	var wg sync.WaitGroup
 	var n atomic.Int64
-	rng := rand.New(rand.NewPCG(r.cfg.Seed, 11))
+	rng := rand.New(rand.NewPCG(r.cfg.Seed, 11^r.cfg.streamSalt()))
 	var worker *Worker
 	if r.cfg.Workload != WorkloadFresh { // a fresh worker would use up seats
 		worker = r.workload.Worker(1 << 40)
@@ -305,7 +306,37 @@ type Env struct {
 	List ListFunc
 }
 
+// waitUntil sleeps until the wall clock reads unix seconds, or returns at
+// once when that is 0 or already past.
+func waitUntil(ctx context.Context, unix float64) error {
+	if unix <= 0 {
+		return nil
+	}
+	sec, frac := math.Modf(unix)
+	at := time.Unix(int64(sec), int64(frac*1e9))
+	// The wall clock can be set back while this waits (clock
+	// synchronization), so look at it again after every wait.
+	for {
+		left := time.Until(at)
+		if left <= 0 {
+			return nil
+		}
+		t := time.NewTimer(left)
+		select {
+		case <-t.C:
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		}
+	}
+}
+
 // Run performs a whole run: availability, load, audit, output files.
+//
+// One worker of several (Config.Workers above 1) does not audit and writes no
+// baseline or final listing to its history: those belong to the whole run
+// (Snapshot and Merge). It still reads availability when the fresh workload
+// needs it, and its browses are recorded.
 func Run(ctx context.Context, cfg Config, u *Universe, env Env) (*Summary, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -331,13 +362,14 @@ func Run(ctx context.Context, cfg Config, u *Universe, env Env) (*Summary, error
 	}
 	// With a history, the availability reads go into it: the linearizability
 	// check uses the one before the run and the last one after it.
+	audit := cfg.Audit && !cfg.multi()
 	var lists *listRecorder
-	if cfg.History {
+	if cfg.History && !cfg.multi() {
 		lists = &listRecorder{}
 	}
 	list := lists.wrap(env.List)
 	var before map[Seat]bool
-	if cfg.Audit || cfg.Workload == WorkloadFresh {
+	if audit || cfg.Workload == WorkloadFresh {
 		if before, err = Availability(ctx, list, probe.Touchable()); err != nil {
 			return nil, err
 		}
@@ -348,6 +380,10 @@ func Run(ctx context.Context, cfg Config, u *Universe, env Env) (*Summary, error
 		return nil, err
 	}
 
+	// Everything is set up: wait for the common start, if there is one.
+	if err := waitUntil(ctx, cfg.StartAt); err != nil {
+		return nil, err
+	}
 	begin := time.Now()
 	client := &Client{Call: env.Book, CallTimeout: cfg.CallTimeout, RetryBudget: cfg.RetryBudget}
 	if cfg.History {
@@ -362,10 +398,13 @@ func Run(ctx context.Context, cfg Config, u *Universe, env Env) (*Summary, error
 	if err != nil {
 		return nil, err
 	}
+	if err := s.withHistograms(filepath.Join(cfg.Out, "timeseries.hdr.jsonl"), begin); err != nil {
+		return nil, err
+	}
 	s.start()
 	r := newRun(cfg, workload, client, s)
 
-	sum := &Summary{Config: cfg, GitCommit: cfg.GitCommit, StartedAt: begin.UTC().Format(time.RFC3339), Seats: u.Seats}
+	sum := &Summary{Config: cfg, GitCommit: cfg.GitCommit, StartedAt: begin.UTC().Format(time.RFC3339), Seats: u.Seats, StartedUnixNs: begin.UnixNano()}
 	browsed := make(chan int64, 1)
 	bctx, stopBrowsing := context.WithCancel(ctx)
 	defer stopBrowsing()
@@ -389,6 +428,13 @@ func Run(ctx context.Context, cfg Config, u *Universe, env Env) (*Summary, error
 	stopBrowsing()
 	sum.Browses = <-browsed
 	sum.Results = rec.Results()
+	hists, err := rec.Histograms(begin)
+	if err != nil {
+		return nil, err
+	}
+	if err := writeJSON(filepath.Join(cfg.Out, "histograms.json"), hists); err != nil {
+		return nil, err
+	}
 	sum.SeatsExhausted = r.out.Load()
 	closeHistory := func() error {
 		if client.History == nil {
@@ -401,7 +447,7 @@ func Run(ctx context.Context, cfg Config, u *Universe, env Env) (*Summary, error
 	}
 	defer closeHistory()
 
-	if cfg.Audit {
+	if audit {
 		after, err := Availability(context.Background(), list, probe.Touchable())
 		if err != nil {
 			return nil, err

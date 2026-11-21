@@ -182,6 +182,12 @@ type Summary struct {
 	Audit           *Audit  `json:"audit,omitempty"`
 	HistoryAttempts int64   `json:"history_attempts,omitempty"`
 	Browses         int64   `json:"browses,omitempty"` // answered ListAvailableSeats calls during the load
+	// StartedUnixNs is the wall clock, in unix nanoseconds, of the time every
+	// time in history.jsonl, histograms.json and timeseries.hdr.jsonl is
+	// measured from. "loadgen merge" uses it to put workers on one time base.
+	StartedUnixNs int64 `json:"started_unix_ns,omitempty"`
+	// MergedFrom lists the worker directories a merged summary was made from.
+	MergedFrom []string `json:"merged_from,omitempty"`
 }
 
 // sortedKeys returns m's keys in order.
