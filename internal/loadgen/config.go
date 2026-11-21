@@ -68,6 +68,20 @@ type Config struct {
 	// for one section; 0 for none. They are written to the history.
 	BrowseRate float64 `json:"browse_rate,omitempty"`
 
+	// Several load generator processes ("workers") can drive one cluster at
+	// the same time. Workers is how many there are (0 and 1 both mean this is
+	// the only one) and WorkerID is which one this is, from 0. The fresh
+	// workload gives every row to one worker; the others share their seats and
+	// differ in their random streams. A worker of several does not audit and
+	// writes no baseline or final listing: "loadgen snapshot" and "loadgen
+	// merge" do that for the whole run.
+	WorkerID int `json:"worker_id"`
+	Workers  int `json:"workers"`
+	// StartAt is the wall-clock time, in unix seconds, at which the load
+	// starts, so that workers start together; 0 starts at once. The setup
+	// (connecting, reading availability) is done before the wait.
+	StartAt float64 `json:"start_at_unix,omitempty"`
+
 	// Client behavior.
 	CallTimeout time.Duration `json:"call_timeout_ns"`
 	RetryBudget time.Duration `json:"retry_budget_ns"`
@@ -94,9 +108,27 @@ func Defaults() Config {
 		RateStart: 500, RateEnd: 20000, RateStep: 500, StepDuration: 10 * time.Second, SLO: 100 * time.Millisecond,
 		ZipfS: 1.1, OrderSizes: "1:70,2:20,4:10", Seed: 1,
 		CallTimeout: 2 * time.Second, RetryBudget: 5 * time.Second,
-		Audit: true,
+		Audit:   true,
+		Workers: 1,
 	}
 }
+
+// workers is the number of workers, at least 1.
+func (c Config) workers() int { return max(c.Workers, 1) }
+
+// multi says whether this is one worker of several.
+func (c Config) multi() bool { return c.Workers > 1 }
+
+// streamSalt is mixed into every random stream so that workers differ. It is
+// 0 for worker 0, which therefore behaves like a single load generator.
+func (c Config) streamSalt() uint64 { return uint64(c.WorkerID) * 0x9E3779B97F4A7C15 }
+
+// clientBase is added to every client id (and so to every user id) so that
+// workers never share one.
+func (c Config) clientBase() uint64 { return uint64(c.WorkerID) << workerShift }
+
+// workerShift is where the worker id sits in a client id.
+const workerShift = 40
 
 // Validate checks the flags that can be checked before connecting.
 func (c Config) Validate() error {
@@ -127,6 +159,12 @@ func (c Config) Validate() error {
 	}
 	if c.Conns < 1 || c.MaxInflight < 1 {
 		return errors.New("loadgen: -conns and -max-inflight must be positive")
+	}
+	if c.Workers < 0 || c.WorkerID < 0 || c.WorkerID >= c.workers() {
+		return fmt.Errorf("loadgen: -worker-id %d must be at least 0 and below -workers %d", c.WorkerID, c.workers())
+	}
+	if c.StartAt < 0 {
+		return errors.New("loadgen: -start-at must not be negative")
 	}
 	if c.BrowseRate < 0 {
 		return errors.New("loadgen: -browse-rate must not be negative")

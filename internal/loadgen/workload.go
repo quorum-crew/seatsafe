@@ -2,6 +2,7 @@ package loadgen
 
 import (
 	"fmt"
+	"hash/fnv"
 	"math/rand/v2"
 	"sort"
 	"strings"
@@ -168,6 +169,9 @@ func NewWorkload(cfg Config, u *Universe, available map[Seat]bool) (*Workload, e
 		}
 	case WorkloadFresh:
 		for _, r := range u.Rows {
+			if !ownsRow(r, cfg.WorkerID, cfg.workers()) {
+				continue
+			}
 			start := -1
 			for i, s := range r.Seats {
 				free := available[Seat{r.Event, r.Section, s}]
@@ -183,7 +187,7 @@ func NewWorkload(cfg Config, u *Universe, available map[Seat]bool) (*Workload, e
 				w.strips = append(w.strips, strip{r, r.Seats[start:]})
 			}
 		}
-		rng := rand.New(rand.NewPCG(cfg.Seed, 7))
+		rng := rand.New(rand.NewPCG(cfg.Seed, 7^cfg.streamSalt()))
 		rng.Shuffle(len(w.strips), func(i, j int) { w.strips[i], w.strips[j] = w.strips[j], w.strips[i] })
 	}
 	if cfg.CrossShardFrac > 0 {
@@ -194,6 +198,30 @@ func NewWorkload(cfg Config, u *Universe, available map[Seat]bool) (*Workload, e
 		}
 	}
 	return w, nil
+}
+
+// ownsRow says whether worker id of n is the one that books row r in the
+// fresh workload. Every row belongs to exactly one worker, by a hash of its
+// event, section and row name, so the workers agree without talking to each
+// other and whatever the order of the rows or the seats that are free.
+func ownsRow(r *Row, id, n int) bool {
+	if n <= 1 {
+		return true
+	}
+	name := ""
+	if len(r.Seats) > 0 {
+		name, _, _ = strings.Cut(r.Seats[0], "-")
+	}
+	h := fnv.New64a()
+	for _, part := range []string{r.Event, r.Section, name} {
+		h.Write([]byte(part))
+		h.Write([]byte{0})
+	}
+	x := h.Sum64()
+	x ^= x >> 33 // spread the hash over the low bits the modulo uses
+	x *= 0xff51afd7ed558ccd
+	x ^= x >> 33
+	return x%uint64(n) == uint64(id)
 }
 
 // Touchable returns the sections this workload can book.
@@ -218,9 +246,10 @@ type Worker struct {
 	rows     []*rand.Zipf // per section
 }
 
-// Worker returns a generator seeded by id.
+// Worker returns a generator seeded by id. With several load generator
+// processes, each has its own streams.
 func (w *Workload) Worker(id uint64) *Worker {
-	wk := &Worker{w: w, rng: rand.New(rand.NewPCG(w.cfg.Seed, id))}
+	wk := &Worker{w: w, rng: rand.New(rand.NewPCG(w.cfg.Seed, id^w.cfg.streamSalt()))}
 	if w.flash != nil {
 		wk.sections = rand.NewZipf(wk.rng, w.cfg.ZipfS, 1, uint64(len(w.flash)-1))
 		wk.rows = make([]*rand.Zipf, len(w.flash))

@@ -114,16 +114,36 @@ func (h *HistoryWriter) Write(clientID uint64, requestID string, o Order, call, 
 // WriteListing records one answered ListAvailableSeats call. Listings are not
 // counted by Close.
 func (h *HistoryWriter) WriteListing(phase string, s Section, free []string, call, ret time.Time) {
-	if free == nil {
-		free = []string{}
-	}
-	b, err := json.Marshal(struct {
-		Kind string `json:"kind"`
-		Listing
-	}{kindList, Listing{phase, s.Event, s.ID, free, call.Sub(h.base).Nanoseconds(), ret.Sub(h.base).Nanoseconds()}})
+	b, err := listingLine(Listing{phase, s.Event, s.ID, free, call.Sub(h.base).Nanoseconds(), ret.Sub(h.base).Nanoseconds()})
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.put(b, err)
+}
+
+// listingLine is the history line of l.
+func listingLine(l Listing) ([]byte, error) {
+	if l.Free == nil {
+		l.Free = []string{}
+	}
+	return json.Marshal(struct {
+		Kind string `json:"kind"`
+		Listing
+	}{kindList, l})
+}
+
+// Widen returns a copy of attempts with every call moved earlier by d and
+// every return moved later by d. A history merged from several machines has
+// times from clocks that differ by a few milliseconds; a check that compares
+// a return on one machine with a call on another (CheckRealTime) is run on
+// the widened copy so that it only reports what no such difference explains.
+func Widen(attempts []Attempt, d time.Duration) []Attempt {
+	out := make([]Attempt, len(attempts))
+	for i, a := range attempts {
+		a.CallNs -= d.Nanoseconds()
+		a.ReturnNs += d.Nanoseconds()
+		out[i] = a
+	}
+	return out
 }
 
 // put appends one line. The caller holds h.mu.

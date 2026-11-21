@@ -1,0 +1,34 @@
+# The same cluster as inventory.example.yaml, on this machine alone: a proof
+# of clusterctl without AWS (docs/aws.md, "Trying it locally").
+#
+# Every host is this machine (executor: local), so each one gets a container
+# and a config directory of its own, /data is a Docker volume per node, and
+# the containers find each other by name on a Docker network instead of by
+# private address on the hosts' network. Zones are made up: one node of
+# every group in each, as on AWS.
+#
+#   docker build -t seatsafe:dev .
+#   clusterctl -inventory deploy/aws/inventory.local.yaml -dir results/local/gen gen
+executor: local
+network: seatsafe-local
+config_dir: results/local/opt
+data_dir: volume
+image: seatsafe:dev
+
+hosts:
+  - {name: shard1-node1, role: storage, shard: 1, node: 1, az: zone-1, private_ip: shard1-node1}
+  - {name: shard1-node2, role: storage, shard: 1, node: 2, az: zone-2, private_ip: shard1-node2}
+  - {name: shard1-node3, role: storage, shard: 1, node: 3, az: zone-3, private_ip: shard1-node3}
+  - {name: shard2-node1, role: storage, shard: 2, node: 1, az: zone-1, private_ip: shard2-node1}
+  - {name: shard2-node2, role: storage, shard: 2, node: 2, az: zone-2, private_ip: shard2-node2}
+  - {name: shard2-node3, role: storage, shard: 2, node: 3, az: zone-3, private_ip: shard2-node3}
+  - {name: shard3-node1, role: storage, shard: 3, node: 1, az: zone-1, private_ip: shard3-node1}
+  - {name: shard3-node2, role: storage, shard: 3, node: 2, az: zone-2, private_ip: shard3-node2}
+  - {name: shard3-node3, role: storage, shard: 3, node: 3, az: zone-3, private_ip: shard3-node3}
+  - {name: coord-1, role: coordinator, node: 1, az: zone-1, private_ip: coord-1}
+  - {name: coord-2, role: coordinator, node: 2, az: zone-2, private_ip: coord-2}
+  - {name: coord-3, role: coordinator, node: 3, az: zone-3, private_ip: coord-3}
+  - {name: router-1, role: router, az: zone-1, private_ip: router-1}
+  - {name: router-2, role: router, az: zone-2, private_ip: router-2}
+  - {name: loadgen-1, role: loadgen, az: zone-1, private_ip: loadgen-1}
+  - {name: loadgen-2, role: loadgen, az: zone-2, private_ip: loadgen-2}

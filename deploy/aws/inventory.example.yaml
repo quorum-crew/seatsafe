@@ -1,0 +1,39 @@
+# The machines of one SeatSafe cluster. Copy to deploy/aws/inventory.yaml and
+# fill in the addresses; cmd/clusterctl reads it (docs/aws.md).
+#
+# One node of every shard and one coordinator in each availability zone, so
+# every Raft group keeps a quorum when a zone is lost.
+#
+#   storage, coordinator   c6id.large, local NVMe mounted at /data
+#   router                 c6i.large
+#   loadgen                c6i.xlarge
+#   monitor                t3.medium
+ssh_user: ec2-user
+ssh_key: ~/.ssh/seatsafe.pem
+image: 123456789012.dkr.ecr.us-west-2.amazonaws.com/seatsafe:latest
+
+hosts:
+  # Shard 1
+  - {name: shard1-node1, role: storage, shard: 1, node: 1, az: us-west-2a, public_ip: 203.0.113.11, private_ip: 10.0.1.11}
+  - {name: shard1-node2, role: storage, shard: 1, node: 2, az: us-west-2b, public_ip: 203.0.113.12, private_ip: 10.0.2.11}
+  - {name: shard1-node3, role: storage, shard: 1, node: 3, az: us-west-2c, public_ip: 203.0.113.13, private_ip: 10.0.3.11}
+  # Shard 2
+  - {name: shard2-node1, role: storage, shard: 2, node: 1, az: us-west-2a, public_ip: 203.0.113.21, private_ip: 10.0.1.12}
+  - {name: shard2-node2, role: storage, shard: 2, node: 2, az: us-west-2b, public_ip: 203.0.113.22, private_ip: 10.0.2.12}
+  - {name: shard2-node3, role: storage, shard: 2, node: 3, az: us-west-2c, public_ip: 203.0.113.23, private_ip: 10.0.3.12}
+  # Shard 3
+  - {name: shard3-node1, role: storage, shard: 3, node: 1, az: us-west-2a, public_ip: 203.0.113.31, private_ip: 10.0.1.13}
+  - {name: shard3-node2, role: storage, shard: 3, node: 2, az: us-west-2b, public_ip: 203.0.113.32, private_ip: 10.0.2.13}
+  - {name: shard3-node3, role: storage, shard: 3, node: 3, az: us-west-2c, public_ip: 203.0.113.33, private_ip: 10.0.3.13}
+  # 2PC coordinator (Raft group 0)
+  - {name: coord-1, role: coordinator, node: 1, az: us-west-2a, public_ip: 203.0.113.41, private_ip: 10.0.1.20}
+  - {name: coord-2, role: coordinator, node: 2, az: us-west-2b, public_ip: 203.0.113.42, private_ip: 10.0.2.20}
+  - {name: coord-3, role: coordinator, node: 3, az: us-west-2c, public_ip: 203.0.113.43, private_ip: 10.0.3.20}
+  # Routers (stateless). Load generator i uses router i, wrapping around.
+  - {name: router-1, role: router, az: us-west-2a, public_ip: 203.0.113.51, private_ip: 10.0.1.30}
+  - {name: router-2, role: router, az: us-west-2b, public_ip: 203.0.113.52, private_ip: 10.0.2.30}
+  # Load generators. The first one also runs unattended campaigns.
+  - {name: loadgen-1, role: loadgen, az: us-west-2a, public_ip: 203.0.113.61, private_ip: 10.0.1.40}
+  - {name: loadgen-2, role: loadgen, az: us-west-2b, public_ip: 203.0.113.62, private_ip: 10.0.2.40}
+  # Prometheus and Grafana
+  - {name: monitor, role: monitor, az: us-west-2a, public_ip: 203.0.113.71, private_ip: 10.0.1.50}

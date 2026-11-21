@@ -143,3 +143,55 @@ func TestIdempotency(t *testing.T) {
 		t.Fatalf("exit %d\n%s", code, out)
 	}
 }
+
+// A history merged from two machines whose clocks differ by 2 ms: an order
+// refused for a seat seems to return before the order that booked the seat
+// was called. -widen-ms allows for the clocks; it does not hide a double
+// booking.
+func TestWidenMs(t *testing.T) {
+	const tenth = 100_000 // 0.1 ms in ns
+	skewed := []string{
+		listing("baseline", -200*tenth, -100*tenth, `"a"`),
+		attempt("a1", 100*tenth, 105*tenth, "CONFIRMED", "e/s/a", false),
+		attempt("b1", 88*tenth, 92*tenth, "SEAT_UNAVAILABLE", "e/s/a", true),
+		listing("final", 300*tenth, 310*tenth, ``),
+	}
+	p := write(t, skewed...)
+	code, out := capture(t, []string{"-linearizable", p})
+	if code != 1 || !strings.Contains(out, "bookings: FAIL") || strings.Contains(out, "widened") {
+		t.Fatalf("without -widen-ms: exit %d\n%s", code, out)
+	}
+	p = write(t, skewed...)
+	for _, flag := range []string{"3", "2.5"} {
+		code, out = capture(t, []string{"-linearizable", "-widen-ms", flag, p})
+		if code != 0 || !strings.Contains(out, "bookings: PASS") || !strings.Contains(out, "; widened by "+flag+"ms") {
+			t.Fatalf("-widen-ms %s: exit %d\n%s", flag, code, out)
+		}
+	}
+
+	// Two CONFIRMED orders for one seat, 1 ms apart on two clocks. Widened,
+	// neither is known to have come first, so real-time-order has nothing to
+	// say; it is a double booking all the same.
+	p = write(t, attempt("o1", 10*tenth, 20*tenth, "CONFIRMED", "e/s/a", false), attempt("o2", 30*tenth, 40*tenth, "CONFIRMED", "e/s/a", false))
+	code, out = capture(t, []string{"-linearizable", p})
+	if code != 1 || !strings.Contains(out, "real-time-order: FAIL, 1 violations") || !strings.Contains(out, "no-double-booking: FAIL") {
+		t.Fatalf("double booking: exit %d\n%s", code, out)
+	}
+	code, out = capture(t, []string{"-linearizable", "-widen-ms", "3", p})
+	if code != 1 || !strings.Contains(out, "real-time-order: PASS, 0 violations, 2 attempts (widened by 3ms)") ||
+		!strings.Contains(out, "no-double-booking: FAIL, 1 violations, 2 attempts\n") || !strings.Contains(out, "bookings: FAIL") {
+		t.Fatalf("double booking with -widen-ms: exit %d\n%s", code, out)
+	}
+	// Seconds apart, the widening changes nothing.
+	p = write(t, attempt("o1", 10*tenth, 20*tenth, "CONFIRMED", "e/s/a", false), attempt("o2", 30000*tenth, 30010*tenth, "CONFIRMED", "e/s/a", false))
+	code, out = capture(t, []string{"-widen-ms", "3", p})
+	if code != 1 || !strings.Contains(out, "real-time-order: FAIL, 1 violations, 2 attempts (widened by 3ms)") {
+		t.Fatalf("double booking seconds apart with -widen-ms: exit %d\n%s", code, out)
+	}
+
+	for _, bad := range []string{"-1", "x", "1e12"} {
+		if code := run([]string{"-widen-ms", bad, p}); code != 2 {
+			t.Fatalf("-widen-ms %s: exit %d, want 2", bad, code)
+		}
+	}
+}

@@ -15,3 +15,7 @@ deploy/seed/*.json
 
 # Load generator output
 /results/
+
+# clusterctl: the real inventory and what gen writes from it
+deploy/aws/inventory.yaml
+deploy/aws/gen/

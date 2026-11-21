@@ -72,6 +72,9 @@ type Cluster struct {
 	Docker  Docker
 	Project string   // compose project name, e.g. seatsafe
 	Files   []string // compose files, e.g. docker-compose.yml
+	// Remote, if set, is the cluster: the hosts of an inventory instead of
+	// the Compose project. Docker, Project and Files are then not used.
+	Remote Remote
 }
 
 // Service names the Compose service of one node of a group: a storage node,
@@ -100,6 +103,9 @@ func (c *Cluster) compose(ctx context.Context, args ...string) (string, error) {
 // Reset wipes the cluster, Raft logs included, and starts it again, waiting
 // until every node is healthy (storage nodes: leader known and seeded).
 func (c *Cluster) Reset(ctx context.Context) error {
+	if c.Remote != nil {
+		return c.Remote.Reset(ctx)
+	}
 	if _, err := c.compose(ctx, "down", "-v", "--remove-orphans"); err != nil {
 		return err
 	}
@@ -111,7 +117,13 @@ func (c *Cluster) Reset(ctx context.Context) error {
 func (c *Cluster) Metrics(ctx context.Context, service string) (map[string]float64, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	out, err := c.Docker.Run(ctx, "exec", c.Container(service), "wget", "-qO-", "http://localhost:8080/metrics")
+	var out string
+	var err error
+	if c.Remote != nil {
+		out, err = c.Remote.Metrics(ctx, service)
+	} else {
+		out, err = c.Docker.Run(ctx, "exec", c.Container(service), "wget", "-qO-", "http://localhost:8080/metrics")
+	}
 	if err != nil {
 		return nil, err
 	}
