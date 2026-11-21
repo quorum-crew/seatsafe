@@ -44,14 +44,64 @@ const DefaultDeadline = 2 * time.Second
 // asked only once.
 const DefaultCoordinatorAttemptTimeout = time.Second
 
+// DefaultShardAttemptTimeout is how long one Book attempt to a shard group
+// may take before the router gives up on that node and looks for the leader
+// again. It bounds what a client waits when a shard leader stops answering
+// without closing its connections (a paused or partitioned process). Chaos
+// runs on a laptop found no shorter setting that kept healthy requests from
+// timing out (docs/results/2026-11-19-router-attempt-timeout.md), so it stays
+// at 500 ms until the same runs are repeated on AWS.
+const DefaultShardAttemptTimeout = 500 * time.Millisecond
+
 // Config tunes a Router.
 type Config struct {
-	Group groupclient.Config // the shard groups
+	// Group is the shard groups' client config. A zero AttemptTimeout means
+	// DefaultShardAttemptTimeout.
+	Group groupclient.Config
 	// Coordinator is the coordinator group's client config. Zero fields
 	// take Group's values, except AttemptTimeout, which defaults to
 	// DefaultCoordinatorAttemptTimeout.
 	Coordinator     groupclient.Config
 	DefaultDeadline time.Duration // default DefaultDeadline
+}
+
+// shardConfig fills cfg.Group's attempt timeout.
+func (c Config) shardConfig() groupclient.Config {
+	out := c.Group
+	if out.AttemptTimeout <= 0 {
+		out.AttemptTimeout = DefaultShardAttemptTimeout
+	}
+	return out
+}
+
+func (c Config) deadline() time.Duration {
+	if c.DefaultDeadline > 0 {
+		return c.DefaultDeadline
+	}
+	return DefaultDeadline
+}
+
+// Validate checks the attempt timeouts against the client deadline. An
+// attempt that can outlast the deadline would never be retried, so the
+// router would wait out a dead leader instead of finding the new one.
+func (c Config) Validate() error {
+	deadline := c.deadline()
+	for _, a := range []struct {
+		name string
+		set  time.Duration
+		got  time.Duration
+	}{
+		{"shard", c.Group.AttemptTimeout, c.shardConfig().AttemptTimeout},
+		{"coordinator", c.Coordinator.AttemptTimeout, c.coordinatorConfig().AttemptTimeout},
+	} {
+		switch {
+		case a.set < 0:
+			return fmt.Errorf("router: %s attempt timeout %v must be positive", a.name, a.set)
+		case a.got >= deadline:
+			return fmt.Errorf("router: %s attempt timeout %v must be shorter than the client deadline %v", a.name, a.got, deadline)
+		}
+	}
+	return nil
 }
 
 // coordinatorConfig fills cfg.Coordinator's zero fields.
@@ -107,6 +157,9 @@ type Router struct {
 // New builds a router with one group client per shard and one for the
 // coordinator group. Metrics are registered in reg.
 func New(sm *shardmap.Map, cfg Config, reg *metrics.Registry) (*Router, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	r := &Router{
 		sm:       sm,
 		shards:   map[uint32]*groupclient.Group{},
@@ -117,17 +170,18 @@ func New(sm *shardmap.Map, cfg Config, reg *metrics.Registry) (*Router, error) {
 		},
 		GroupMetrics: groupclient.NewMetrics(reg),
 	}
-	if r.deadline <= 0 {
-		r.deadline = DefaultDeadline
-	}
+	r.deadline = cfg.deadline()
 	for _, id := range sm.ShardIDs() {
-		g, err := groupclient.New(fmt.Sprintf("shard-%d", id), sm.ShardNodes(id), cfg.Group, r.GroupMetrics)
+		name := fmt.Sprintf("shard-%d", id)
+		r.GroupMetrics.Init(name)
+		g, err := groupclient.New(name, sm.ShardNodes(id), cfg.shardConfig(), r.GroupMetrics)
 		if err != nil {
 			r.Close()
 			return nil, err
 		}
 		r.shards[id] = g
 	}
+	r.GroupMetrics.Init("coordinator")
 	g, err := groupclient.New("coordinator", sm.CoordinatorNodes(), cfg.coordinatorConfig(), r.GroupMetrics)
 	if err != nil {
 		r.Close()

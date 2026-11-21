@@ -111,6 +111,21 @@ func NewMetrics(r *metrics.Registry) *Metrics {
 	}
 }
 
+// Reasons lists every retry reason.
+var Reasons = []string{ReasonRedirect, ReasonNotLeader, ReasonUnavailable, ReasonAttemptTimer}
+
+// Init creates group's failover series at 0: retries for every reason,
+// leader changes and leader_recovery_seconds. Without it each appears only
+// with its first event, and Prometheus' increase() cannot see that event, so
+// a dashboard misses the first failover after a process starts.
+func (m *Metrics) Init(group string) {
+	for _, r := range Reasons {
+		m.Retries.Init(group, r)
+	}
+	m.LeaderChanges.Init(group)
+	m.LeaderRecovery.Init(group)
+}
+
 // Group is a client for one Raft group. Safe for concurrent use.
 type Group struct {
 	name  string

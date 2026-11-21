@@ -112,6 +112,19 @@ func (c *CounterVec) Inc(values ...string) {
 	c.mu.Unlock()
 }
 
+// Init creates the series with these label values at 0 if it does not exist
+// yet. A counter that first appears with the value 1 hides that first
+// increment from Prometheus' increase() and rate(), so series that start
+// rare (a leader change, a retry) should be created up front.
+func (c *CounterVec) Init(values ...string) {
+	k := c.key(values)
+	c.mu.Lock()
+	if _, ok := c.vals[k]; !ok {
+		c.vals[k] = 0
+	}
+	c.mu.Unlock()
+}
+
 // Value returns the current value of one series (for tests).
 func (c *CounterVec) Value(values ...string) float64 {
 	k := c.key(values)
@@ -166,6 +179,17 @@ func (h *HistogramVec) Observe(v float64, values ...string) {
 	s.counts[i]++
 	s.sum += v
 	s.count++
+	h.mu.Unlock()
+}
+
+// Init creates the series with these label values, empty, if it does not
+// exist yet (see CounterVec.Init).
+func (h *HistogramVec) Init(values ...string) {
+	k := h.key(values)
+	h.mu.Lock()
+	if h.series[k] == nil {
+		h.series[k] = &histSeries{counts: make([]uint64, len(h.buckets)+1)}
+	}
 	h.mu.Unlock()
 }
 
