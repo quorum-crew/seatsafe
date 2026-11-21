@@ -12,8 +12,10 @@
 # cross-shard and a few browses per second are recorded, so the Porcupine
 # check after every run sees 2PC and reads as well as bookings.
 #
-# The cluster is wiped every 5 runs, after any run that did not finish, and
-# when less than 3 GiB of memory is free before a run. A run that breaks (the
+# The cluster is wiped every 5 runs, after any run that did not pass, and
+# when less than 3 GiB of memory is free before a run; otherwise the next run
+# waits 9 s (-hold-drain) so holds left by cross-shard orders are resolved
+# before its baseline. A run that breaks (the
 # cluster does not come up, the load generator dies) is recorded as such and
 # the campaign goes on. results/chaos-<stamp>/summary.md has one row per run
 # (fault, target, failover, audit rules a to e, the bookings verdict

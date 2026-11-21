@@ -95,6 +95,7 @@ func main() {
 		browseRate   = flag.Float64("browse-rate", 0, "ListAvailableSeats calls per second during the load, recorded for the linearizability check")
 		linearizable = flag.Bool("linearizable", true, "check every run's history for linearizability with Porcupine: the bookings decide the run, stale browses are reported")
 		checkTimeout = flag.Duration("check-timeout", 2*time.Minute, "time allowed for one linearizability check; running out makes the run a TIMEOUT, not a pass")
+		holdDrain    = flag.Duration("hold-drain", chaos.DefaultHoldDrain, "wait this long after a run before the next one starts, unless the cluster is reset, so holds of its cross-shard orders are resolved before the next baseline")
 		minFreeMem   = flag.Float64("min-free-mem", 0, "GiB of memory that must be available to the containers (Docker's MemAvailable) before each run; 0 = don't check")
 	)
 	flag.Parse()
@@ -126,7 +127,7 @@ func main() {
 		HealTimeout: *healTimeout, Image: *image, DeployDir: *deploy, Workload: *workload, Rate: *rate,
 		Duration: *duration, Out: *out, StopOnFail: *stopOnFail, Logf: log.Printf,
 		CrossShardFrac: *crossFrac, BrowseRate: *browseRate, Linearizable: *linearizable, CheckTimeout: *checkTimeout,
-		MinFreeMem: uint64(*minFreeMem * (1 << 30)),
+		MinFreeMem: uint64(*minFreeMem * (1 << 30)), HoldDrain: *holdDrain,
 	}
 	what := fmt.Sprintf("faults %v on a random shard", kinds)
 	switch {
@@ -134,8 +135,8 @@ func main() {
 		cfg.Plan = chaos.Mix
 		what = "the campaign mix (kill-leader, pause-leader, partition, none; shard and coordinator)"
 	case *target == string(chaos.TargetCoordinator):
-		for _, k := range kinds {
-			cfg.Plan = append(cfg.Plan, chaos.Step{Kind: k, Target: chaos.TargetCoordinator})
+		if cfg.Plan, err = chaos.CoordinatorPlan(kinds); err != nil {
+			log.Fatal(err)
 		}
 		what = fmt.Sprintf("faults %v on the coordinator, in turn", kinds)
 	case *target != string(chaos.TargetShard):

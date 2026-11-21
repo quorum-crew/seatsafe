@@ -6,7 +6,11 @@
 // The history is partitioned by seat: every seat is checked on its own,
 // against a model of that one seat. A seat is free, booked by an order, or
 // held by a cross-shard order that has prepared but not finished (2PC). Before
-// the run it is free or booked, and the model does not assume which.
+// the run it is free or booked, and the model does not assume which. It is
+// never held before the run: a hold of an earlier run's order, released
+// during this one, would look like a booked seat coming free. The chaos
+// campaign makes sure of that (it resets the cluster after a run that did not
+// pass and otherwise waits for holds to be resolved, chaos.Config.HoldDrain).
 //
 // Every order is one operation per seat, from its first call to its last
 // return (retries included), projected onto each of its seats:
@@ -64,7 +68,10 @@
 //
 // Checking linearizability is NP-hard. Options.Timeout bounds the whole
 // check. A seat that could not be decided in time is reported as timed out:
-// the verdict is then TIMEOUT, never PASS.
+// the verdict is then TIMEOUT, never PASS. Every seat's bookings are checked
+// before any browse is, so the browses only get the time that is left and
+// can never turn the verdict into TIMEOUT: a seat whose browses run out of
+// time is reported as such (Report.BrowseUndecided).
 package linearize
 
 import (
@@ -683,33 +690,27 @@ func Check(h *loadgen.History, opt Options) *Report {
 	r.Seats = len(checks)
 	r.model = Model(requests)
 
-	jobs := make(chan *seatCheck)
-	var wg sync.WaitGroup
-	for range opt.Workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for c := range jobs {
-				left := time.Until(deadline)
-				if left <= 0 {
-					c.result = porcupine.Unknown // out of time before it started
-					continue
-				}
-				c.result, c.info = porcupine.CheckOperationsVerbose(r.model, c.ops, left)
-				if c.result != porcupine.Illegal {
-					c.info = porcupine.LinearizationInfo{}
-				}
-				if c.result == porcupine.Ok && len(c.browses) > 0 {
-					c.checkBrowses(r.model, deadline)
-				}
-			}
-		}()
-	}
+	// First the bookings of every seat, then, in the time that is left, the
+	// browses of the seats whose bookings are linearizable: the browses
+	// never take time the verdict needs.
+	parallel(opt.Workers, checks, func(c *seatCheck) {
+		left := time.Until(deadline)
+		if left <= 0 {
+			c.result = porcupine.Unknown // out of time before it started
+			return
+		}
+		c.result, c.info = porcupine.CheckOperationsVerbose(r.model, c.ops, left)
+		if c.result != porcupine.Illegal {
+			c.info = porcupine.LinearizationInfo{}
+		}
+	})
+	var withBrowses []*seatCheck
 	for _, c := range checks {
-		jobs <- c
+		if c.result == porcupine.Ok && len(c.browses) > 0 {
+			withBrowses = append(withBrowses, c)
+		}
 	}
-	close(jobs)
-	wg.Wait()
+	parallel(opt.Workers, withBrowses, func(c *seatCheck) { c.checkBrowses(r.model, deadline) })
 
 	var bad []*seatCheck
 	staleListings := map[int]bool{}
@@ -745,6 +746,31 @@ func Check(h *loadgen.History, opt Options) *Report {
 	return r
 }
 
+// parallel runs f on every seat, workers at a time, and returns when all are
+// done.
+func parallel(workers int, checks []*seatCheck, f func(*seatCheck)) {
+	jobs := make(chan *seatCheck)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for c := range jobs {
+				f(c)
+			}
+		}()
+	}
+	for _, c := range checks {
+		jobs <- c
+	}
+	close(jobs)
+	wg.Wait()
+}
+
+// checkOperations checks the operations of one seat with its browses; a
+// variable so a test can make it slow.
+var checkOperations = porcupine.CheckOperationsTimeout
+
 // checkBrowses looks for the stale browses of a seat whose bookings are
 // linearizable. The seat is checked with every browse read added; only if
 // that fails are the browses added one at a time, in order of their calls,
@@ -756,7 +782,7 @@ func (c *seatCheck) checkBrowses(model porcupine.Model, deadline time.Time) {
 		if left <= 0 {
 			return porcupine.Unknown
 		}
-		return porcupine.CheckOperationsTimeout(model, ops, left)
+		return checkOperations(model, ops, left)
 	}
 	with := func(ops []porcupine.Operation, extra ...browseRead) []porcupine.Operation {
 		out := make([]porcupine.Operation, len(ops), len(ops)+len(extra))

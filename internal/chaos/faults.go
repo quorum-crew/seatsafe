@@ -60,6 +60,32 @@ func (k Kind) onCoordinator() bool {
 	return false
 }
 
+// CoordinatorPlan is a plan that targets the coordinator group with each of
+// kinds in turn. It is an error if any of them cannot target the
+// coordinator (quorum-loss, delay-shard, kill-router and rolling-restart are
+// shard or router faults): those runs could only be skipped.
+func CoordinatorPlan(kinds []Kind) ([]Step, error) {
+	var plan []Step
+	var cannot, can []string
+	for _, k := range kinds {
+		if k != None && !k.onCoordinator() {
+			cannot = append(cannot, string(k))
+			continue
+		}
+		plan = append(plan, Step{Kind: k, Target: TargetCoordinator})
+	}
+	if len(cannot) > 0 {
+		for _, k := range append(slices.Clone(AllKinds), Partition) {
+			if k.onCoordinator() {
+				can = append(can, string(k))
+			}
+		}
+		return nil, fmt.Errorf("faults %s cannot target the coordinator; with -target coordinator use -faults with some of %s, none",
+			strings.Join(cannot, ", "), strings.Join(can, ", "))
+	}
+	return plan, nil
+}
+
 // AllKinds lists every fault kind, in a stable order.
 var AllKinds = []Kind{KillLeader, KillFollower, IsolateLeader, IsolateFollower, PauseLeader, QuorumLoss, DelayShard, KillRouter, RollingRestart}
 

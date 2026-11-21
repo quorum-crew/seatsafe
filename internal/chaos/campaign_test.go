@@ -264,11 +264,13 @@ func TestCampaignSurvivesCrashes(t *testing.T) {
 	if r(1).P99 != 3*time.Millisecond || r(1).FreeMem != 4<<30 || r(1).CheckDetail != "1 seats, 4 operations, 0 browses" {
 		t.Fatalf("run 1: %+v", r(1))
 	}
-	// Resets: before run 1, after the run without an audit (3), three failed
-	// tries (5) and one that worked (6), after the panic (8), and the
-	// scheduled one before run 9.
-	if d.ups != 8 {
-		t.Fatalf("%d compose ups, want 8", d.ups)
+	// Resets: before run 1, after each of the failed runs 2 and 3 (before
+	// runs 3 and 4), three failed tries after the failed run 4 (5) and one
+	// that worked (6), after the panic (8), and the scheduled one before run
+	// 9. A run that did not pass may leave something behind that the next
+	// run's baseline would see, so the next run starts from a reset cluster.
+	if d.ups != 9 {
+		t.Fatalf("%d compose ups, want 9", d.ups)
 	}
 	if !strings.Contains(d.loadArgs, "-cross-shard-frac 0.2") || !strings.Contains(d.loadArgs, "-browse-rate 5") || !strings.Contains(d.loadArgs, "-workload flash") {
 		t.Fatalf("load generator arguments: %s", d.loadArgs)
@@ -340,5 +342,103 @@ func TestCheckTimeoutIsNotAPass(t *testing.T) {
 		if !strings.Contains(s, want) {
 			t.Fatalf("summary missing %q:\n%s", want, s)
 		}
+	}
+}
+
+// A fault that could not be injected never hides a failure: the run is SKIP
+// only if nothing else went wrong. cmd/chaos exits 0 for SKIP, so an
+// unattended campaign would not see the failure.
+func TestFailureIsNotHiddenBySkip(t *testing.T) {
+	for _, c := range []struct {
+		name                string
+		audit, linearizable string
+		want, reason        string
+	}{
+		{"audit failed", "audit FAIL: 3 orders", linearize.Pass, VerdictFail, "correctness audit failed; could not inject: coordinator has no leader to target"},
+		{"bookings not linearizable", "audit PASS: 3 orders", linearize.Fail, VerdictFail, "bookings are not linearizable: first bad seat e/s/a; could not inject: coordinator has no leader to target"},
+		{"check ran out of time", "audit PASS: 3 orders", linearize.Timeout, VerdictTimeout, "the linearizability check ran out of time: first bad seat e/s/a; could not inject: coordinator has no leader to target"},
+		{"nothing failed", "audit PASS: 3 orders", linearize.Pass, VerdictSkip, "could not inject: coordinator has no leader to target"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			r := blank(1)
+			r.Audit, r.Linearizable, r.CheckDetail = c.audit, c.linearizable, "first bad seat e/s/a"
+			r.InjectErr = "coordinator has no leader to target" // and no Fault: nothing was changed
+			r.decide(nil, nil, nil, nil)
+			if r.Verdict != c.want || r.Reason != c.reason {
+				t.Fatalf("verdict %s (%q), want %s (%q)", r.Verdict, r.Reason, c.want, c.reason)
+			}
+		})
+	}
+	// A fault that was injected in part: the run is decided as usual, with
+	// a note.
+	r := blank(1)
+	r.Audit, r.Linearizable, r.Fault, r.InjectErr = "audit PASS: 3 orders", linearize.Pass, "kill-leader shard 1", "restart: timeout"
+	if r.decide(nil, nil, nil, nil); r.Verdict != VerdictPass || r.Reason != "partial inject: restart: timeout" {
+		t.Fatalf("partial inject: %s %q", r.Verdict, r.Reason)
+	}
+}
+
+// -target coordinator takes only the faults the coordinator group can get.
+// With the default -faults all, four of the nine could only be skipped.
+func TestCoordinatorPlan(t *testing.T) {
+	_, err := CoordinatorPlan(AllKinds)
+	if err == nil {
+		t.Fatal("every fault kind accepted for the coordinator")
+	}
+	for _, k := range []Kind{QuorumLoss, DelayShard, KillRouter, RollingRestart} {
+		if !strings.Contains(err.Error(), string(k)) {
+			t.Fatalf("%v: does not name %s", err, k)
+		}
+	}
+	if strings.Contains(strings.SplitN(err.Error(), "cannot", 2)[0], string(KillLeader)) {
+		t.Fatalf("%v: names kill-leader as unsupported", err)
+	}
+
+	kinds := []Kind{KillLeader, KillFollower, IsolateLeader, IsolateFollower, PauseLeader, Partition, None}
+	plan, err := CoordinatorPlan(kinds)
+	if err != nil || len(plan) != len(kinds) {
+		t.Fatalf("%v, %v", plan, err)
+	}
+	for i, s := range plan {
+		if s.Kind != kinds[i] || s.Target != TargetCoordinator || (s.Kind != None && !s.Kind.onCoordinator()) {
+			t.Fatalf("step %d: %+v", i, s)
+		}
+	}
+}
+
+// A run starts only after the last run's holds can have been resolved: it
+// waits HoldDrain after the run before, unless the cluster is reset in
+// between (after a run that did not pass), which clears every hold.
+func TestCampaignWaitsForHolds(t *testing.T) {
+	const drain = time.Second
+	var starts []time.Time
+	d := &campaignDocker{fakeDocker: &fakeDocker{leader: 2}}
+	d.load = func(run int, dir string) (string, error) {
+		starts = append(starts, time.Now())
+		if run == 3 {
+			writeRun(t, dir, auditFail, goodHistory)
+			return "  audit FAIL: 3 orders\n", nil
+		}
+		writeRun(t, dir, auditPass, goodHistory)
+		return consolePass, nil
+	}
+	results, err := Campaign(context.Background(), &Cluster{Docker: d, Project: "seatsafe"}, Config{
+		Runs: 4, Kinds: []Kind{None}, HealTimeout: time.Second, Duration: time.Second, Linearizable: true,
+		HoldDrain: drain, Out: t.TempDir(), Logf: func(string, ...any) {},
+	})
+	if err != nil || len(results) != 4 || len(starts) != 4 {
+		t.Fatalf("%d results, %d loads, %v", len(results), len(starts), err)
+	}
+	if results[2].Verdict != VerdictFail {
+		t.Fatalf("run 3: %+v", results[2])
+	}
+	for i, want := range []bool{true, true, false} { // before runs 2, 3, 4
+		gap := starts[i+1].Sub(starts[i])
+		if waited := gap >= drain; waited != want {
+			t.Errorf("run %d started %v after run %d; want a wait of %v: %v", i+2, gap.Round(time.Millisecond), i+1, drain, want)
+		}
+	}
+	if d.ups != 2 {
+		t.Fatalf("%d compose ups, want 2 (before run 1, after the failed run 3)", d.ups)
 	}
 }

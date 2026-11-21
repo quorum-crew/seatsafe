@@ -70,11 +70,27 @@ type Config struct {
 	MemWait    time.Duration
 	FreeMem    func(ctx context.Context) (uint64, error) // default: Cluster.FreeMem (Docker's MemAvailable)
 
+	// HoldDrain is how long after a run the next one waits before its load
+	// starts, unless the cluster is reset in between (0 = no wait). A
+	// cross-shard order of the last run may have left a hold on a shard
+	// (an Abort that was lost, an order that was never answered); the shard
+	// resolves it with the coordinator once it expires. The next run's
+	// baseline must not see it: the model starts every seat free or booked,
+	// and a hold released during the run would look like a booked seat
+	// coming free. DefaultHoldDrain covers the default hold timing.
+	HoldDrain time.Duration
+
 	Out        string // host directory for results
 	Title      string // first lines of summary.md
 	StopOnFail bool
 	Logf       func(format string, args ...any)
 }
+
+// DefaultHoldDrain covers a hold's life with the default timing: it expires
+// after the coordinator's hold TTL (5 s, HOLD_TTL_MS), the shard's next
+// check finds it within a second plus jitter, and the coordinator answers
+// within the 2 s decide timeout.
+const DefaultHoldDrain = 9 * time.Second
 
 // Verdicts of a run.
 const (
@@ -186,20 +202,31 @@ func Campaign(ctx context.Context, c *Cluster, cfg Config) ([]Result, error) {
 	in := &Injector{C: c, Rand: rnd}
 	var results []Result
 	needReset := true
+	var lastEnd time.Time
 	for i := 1; i <= cfg.Runs && ctx.Err() == nil; i++ {
 		if cfg.ResetEvery > 0 && i > 1 && (i-1)%cfg.ResetEvery == 0 {
 			needReset = true
+		}
+		// A reset clears every hold; otherwise let the last run's holds be
+		// resolved before this run's baseline.
+		if wait := cfg.HoldDrain - time.Since(lastEnd); !needReset && i > 1 && wait > 0 {
+			cfg.Logf("run %d: waiting %s for the last run's holds to be resolved", i, wait.Round(100*time.Millisecond))
+			sleep(ctx, wait)
 		}
 		r := guarded(i, func() Result { return prepareAndRun(ctx, c, in, rnd, cfg, i, &needReset) })
 		if ctx.Err() != nil && r.Verdict != VerdictPass {
 			break // interrupted: the run says nothing
 		}
 		// After a run that did not finish normally the cluster is in an
-		// unknown state.
-		if r.Verdict == VerdictCrash || r.AuditRules == nil {
+		// unknown state. After any run that did not pass it may also hold
+		// something the next run's baseline would see, such as a hold of a
+		// cross-shard order that was never decided: start the next run
+		// clean.
+		if r.Verdict != VerdictPass || r.AuditRules == nil {
 			needReset = true
 		}
 		results = append(results, r)
+		lastEnd = time.Now()
 		cfg.Logf("run %d: %s  %s  failover %s  recovery %s  elections %d  client p99 %s max %s  bookings %s (%s)  %s  %s %s", i, r.Verdict, r.Fault,
 			secs(r.Failover), secs(r.Recovery), r.Elections, millis(r.P99), millis(r.Max), r.Linearizable, secs(r.CheckTime), r.staleLine(), r.Audit, r.Reason)
 		a := r.AuditRules
@@ -419,34 +446,7 @@ func runOnce(ctx context.Context, c *Cluster, in *Injector, rnd *rand.Rand, cfg 
 	}
 	writeFaultLog(dir, r, bad)
 
-	switch {
-	case r.Fault == "" && r.InjectErr != "":
-		r.Verdict, r.Reason = VerdictSkip, "could not inject: "+r.InjectErr
-	case strings.HasPrefix(r.Audit, "audit FAIL"):
-		r.Verdict, r.Reason = VerdictFail, "correctness audit failed"
-	case r.Audit == "":
-		r.Verdict, r.Reason = VerdictFail, "load generator gave no audit result: "+errString(ld.err)
-	case herr != nil:
-		r.Verdict, r.Reason = VerdictFail, "cluster did not heal: "+describe(bad)
-	case r.Reason != "":
-		r.Verdict = VerdictFail
-	case r.Linearizable == linearize.Fail:
-		r.Verdict, r.Reason = VerdictFail, "bookings are not linearizable: "+r.CheckDetail
-	case checkErr != nil:
-		r.Verdict, r.Reason = VerdictFail, "the linearizability check could not run: "+checkErr.Error()
-	case r.Linearizable == linearize.Timeout:
-		r.Verdict, r.Reason = VerdictTimeout, "the linearizability check ran out of time: "+r.CheckDetail
-	default:
-		r.Verdict = VerdictPass
-	}
-	// Bookings that are not linearizable are a failure whatever else failed.
-	// Stale browses are not: they are in the result and change nothing here.
-	if r.Linearizable == linearize.Fail && r.Verdict == VerdictFail && !strings.Contains(r.Reason, "not linearizable") {
-		r.Reason += "; bookings are not linearizable: " + r.CheckDetail
-	}
-	if r.InjectErr != "" && r.Verdict != VerdictSkip && r.Reason == "" {
-		r.Reason = "partial inject: " + r.InjectErr
-	}
+	r.decide(ld.err, herr, bad, checkErr)
 	if r.Verdict == VerdictFail {
 		// Keep the evidence: the next run may reset the cluster, which
 		// deletes the containers and their logs.
@@ -457,6 +457,52 @@ func runOnce(ctx context.Context, c *Cluster, in *Injector, rnd *rand.Rand, cfg 
 		cancel()
 	}
 	return r
+}
+
+// decide sets r.Verdict and r.Reason from what the run found: the load
+// generator's error, the cluster's health after the run (healErr, bad), and
+// whether the history check could run.
+//
+// A failure of any kind decides the run, whether or not the fault could be
+// injected: a run is SKIP only when nothing failed and no fault was
+// injected, and a TIMEOUT is reported as such.
+func (r *Result) decide(loadErr, healErr error, bad []ShardHealth, checkErr error) {
+	switch {
+	case strings.HasPrefix(r.Audit, "audit FAIL"):
+		r.Verdict, r.Reason = VerdictFail, "correctness audit failed"
+	case r.Audit == "":
+		r.Verdict, r.Reason = VerdictFail, "load generator gave no audit result: "+errString(loadErr)
+	case healErr != nil:
+		r.Verdict, r.Reason = VerdictFail, "cluster did not heal: "+describe(bad)
+	case r.Reason != "":
+		r.Verdict = VerdictFail
+	case r.Linearizable == linearize.Fail:
+		r.Verdict, r.Reason = VerdictFail, "bookings are not linearizable: "+r.CheckDetail
+	case checkErr != nil:
+		r.Verdict, r.Reason = VerdictFail, "the linearizability check could not run: "+checkErr.Error()
+	case r.Linearizable == linearize.Timeout:
+		r.Verdict, r.Reason = VerdictTimeout, "the linearizability check ran out of time: "+r.CheckDetail
+	case r.Fault == "" && r.InjectErr != "":
+		r.Verdict, r.Reason = VerdictSkip, "could not inject: "+r.InjectErr
+	default:
+		r.Verdict = VerdictPass
+	}
+	// Bookings that are not linearizable are a failure whatever else failed.
+	// Stale browses are not: they are in the result and change nothing here.
+	if r.Linearizable == linearize.Fail && r.Verdict == VerdictFail && !strings.Contains(r.Reason, "not linearizable") {
+		r.Reason += "; bookings are not linearizable: " + r.CheckDetail
+	}
+	// A fault that was not (fully) injected is noted on any other verdict.
+	if r.InjectErr != "" && r.Verdict != VerdictSkip {
+		note := "partial inject: "
+		if r.Fault == "" {
+			note = "could not inject: "
+		}
+		if r.Reason != "" {
+			note = "; " + note
+		}
+		r.Reason += note + r.InjectErr
+	}
 }
 
 // HistoryCheck is what the Porcupine check found in one run's history.

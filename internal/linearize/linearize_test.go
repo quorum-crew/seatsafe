@@ -437,6 +437,34 @@ func TestBrowseTimeout(t *testing.T) {
 	}
 }
 
+// The browses never take the time the bookings verdict needs. With one
+// worker and a browse check that uses up all the time it is given, seat a's
+// browses would leave nothing for seat x's bookings if they ran in turn (x
+// is checked after a, and has no browses); the bookings of every seat are
+// checked first, so the verdict is PASS and only a's browses are undecided.
+func TestBrowsesDoNotTakeTheBookingsTime(t *testing.T) {
+	old := checkOperations
+	defer func() { checkOperations = old }()
+	checkOperations = func(_ porcupine.Model, _ []porcupine.Operation, timeout time.Duration) porcupine.CheckResult {
+		time.Sleep(timeout)
+		return porcupine.Unknown
+	}
+	b := new(hb).list(baseline, -20, -10, "e/s1", "a", "b").
+		order("o1", 10, 20, confirmed, one(seatA)).
+		list(browse, 30, 40, "e/s1", "a", "b"). // stale for a
+		list(baseline, -20, -10, "e/s2", "x").
+		order("o2", 50, 60, confirmed, one(seatX)).
+		list(final, 70, 80, "e/s1", "b").
+		list(final, 70, 80, "e/s2")
+	r := Check(&b.h, Options{Timeout: 300 * time.Millisecond, Workers: 1})
+	if r.Verdict() != Pass || len(r.TimedOut) != 0 {
+		t.Fatalf("bookings verdict %s (timed out: %v), want PASS: the browse check took the bookings' time", r.Verdict(), r.TimedOut)
+	}
+	if !reflect.DeepEqual(r.BrowseUndecided, []string{seatA}) || r.StaleBrowses != 0 {
+		t.Fatalf("%s; undecided %v", r.StaleLine(), r.BrowseUndecided)
+	}
+}
+
 func TestNoBrowsesOption(t *testing.T) {
 	b := new(hb).list(baseline, -20, -10, "e/s1", "a").
 		order("o1", 10, 20, confirmed, one(seatA)).

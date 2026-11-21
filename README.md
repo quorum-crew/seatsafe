@@ -116,8 +116,10 @@ go run ./cmd/chaos -campaign -runs 20   # the same, with a local Go
 The runs go through kill-leader, pause-leader, partition and a no-fault
 control in turn, the faults alternating between a shard and the coordinator,
 with a fifth of the orders cross-shard and a few browses per second. The
-cluster is wiped every 5 runs, after a run that did not finish, and when less
-than 3 GiB of memory is free before a run. A run that breaks (the cluster
+cluster is wiped every 5 runs, after any run that did not pass, and when less
+than 3 GiB of memory is free before a run; otherwise the next run waits 9 s
+(`-hold-drain`), so that any hold a cross-shard order left behind is
+resolved before the next baseline. A run that breaks (the cluster
 does not come up, the load generator dies) is recorded as `CRASH` or `FAIL`
 and the campaign carries on. `summary.md` is rewritten after every run with
 one row per run (fault, target, failover, the audit's rules a to e, the
