@@ -107,6 +107,7 @@ func run() error {
 	node, err := raftnode.Start(raftnode.Config{
 		ID: raftID, Peers: ids, SM: coordinator.Applier{SM: machine}, Transport: tr, Store: store,
 		TickInterval: cfg.tick, ElectionTicks: cfg.election, HeartbeatTicks: cfg.heartbeat,
+		DisableLeaderSendFirst: !cfg.sendFirst, DisableEarlyApply: !cfg.earlyApply,
 	})
 	if err != nil {
 		return err
@@ -218,9 +219,12 @@ type config struct {
 	tick                time.Duration
 	election, heartbeat int
 	holdTTL, retention  time.Duration
+	// The two Ready loop changes in raftnode, on unless turned off.
+	sendFirst, earlyApply bool
 }
 
-// configFromEnv reads the Raft timing, HOLD_TTL_MS and GC_RETENTION_MS.
+// configFromEnv reads the Raft timing, HOLD_TTL_MS, GC_RETENTION_MS,
+// RAFT_LEADER_SEND_FIRST and RAFT_EARLY_APPLY.
 func configFromEnv() (config, error) {
 	var c config
 	var err error
@@ -243,6 +247,15 @@ func configFromEnv() (config, error) {
 	c.heartbeat = ticks("RAFT_HEARTBEAT_TICKS", defaultHeartbeatTicks)
 	c.holdTTL = ms("HOLD_TTL_MS", int(coordinator.DefaultHoldTTL/time.Millisecond))
 	c.retention = ms("GC_RETENTION_MS", int(coordinator.DefaultGCRetention/time.Millisecond))
+	flag := func(key string) bool {
+		var b bool
+		if err == nil {
+			b, err = boolEnv(key, true)
+		}
+		return b
+	}
+	c.sendFirst = flag("RAFT_LEADER_SEND_FIRST")
+	c.earlyApply = flag("RAFT_EARLY_APPLY")
 	if err != nil {
 		return config{}, err
 	}
@@ -250,6 +263,18 @@ func configFromEnv() (config, error) {
 		return config{}, fmt.Errorf("RAFT_ELECTION_TICKS (%d) must be greater than RAFT_HEARTBEAT_TICKS (%d)", c.election, c.heartbeat)
 	}
 	return c, nil
+}
+
+func boolEnv(key string, def bool) (bool, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("%s must be true or false, got %q", key, v)
+	}
+	return b, nil
 }
 
 func positiveIntEnv(key string, def int) (int, error) {
