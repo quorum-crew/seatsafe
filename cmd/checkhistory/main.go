@@ -17,6 +17,11 @@
 // are printed and Porcupine's visualization of that seat is written next to
 // the history, as <history>.linearizability.html.
 //
+// A history merged from several load generator machines has times from clocks
+// that differ by a few milliseconds. -widen-ms N allows for that: the
+// real-time-order check and the linearizability check then treat every call
+// as N ms earlier and every return as N ms later.
+//
 // Exit code 1 means a check failed. Exit code 3 means that nothing failed but
 // the bookings check ran out of time (-timeout) before it could decide every
 // seat: that is not a pass. Stale browses do not change the exit code.
@@ -27,6 +32,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/quorum-crew/seatsafe/internal/linearize"
 	"github.com/quorum-crew/seatsafe/internal/loadgen"
@@ -41,8 +47,9 @@ func run(args []string) int {
 	linearizable := fs.Bool("linearizable", false, "also check linearizability with Porcupine, seat by seat: the bookings (the verdict) and, reported separately, stale browses")
 	timeout := fs.Duration("timeout", linearize.DefaultTimeout, "-linearizable: time allowed for the whole check; running out is reported as TIMEOUT, not as a pass")
 	noBrowses := fs.Bool("no-browses", false, "-linearizable: do not look for stale browses (the bookings verdict never uses them)")
+	widenMs := fs.Float64("widen-ms", 0, "clock skew to allow for, in ms (may have a fraction): the real-time-order check and -linearizable treat every call as this much earlier and every return as this much later")
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: checkhistory [-linearizable] [-timeout 1m] [-no-browses] history.jsonl")
+		fmt.Fprintln(fs.Output(), "usage: checkhistory [-linearizable] [-timeout 1m] [-no-browses] [-widen-ms 0] history.jsonl")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -52,6 +59,11 @@ func run(args []string) int {
 		fs.Usage()
 		return 2
 	}
+	if *widenMs < 0 || *widenMs > 3600e3 {
+		fmt.Fprintln(os.Stderr, "checkhistory: -widen-ms must be between 0 and an hour")
+		return 2
+	}
+	widen := time.Duration(*widenMs * float64(time.Millisecond))
 	path := fs.Arg(0)
 	f, err := os.Open(path)
 	if err != nil {
@@ -66,7 +78,13 @@ func run(args []string) int {
 	}
 	code := 0
 	for _, c := range loadgen.Checks {
-		v := c.Run(history.Attempts)
+		attempts, note := history.Attempts, ""
+		if widen > 0 && c.Name == "real-time-order" {
+			// The only one of these checks that compares times of
+			// different orders, which may be from different machines.
+			attempts, note = loadgen.Widen(attempts, widen), fmt.Sprintf(" (widened by %v)", widen)
+		}
+		v := c.Run(attempts)
 		verdict := "PASS"
 		if len(v) > 0 {
 			verdict, code = "FAIL", 1
@@ -74,7 +92,7 @@ func run(args []string) int {
 				verdict = c.Verdict
 			}
 		}
-		fmt.Printf("%s: %s, %d violations, %d attempts\n", c.Name, verdict, len(v), len(history.Attempts))
+		fmt.Printf("%s: %s, %d violations, %d attempts%s\n", c.Name, verdict, len(v), len(history.Attempts), note)
 		for i, x := range v {
 			if i == 20 {
 				fmt.Printf("  ... and %d more\n", len(v)-i)
@@ -87,7 +105,7 @@ func run(args []string) int {
 		return code
 	}
 
-	r := linearize.Check(history, linearize.Options{Timeout: *timeout, NoBrowses: *noBrowses})
+	r := linearize.Check(history, linearize.Options{Timeout: *timeout, NoBrowses: *noBrowses, Widen: widen})
 	fmt.Printf("bookings: %s\n", r)
 	if len(history.Listings) == 0 {
 		fmt.Println("  the history has no listings (no baseline, browses or final read): only the orders were checked against each other")

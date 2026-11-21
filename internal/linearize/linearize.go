@@ -64,6 +64,19 @@
 // names that seat), and an order counts as cross-shard when its seats are in
 // more than one section.
 //
+// # Clock skew
+//
+// A history merged from several load generator machines ("loadgen merge") has
+// times from clocks that differ by a few milliseconds, so an operation that
+// really came after another can look as if it came before it. Options.Widen
+// allows for that: every operation's call is moved earlier and its return
+// later by that much (orders, from first call to last return, and every
+// listing, the baseline and the final read included). Set it to more than the
+// largest difference between the clocks. Widening only lets operations that
+// are close in time be ordered either way; it removes no operation and
+// changes no answer, so a seat CONFIRMED for two orders fails whatever the
+// widening, as does anything else that no ordering explains.
+//
 // # Timeouts
 //
 // Checking linearizability is NP-hard. Options.Timeout bounds the whole
@@ -395,6 +408,10 @@ type Options struct {
 	NoBrowses bool
 	// Workers is how many seats are checked at once; 0 means one per CPU.
 	Workers int
+	// Widen moves every operation's call earlier and its return later by
+	// this much, for a history whose times come from several machines' clocks
+	// (see "Clock skew" in the package doc). 0 for a history from one machine.
+	Widen time.Duration
 }
 
 // DefaultTimeout bounds a check that was not given a timeout.
@@ -421,6 +438,7 @@ type Report struct {
 	BrowseUndecided []string // seats whose browses were not decided within the timeout, by name
 
 	Elapsed time.Duration
+	Widen   time.Duration // Options.Widen, when it was applied
 
 	first      *seatCheck // the first illegal seat
 	firstStale *seatCheck // the first seat with a stale browse
@@ -466,8 +484,12 @@ func Sample(names []string) string {
 
 // String is a one-line summary of the bookings verdict.
 func (r *Report) String() string {
-	return fmt.Sprintf("%s: %d seats (%d operations) from %d orders (%d UNKNOWN, %d cross-shard) and %d listings (%d browses); %d not linearizable, %d timed out; %.2fs",
+	s := fmt.Sprintf("%s: %d seats (%d operations) from %d orders (%d UNKNOWN, %d cross-shard) and %d listings (%d browses); %d not linearizable, %d timed out; %.2fs",
 		r.Verdict(), r.Seats, r.Operations, r.Orders, r.Unknown, r.Cross, r.Listings, r.Browses, len(r.Illegal), len(r.TimedOut), r.Elapsed.Seconds())
+	if r.Widen > 0 {
+		s += fmt.Sprintf("; widened by %v", r.Widen)
+	}
+	return s
 }
 
 // Visualize writes Porcupine's HTML visualization of the first seat that is
@@ -560,9 +582,13 @@ func Check(h *loadgen.History, opt Options) *Report {
 	}
 	deadline := start.Add(opt.Timeout)
 
+	widen := max(opt.Widen, 0).Nanoseconds()
 	all := orders(h.Attempts)
+	for _, o := range all {
+		o.call, o.ret = o.call-widen, o.ret+widen
+	}
 	requests := make([]string, len(all))
-	r := &Report{Orders: len(all)}
+	r := &Report{Orders: len(all), Widen: max(opt.Widen, 0)}
 
 	// The end of the history: after everything in it. Operations that may
 	// take effect at any later time return here.
@@ -576,6 +602,7 @@ func Check(h *loadgen.History, opt Options) *Report {
 		if opt.NoBrowses && l.Phase == loadgen.PhaseBrowse {
 			continue
 		}
+		l.CallNs, l.ReturnNs = l.CallNs-widen, l.ReturnNs+widen
 		listings = append(listings, l)
 		end = max(end, l.ReturnNs)
 		r.Listings++
