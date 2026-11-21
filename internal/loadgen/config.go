@@ -64,6 +64,9 @@ type Config struct {
 	OrderSizes     string  `json:"order_sizes"`
 	CrossShardFrac float64 `json:"cross_shard_frac"`
 	Seed           uint64  `json:"seed"`
+	// BrowseRate is ListAvailableSeats calls per second during the load, each
+	// for one section; 0 for none. They are written to the history.
+	BrowseRate float64 `json:"browse_rate,omitempty"`
 
 	// Client behavior.
 	CallTimeout time.Duration `json:"call_timeout_ns"`
@@ -124,6 +127,9 @@ func (c Config) Validate() error {
 	}
 	if c.Conns < 1 || c.MaxInflight < 1 {
 		return errors.New("loadgen: -conns and -max-inflight must be positive")
+	}
+	if c.BrowseRate < 0 {
+		return errors.New("loadgen: -browse-rate must not be negative")
 	}
 	if c.CrossShardFrac < 0 || c.CrossShardFrac > 1 {
 		return errors.New("loadgen: -cross-shard-frac must be between 0 and 1")

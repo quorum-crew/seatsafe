@@ -46,6 +46,7 @@ func main() {
 	flag.StringVar(&c.OrderSizes, "order-sizes", c.OrderSizes, "seats per order as size:weight,...")
 	flag.Float64Var(&c.CrossShardFrac, "cross-shard-frac", c.CrossShardFrac, "fraction of orders across two shards (needs the real coordinator)")
 	flag.Uint64Var(&c.Seed, "seed", c.Seed, "random seed for picking seats")
+	flag.Float64Var(&c.BrowseRate, "browse-rate", c.BrowseRate, "ListAvailableSeats calls per second during the load, written to the history (0 = none)")
 	flag.DurationVar(&c.CallTimeout, "call-timeout", c.CallTimeout, "deadline per call")
 	flag.DurationVar(&c.RetryBudget, "retry-budget", c.RetryBudget, "time an order may keep retrying")
 	flag.StringVar(&c.Out, "out", "", "output directory (default results/<timestamp>-<label>)")

@@ -159,7 +159,7 @@ func (c *Client) Book(clientID uint64, o Order) Result {
 		cancel()
 		code := status.Code(err)
 		if c.History != nil {
-			c.History.Write(clientID, req.RequestId, o.Seats, callAt, res.Return, resp, code)
+			c.History.Write(clientID, req.RequestId, o, callAt, res.Return, resp, code)
 		}
 		switch code {
 		case codes.OK:

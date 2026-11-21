@@ -1,7 +1,10 @@
 // Package chaos injects faults into the Docker Compose cluster while the load
 // generator runs, and checks after every run that no seat was double-booked
-// (the load generator's audit) and that every shard healed: a leader, all
-// three replicas back, and all of them at the same applied index.
+// (the load generator's audit), that the run's bookings are linearizable
+// (internal/linearize, a Porcupine model of one seat; stale browses are
+// reported separately and do not fail a run) and that every Raft
+// group healed: a leader, all three replicas back, and all of them at the
+// same applied index.
 //
 // Faults are done with the Docker CLI only, so the same tool works on Linux,
 // macOS and Windows hosts: docker kill/start (crash and restart), docker
@@ -49,6 +52,21 @@ var (
 	NodeIDs  = []int{1, 2, 3} // Raft ID = position in PEERS = node number
 )
 
+// CoordinatorGroup is the group number of the 2PC coordinator's Raft group
+// (Raft group 0). Shards are groups 1, 2, 3.
+const CoordinatorGroup = 0
+
+// GroupIDs lists every Raft group: the coordinator, then the shards.
+func GroupIDs() []int { return append([]int{CoordinatorGroup}, ShardIDs...) }
+
+// GroupName is "coordinator" or "shard N".
+func GroupName(group int) string {
+	if group == CoordinatorGroup {
+		return "coordinator"
+	}
+	return fmt.Sprintf("shard %d", group)
+}
+
 // Cluster is the Compose project the faults are injected into.
 type Cluster struct {
 	Docker  Docker
@@ -56,8 +74,14 @@ type Cluster struct {
 	Files   []string // compose files, e.g. docker-compose.yml
 }
 
-// Service names a storage node's Compose service.
-func Service(shard, node int) string { return fmt.Sprintf("shard%d-node%d", shard, node) }
+// Service names the Compose service of one node of a group: a storage node,
+// or a coordinator node for CoordinatorGroup.
+func Service(group, node int) string {
+	if group == CoordinatorGroup {
+		return fmt.Sprintf("coord-%d", node)
+	}
+	return fmt.Sprintf("shard%d-node%d", group, node)
+}
 
 // Container is the container name Compose gives a service.
 func (c *Cluster) Container(service string) string { return c.Project + "-" + service + "-1" }
@@ -134,9 +158,9 @@ func (c *Cluster) Leader(ctx context.Context, shard int) int {
 	return 0
 }
 
-// ShardHealth is what WaitHealed found for one shard.
+// ShardHealth is what WaitHealed found for one Raft group.
 type ShardHealth struct {
-	Shard   int
+	Shard   int // group number: a shard id, or CoordinatorGroup
 	Leader  int
 	Applied []uint64 // per node; equal when converged
 	Err     string   // why it is not healed, if it isn't
@@ -172,14 +196,15 @@ func (c *Cluster) shardHealth(ctx context.Context, shard int) ShardHealth {
 	return h
 }
 
-// WaitHealed waits up to timeout for every shard to be healthy and returns
-// how long it took, or the shards that never healed.
+// WaitHealed waits up to timeout for every Raft group (the shards and the
+// coordinator) to be healthy and returns how long it took, or the groups
+// that never healed.
 func (c *Cluster) WaitHealed(ctx context.Context, timeout time.Duration) (time.Duration, []ShardHealth, error) {
 	start := time.Now()
 	deadline := start.Add(timeout)
 	for {
 		var bad []ShardHealth
-		for _, s := range ShardIDs {
+		for _, s := range GroupIDs() {
 			if h := c.shardHealth(ctx, s); h.Err != "" {
 				bad = append(bad, h)
 			}
@@ -188,7 +213,7 @@ func (c *Cluster) WaitHealed(ctx context.Context, timeout time.Duration) (time.D
 			return time.Since(start), nil, nil
 		}
 		if time.Now().After(deadline) || ctx.Err() != nil {
-			return time.Since(start), bad, fmt.Errorf("%d shard(s) not healed after %v", len(bad), timeout)
+			return time.Since(start), bad, fmt.Errorf("%d group(s) not healed after %v", len(bad), timeout)
 		}
 		select {
 		case <-ctx.Done():
@@ -224,11 +249,11 @@ func (c *Cluster) agreedLeader(ctx context.Context, shard int, exclude []string)
 	return leader
 }
 
-// Terms returns each shard's current Raft term (the highest any of its nodes
-// reports). ok is false if a shard has no reachable node.
+// Terms returns each Raft group's current term (the highest any of its nodes
+// reports). ok is false if a group has no reachable node.
 func (c *Cluster) Terms(ctx context.Context) (map[int]uint64, bool) {
 	terms := map[int]uint64{}
-	for _, s := range ShardIDs {
+	for _, s := range GroupIDs() {
 		found := false
 		for _, n := range NodeIDs {
 			if m, err := c.Metrics(ctx, Service(s, n)); err == nil {

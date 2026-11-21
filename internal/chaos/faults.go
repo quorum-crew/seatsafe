@@ -25,6 +25,12 @@ const (
 	KillRouter      Kind = "kill-router"      // SIGKILL the stateless router, restart it later
 	RollingRestart  Kind = "rolling-restart"  // restart a shard's nodes one after another
 
+	// Partition cuts the current leader of the chosen group (a shard or the
+	// coordinator) off the network with docker network disconnect and
+	// reconnects it when the fault is healed. On a shard it is what
+	// isolate-leader does. Not part of "all".
+	Partition Kind = "partition"
+
 	// None injects nothing: a control run under the same load, to count
 	// elections nobody caused. Not part of "all".
 	None Kind = "none"
@@ -33,7 +39,51 @@ const (
 // RemovesLeader reports whether the fault takes the shard's leader away, so
 // the rest of the group has to elect a new one (a failover).
 func (k Kind) RemovesLeader() bool {
-	return k == KillLeader || k == IsolateLeader || k == PauseLeader
+	return k == KillLeader || k == IsolateLeader || k == PauseLeader || k == Partition
+}
+
+// Target says which kind of Raft group a fault goes to.
+type Target string
+
+const (
+	TargetShard       Target = "shard"       // one of the shards, picked at random
+	TargetCoordinator Target = "coordinator" // the coordinator group
+)
+
+// onCoordinator reports whether the fault can be aimed at the coordinator
+// group: the ones that act on one node of a group.
+func (k Kind) onCoordinator() bool {
+	switch k {
+	case KillLeader, KillFollower, IsolateLeader, IsolateFollower, PauseLeader, Partition:
+		return true
+	}
+	return false
+}
+
+// CoordinatorPlan is a plan that targets the coordinator group with each of
+// kinds in turn. It is an error if any of them cannot target the
+// coordinator (quorum-loss, delay-shard, kill-router and rolling-restart are
+// shard or router faults): those runs could only be skipped.
+func CoordinatorPlan(kinds []Kind) ([]Step, error) {
+	var plan []Step
+	var cannot, can []string
+	for _, k := range kinds {
+		if k != None && !k.onCoordinator() {
+			cannot = append(cannot, string(k))
+			continue
+		}
+		plan = append(plan, Step{Kind: k, Target: TargetCoordinator})
+	}
+	if len(cannot) > 0 {
+		for _, k := range append(slices.Clone(AllKinds), Partition) {
+			if k.onCoordinator() {
+				can = append(can, string(k))
+			}
+		}
+		return nil, fmt.Errorf("faults %s cannot target the coordinator; with -target coordinator use -faults with some of %s, none",
+			strings.Join(cannot, ", "), strings.Join(can, ", "))
+	}
+	return plan, nil
 }
 
 // AllKinds lists every fault kind, in a stable order.
@@ -47,8 +97,8 @@ func ParseKinds(s string) ([]Kind, error) {
 	var out []Kind
 	for _, p := range strings.Split(s, ",") {
 		k := Kind(strings.TrimSpace(p))
-		if !slices.Contains(AllKinds, k) && k != None {
-			return nil, fmt.Errorf("unknown fault %q (known: %v, none)", k, AllKinds)
+		if !slices.Contains(AllKinds, k) && k != None && k != Partition {
+			return nil, fmt.Errorf("unknown fault %q (known: %v, partition, none)", k, AllKinds)
 		}
 		out = append(out, k)
 	}
@@ -58,18 +108,37 @@ func ParseKinds(s string) ([]Kind, error) {
 // Fault is one injected fault. Heal undoes it; it is safe to call more than
 // once and after a failed Inject.
 type Fault struct {
-	Kind    Kind
-	Shard   int      // 0 for the router
-	Targets []string // compose services affected
-	Detail  string   // e.g. "delay 120ms±30ms"
+	Kind        Kind
+	Shard       int      // 0 for the router and for the coordinator
+	Coordinator bool     // the fault is in the coordinator group
+	Targets     []string // compose services affected
+	Detail      string   // e.g. "delay 120ms±30ms"
 
 	heal func(ctx context.Context) error
 }
 
+// Group returns the Raft group the fault is in. ok is false for a fault
+// outside every group (the router, none).
+func (f *Fault) Group() (group int, ok bool) {
+	if f.Coordinator {
+		return CoordinatorGroup, true
+	}
+	return f.Shard, f.Shard != 0
+}
+
+// TargetName is "shard N", "coordinator", or "-" for a fault outside every
+// group.
+func (f *Fault) TargetName() string {
+	if g, ok := f.Group(); ok {
+		return GroupName(g)
+	}
+	return "-"
+}
+
 func (f *Fault) String() string {
 	s := string(f.Kind)
-	if f.Shard != 0 {
-		s += fmt.Sprintf(" shard %d", f.Shard)
+	if g, ok := f.Group(); ok {
+		s += " " + GroupName(g)
 	}
 	s += " " + strings.Join(f.Targets, ",")
 	if f.Detail != "" {
@@ -92,20 +161,35 @@ type Injector struct {
 	Rand *rand.Rand
 }
 
-// Inject picks a target for kind and applies the fault. The returned Fault is
-// non-nil whenever something may have been changed, even with an error, so
-// the caller can always Heal it.
+// Inject picks a shard for kind and applies the fault there.
 func (in *Injector) Inject(ctx context.Context, kind Kind) (*Fault, error) {
+	return in.InjectAt(ctx, kind, TargetShard)
+}
+
+// InjectAt picks a target for kind in a shard or in the coordinator group
+// and applies the fault. The returned Fault is non-nil whenever something may
+// have been changed, even with an error, so the caller can always Heal it.
+func (in *Injector) InjectAt(ctx context.Context, kind Kind, target Target) (*Fault, error) {
 	shard := ShardIDs[in.Rand.IntN(len(ShardIDs))]
 	f := &Fault{Kind: kind, Shard: shard}
 	if kind == None {
 		f.Shard = 0
 		return f, nil
 	}
+	switch target {
+	case TargetShard, "":
+	case TargetCoordinator:
+		if !kind.onCoordinator() {
+			return nil, fmt.Errorf("fault %q cannot target the coordinator", kind)
+		}
+		shard, f.Shard, f.Coordinator = CoordinatorGroup, 0, true
+	default:
+		return nil, fmt.Errorf("unknown target %q", target)
+	}
 	pickLeader := func() (int, error) {
 		l := in.C.Leader(ctx, shard)
 		if l == 0 {
-			return 0, fmt.Errorf("shard %d has no leader to target", shard)
+			return 0, fmt.Errorf("%s has no leader to target", GroupName(shard))
 		}
 		return l, nil
 	}
@@ -120,7 +204,7 @@ func (in *Injector) Inject(ctx context.Context, kind Kind) (*Fault, error) {
 	}
 
 	switch kind {
-	case KillLeader, KillFollower, PauseLeader, IsolateLeader, IsolateFollower:
+	case KillLeader, KillFollower, PauseLeader, IsolateLeader, IsolateFollower, Partition:
 		l, err := pickLeader()
 		if err != nil {
 			return nil, err

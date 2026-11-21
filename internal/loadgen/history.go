@@ -25,6 +25,50 @@ type Attempt struct {
 	Outcome   string   `json:"outcome"`   // empty when the call returned an error
 	Replayed  bool     `json:"replayed"`
 	Code      string   `json:"code"` // gRPC code
+	// Unavailable lists the seats a SEAT_UNAVAILABLE answer named. Histories
+	// written before this field existed do not have it.
+	Unavailable []string `json:"unavailable_seats,omitempty"`
+	// Cross says whether the order's seats are on two or more shards (it went
+	// through 2PC). Nil in histories written before this field existed.
+	Cross *bool `json:"cross,omitempty"`
+}
+
+// Phases of a Listing.
+const (
+	PhaseBaseline = "baseline" // before the first order was sent
+	PhaseBrowse   = "browse"   // while orders were running
+	PhaseFinal    = "final"    // after the last order was answered (the audit's last read)
+)
+
+// Listing is a history line with "kind":"list": one answered
+// ListAvailableSeats call for one section, with every seat it listed as free.
+// A seat of that section it did not list was not free.
+type Listing struct {
+	Phase    string   `json:"phase"`
+	Event    string   `json:"event"`
+	Section  string   `json:"section"`
+	Free     []string `json:"free"`      // seat ids
+	CallNs   int64    `json:"call_ns"`   // from the start of the run; negative for the baseline
+	ReturnNs int64    `json:"return_ns"` // from the start of the run
+}
+
+// History is everything in a history.jsonl.
+type History struct {
+	Attempts []Attempt
+	Listings []Listing // empty in histories written before listings were recorded
+}
+
+// kindList marks a Listing line. Attempt lines have no kind.
+const kindList = "list"
+
+// line is the union of both kinds of history line.
+type line struct {
+	Kind string `json:"kind,omitempty"`
+	Attempt
+	Phase   string   `json:"phase,omitempty"`
+	Event   string   `json:"event,omitempty"`
+	Section string   `json:"section,omitempty"`
+	Free    []string `json:"free,omitempty"`
 }
 
 // HistoryWriter appends attempts to history.jsonl. Safe for concurrent use.
@@ -46,26 +90,50 @@ func NewHistoryWriter(path string, base time.Time) (*HistoryWriter, error) {
 	return &HistoryWriter{f: f, w: bufio.NewWriterSize(f, 1<<20), base: base}, nil
 }
 
-// Write records one call.
-func (h *HistoryWriter) Write(clientID uint64, requestID string, seats []Seat, call, ret time.Time, resp *seatsafev1.BookSeatsResponse, code codes.Code) {
-	a := Attempt{ClientID: clientID, RequestID: requestID, Seats: make([]string, len(seats)),
-		CallNs: call.Sub(h.base).Nanoseconds(), ReturnNs: ret.Sub(h.base).Nanoseconds(), Code: code.String()}
-	for i, s := range seats {
+// Write records one call of order o.
+func (h *HistoryWriter) Write(clientID uint64, requestID string, o Order, call, ret time.Time, resp *seatsafev1.BookSeatsResponse, code codes.Code) {
+	cross := o.Cross
+	a := Attempt{ClientID: clientID, RequestID: requestID, Seats: make([]string, len(o.Seats)),
+		CallNs: call.Sub(h.base).Nanoseconds(), ReturnNs: ret.Sub(h.base).Nanoseconds(), Code: code.String(), Cross: &cross}
+	for i, s := range o.Seats {
 		a.Seats[i] = s.String()
 	}
 	if code == codes.OK {
 		a.Outcome, a.Replayed = outcomeOf(resp.GetOutcome()), resp.GetReplayed()
+		for _, r := range resp.GetUnavailableSeats() {
+			a.Unavailable = append(a.Unavailable, Seat{r.GetEventId(), r.GetSectionId(), r.GetSeatId()}.String())
+		}
 	}
-	line, err := json.Marshal(a)
+	b, err := json.Marshal(a)
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.put(b, err)
+	h.count++
+}
+
+// WriteListing records one answered ListAvailableSeats call. Listings are not
+// counted by Close.
+func (h *HistoryWriter) WriteListing(phase string, s Section, free []string, call, ret time.Time) {
+	if free == nil {
+		free = []string{}
+	}
+	b, err := json.Marshal(struct {
+		Kind string `json:"kind"`
+		Listing
+	}{kindList, Listing{phase, s.Event, s.ID, free, call.Sub(h.base).Nanoseconds(), ret.Sub(h.base).Nanoseconds()}})
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.put(b, err)
+}
+
+// put appends one line. The caller holds h.mu.
+func (h *HistoryWriter) put(b []byte, err error) {
 	if err == nil {
-		_, err = h.w.Write(append(line, '\n'))
+		_, err = h.w.Write(append(b, '\n'))
 	}
 	if err != nil && h.err == nil {
 		h.err = err
 	}
-	h.count++
 }
 
 // Close flushes the file and reports the first write error.
@@ -81,19 +149,36 @@ func (h *HistoryWriter) Close() (int64, error) {
 	return h.count, h.err
 }
 
-// ReadHistory reads history.jsonl.
+// ReadHistory reads the attempts of a history.jsonl, skipping listings.
 func ReadHistory(r io.Reader) ([]Attempt, error) {
-	var out []Attempt
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 1<<20), 1<<24)
-	for line := 1; sc.Scan(); line++ {
-		var a Attempt
-		if err := json.Unmarshal(sc.Bytes(), &a); err != nil {
-			return nil, fmt.Errorf("loadgen: history line %d: %w", line, err)
-		}
-		out = append(out, a)
+	h, err := ReadFullHistory(r)
+	if err != nil {
+		return nil, err
 	}
-	return out, sc.Err()
+	return h.Attempts, nil
+}
+
+// ReadFullHistory reads a history.jsonl: attempts and listings. A file
+// written before listings existed gives attempts only.
+func ReadFullHistory(r io.Reader) (*History, error) {
+	h := &History{}
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 1<<20), 1<<28)
+	for n := 1; sc.Scan(); n++ {
+		var l line
+		if err := json.Unmarshal(sc.Bytes(), &l); err != nil {
+			return nil, fmt.Errorf("loadgen: history line %d: %w", n, err)
+		}
+		switch l.Kind {
+		case "":
+			h.Attempts = append(h.Attempts, l.Attempt)
+		case kindList:
+			h.Listings = append(h.Listings, Listing{l.Phase, l.Event, l.Section, l.Free, l.CallNs, l.ReturnNs})
+		default:
+			return nil, fmt.Errorf("loadgen: history line %d: unknown kind %q", n, l.Kind)
+		}
+	}
+	return h, sc.Err()
 }
 
 // Violation is one broken rule, found offline.
@@ -107,20 +192,18 @@ type Violation struct {
 type Check struct {
 	Name string
 	Run  func([]Attempt) []Violation
+	// Verdict is what a history with violations is called; "" means FAIL.
+	Verdict string
 }
 
 // Checks are what cmd/checkhistory runs, in order.
 //
-// To add linearizability checking, write a Porcupine model of one seat
-// (state: free or booked by a request_id; operations: book returning CONFIRMED
-// or SEAT_UNAVAILABLE), turn each order's attempts into one operation with
-// porcupine.Operation{ClientId, Input, Call, Output, Return} using its first
-// call_ns and final return_ns, keep the seats of multi-seat orders together
-// with a partition by seat, treat orders with no final outcome as open-ended,
-// and append a Check here that calls porcupine.CheckOperations per seat.
+// The linearizability check (a Porcupine model of one seat) is in
+// internal/linearize; cmd/checkhistory -linearizable runs it.
 var Checks = []Check{
-	{"no-double-booking", CheckNoDoubleBooking},
-	{"real-time-order", CheckRealTime},
+	{Name: "no-double-booking", Run: CheckNoDoubleBooking},
+	{Name: "real-time-order", Run: CheckRealTime},
+	{Name: "idempotency", Run: CheckIdempotency, Verdict: VerdictIdempotency},
 }
 
 // confirmed is one order confirmed for one seat.
