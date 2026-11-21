@@ -423,6 +423,9 @@ func TestAppliesPersistedEntriesBeforeSave(t *testing.T) {
 	if got := result(t, resA, "a (committed, persisted) was not applied while the Save of b was blocked"); got != 2 {
 		t.Fatalf("a applied at position %d, want 2", got)
 	}
+	// The result is delivered before the applied index is stored, so the
+	// index can lag the result by a moment.
+	eventually(t, "the leader's applied index to reach a", func() bool { return p.lead.Status().Applied >= a })
 	if got := p.lead.Status().Applied; got != a {
 		t.Fatalf("applied index %d, want %d", got, a)
 	}
