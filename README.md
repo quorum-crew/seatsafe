@@ -148,9 +148,18 @@ default 120000), `ROUTER_COORD_ATTEMPT_MS` (router, default 1000). Metrics are
 `seatsafe_coordinator_*` on the coordinator nodes' `/metrics`;
 `seatsafe_coordinator_protocol_violations_total` must stay 0.
 
+## Running on real machines
+
+`cmd/clusterctl` runs SeatSafe on the machines of an inventory (`deploy/aws/inventory.yaml`): it generates
+and copies the configuration, starts and resets the cluster, runs benchmark presets from several load
+generator hosts with one merged result and one audit, and runs chaos campaigns (kill, pause, partition,
+zone outage) with the audit and the bookings verdict per run. [docs/aws.md](docs/aws.md) has the contract
+with whoever provisions the machines, the runbook, the costs, and how to try all of it on one machine.
+
 ## Layout
 
 - `cmd/router`, `cmd/storage`, `cmd/coordinator`: entry points for each node type
+- `cmd/clusterctl`, `internal/clusterctl`, `internal/inventory`: clusters on real machines (docs/aws.md)
 - `internal/coordinator`, `internal/coordsm`: the 2PC coordinator and its replicated state machine
 - `internal/server`: shared health and metrics endpoints
 - `deploy/`: Prometheus and Grafana config
