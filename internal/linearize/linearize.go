@@ -737,7 +737,16 @@ func Check(h *loadgen.History, opt Options) *Report {
 			withBrowses = append(withBrowses, c)
 		}
 	}
-	parallel(opt.Workers, withBrowses, func(c *seatCheck) { c.checkBrowses(r.model, deadline) })
+	// One seat's browses get at most a tenth of the whole budget, so that a
+	// seat whose browses are hard to decide cannot use up the time of all
+	// the others: it alone is reported as not decided.
+	parallel(opt.Workers, withBrowses, func(c *seatCheck) {
+		until := time.Now().Add(opt.Timeout / 10)
+		if deadline.Before(until) {
+			until = deadline
+		}
+		c.checkBrowses(r.model, until)
+	})
 
 	var bad []*seatCheck
 	staleListings := map[int]bool{}
