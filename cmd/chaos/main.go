@@ -10,6 +10,13 @@
 //	docker compose build
 //	go run ./cmd/chaos -runs 500
 //
+// With -inventory it runs against the machines of an inventory instead
+// (docs/aws.md): faults are docker and iptables commands on the hosts and
+// the load comes from the inventory's load generator hosts. cmd/clusterctl
+// campaign is the same thing with a resumable, unattended campaign around it.
+//
+//	go run ./cmd/chaos -inventory deploy/aws/inventory.yaml -faults kill-leader,pause-leader,partition,az-outage -runs 8
+//
 // Each run: the load generator books seats for -duration; partway through,
 // one fault (picked at random from -faults) is injected on a random shard and
 // healed a few seconds later. After the load, the run passes only if the
@@ -60,6 +67,8 @@ import (
 	"time"
 
 	"github.com/quorum-crew/seatsafe/internal/chaos"
+	"github.com/quorum-crew/seatsafe/internal/clusterctl"
+	"github.com/quorum-crew/seatsafe/internal/inventory"
 )
 
 // campaignDefaults are the flag defaults -campaign sets, unless the flag was
@@ -96,6 +105,9 @@ func main() {
 		linearizable = flag.Bool("linearizable", true, "check every run's history for linearizability with Porcupine: the bookings decide the run, stale browses are reported")
 		checkTimeout = flag.Duration("check-timeout", 2*time.Minute, "time allowed for one linearizability check; running out makes the run a TIMEOUT, not a pass")
 		holdDrain    = flag.Duration("hold-drain", chaos.DefaultHoldDrain, "wait this long after a run before the next one starts, unless the cluster is reset, so holds of its cross-shard orders are resolved before the next baseline")
+		invFile      = flag.String("inventory", "", "run against the machines of this inventory (deploy/aws/inventory.yaml, see docs/aws.md) instead of the Compose cluster: faults by docker and iptables on the hosts, the load from its load generator hosts")
+		genDir       = flag.String("gen-dir", filepath.Join("deploy", "aws", "gen"), "-inventory: the directory clusterctl gen wrote (for the layout)")
+		sshPrivate   = flag.Bool("ssh-private", false, "-inventory: ssh to the hosts' private addresses")
 		minFreeMem   = flag.Float64("min-free-mem", 0, "GiB of memory that must be available to the containers (Docker's MemAvailable) before each run; 0 = don't check")
 	)
 	flag.Parse()
@@ -145,6 +157,14 @@ func main() {
 	cfg.Title = fmt.Sprintf("# Chaos campaign\n\nseed %d, %v load at %.0f orders/s (%s), %.0f%% cross-shard, %.0f browses/s; %s\n\n",
 		*seed, *duration, *rate, *workload, *crossFrac*100, *browseRate, what)
 	c := &chaos.Cluster{Docker: chaos.CLI{}, Project: *project, Files: strings.Split(*files, ",")}
+	if *invFile != "" {
+		remote, cleanup, err := remoteCluster(*invFile, *genDir, *sshPrivate, kinds, cfg.Plan)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer cleanup()
+		c, cfg.MinFreeMem, cfg.WidenFor = remote, 0, clusterctl.ReadWiden
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -161,4 +181,49 @@ func main() {
 			os.Exit(2) // a failure, a check that ran out of time, or a run that broke
 		}
 	}
+}
+
+// remoteCluster is the cluster of an inventory, in the layout clusterctl gen
+// last wrote, as the target of the faults. Faults that need tools inside the
+// containers are refused here rather than skipped run by run.
+func remoteCluster(invFile, genDir string, private bool, kinds []chaos.Kind, plan []chaos.Step) (*chaos.Cluster, func(), error) {
+	for _, s := range plan {
+		kinds = append(kinds, s.Kind)
+	}
+	if len(plan) > 0 {
+		kinds = kinds[len(kinds)-len(plan):]
+	}
+	for _, k := range kinds {
+		if k == chaos.DelayShard || k == chaos.RollingRestart {
+			return nil, nil, fmt.Errorf("fault %q is not available with -inventory; use -faults with some of kill-leader, kill-follower, pause-leader, partition, isolate-leader, isolate-follower, quorum-loss, az-outage, none", k)
+		}
+	}
+	full, err := inventory.Load(invFile)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, w := range full.Warnings {
+		log.Printf("warning: %s", w)
+	}
+	var exec clusterctl.Executor = clusterctl.SSH{User: full.SSHUser, Key: full.SSHKey, Private: private}
+	if full.Executor == inventory.ExecLocal {
+		exec = clusterctl.Local{}
+	}
+	ctl, err := clusterctl.New(full, genDir, exec)
+	if err != nil {
+		return nil, nil, err
+	}
+	ctl.Logf = log.Printf
+	l, err := clusterctl.ReadLayout(genDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	if ctl.Inv, err = full.Layout(l.Shards, l.Replicas); err != nil {
+		return nil, nil, err
+	}
+	cluster, remote := ctl.ChaosCluster(5 * time.Millisecond)
+	if err := remote.Cleanup(context.Background()); err != nil {
+		return nil, nil, fmt.Errorf("cleaning up before the first run: %w", err)
+	}
+	return cluster, func() { _ = remote.Cleanup(context.Background()) }, nil
 }
