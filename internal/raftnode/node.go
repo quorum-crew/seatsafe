@@ -9,7 +9,9 @@
 // Two things in the loop do not wait for the local write (handleReady): a
 // leader sends a Ready's appends before it persists them, so the followers
 // write in parallel with it, and committed entries that are already on this
-// node's disk are applied before the Ready's own write.
+// node's disk are applied before the Ready's own write. Config can turn
+// either off; with both off the loop runs persist, send, apply for every
+// Ready.
 package raftnode
 
 import (
@@ -101,6 +103,17 @@ type Config struct {
 	// compaction, so a follower that is only slightly behind can catch up
 	// from the log instead of needing the whole snapshot.
 	CatchUpEntries uint64 // default DefaultCatchUpEntries
+
+	// The two changes to the Ready loop's order (handleReady), on unless
+	// turned off here. With both off the loop persists, then sends, then
+	// applies, for every Ready.
+	//
+	// DisableLeaderSendFirst makes a leader send its appends and heartbeats
+	// only after its own Save, like any other node.
+	DisableLeaderSendFirst bool
+	// DisableEarlyApply makes every committed entry wait for its Ready's
+	// Save, including entries persisted by earlier Readies.
+	DisableEarlyApply bool
 }
 
 // Snapshot defaults, as etcd's (SnapshotCount 100,000, catch-up 5,000). At
@@ -373,6 +386,10 @@ type applyBatch struct {
 //   - Committed entries that are already on this node's disk are applied
 //     without waiting for this Ready's Save, which is for other entries. See
 //     splitCommitted.
+//
+// Config.DisableLeaderSendFirst and Config.DisableEarlyApply turn off the
+// first and the second; with both set, every Ready is persisted, then sent,
+// then applied.
 func (n *Node) handleReady(rd raft.Ready) (applyBatch, error) {
 	if rd.SoftState != nil {
 		n.leading = rd.SoftState.RaftState == raft.StateLeader
@@ -450,7 +467,7 @@ func (n *Node) handleReady(rd raft.Ready) (applyBatch, error) {
 // MsgAppResp, MsgVoteResp and MsgPreVoteResp, the three kinds etcd raft
 // holds back until the local write is durable (raft.send).
 func (n *Node) sendFirst(rd raft.Ready) (first, rest []raftpb.Message) {
-	if len(rd.Messages) == 0 || !n.leading || !raft.IsEmptySnap(rd.Snapshot) {
+	if n.cfg.DisableLeaderSendFirst || len(rd.Messages) == 0 || !n.leading || !raft.IsEmptySnap(rd.Snapshot) {
 		return nil, rd.Messages
 	}
 	if hs := rd.HardState; !raft.IsEmptyHardState(hs) && (hs.Term != n.hardState.Term || hs.Vote != n.hardState.Vote) {
@@ -478,7 +495,7 @@ func (n *Node) sendFirst(rd raft.Ready) (first, rest []raftpb.Message) {
 // restored first, or a configuration change, which the loop waits for.
 func (n *Node) splitCommitted(rd raft.Ready) (early, late []raftpb.Entry) {
 	ents := rd.CommittedEntries
-	if len(ents) == 0 || !raft.IsEmptySnap(rd.Snapshot) || slices.ContainsFunc(ents, isConfChange) {
+	if n.cfg.DisableEarlyApply || len(ents) == 0 || !raft.IsEmptySnap(rd.Snapshot) || slices.ContainsFunc(ents, isConfChange) {
 		return nil, ents
 	}
 	persisted, err := n.storage.LastIndex() // also the store's last index: the two are written together
@@ -599,9 +616,12 @@ func (n *Node) maybeSnapshot() error {
 	// Never record an applied index above the last index persisted here.
 	// Entries are applied early only when they are on disk, and this runs
 	// after the Ready's Save, so it always holds; if it ever did not, a
-	// later batch takes the snapshot.
-	if last, err := n.storage.LastIndex(); err != nil || applied > last {
-		return nil
+	// later batch takes the snapshot. Without early apply nothing is applied
+	// before its Save, and the check is skipped.
+	if !n.cfg.DisableEarlyApply {
+		if last, err := n.storage.LastIndex(); err != nil || applied > last {
+			return nil
+		}
 	}
 	start := time.Now()
 	var encode func() ([]byte, error)

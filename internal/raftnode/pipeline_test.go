@@ -197,6 +197,13 @@ func newPipeline(t *testing.T, durable bool, snapEvery uint64) *pipeline {
 			return p.links[id]
 		}
 	})
+	// These tests are of the two Ready loop changes: both must be on, as
+	// they are by default (RAFT_LEADER_SEND_FIRST and RAFT_EARLY_APPLY).
+	for id, n := range p.nodes {
+		if n.cfg.DisableLeaderSendFirst || n.cfg.DisableEarlyApply {
+			t.Fatalf("node %d runs with a pipeline change off: %+v", id, n.cfg)
+		}
+	}
 	// Nobody's election timer fires for 10 s: make node 1 campaign now. It
 	// ignores the request until it has applied the initial configuration.
 	p.lead = p.nodes[1]

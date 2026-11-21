@@ -239,3 +239,135 @@ func TestSnapshotOnlyOfPersistedState(t *testing.T) {
 		t.Fatalf("snapshot index %d, want 10", got)
 	}
 }
+
+// eventLog is a Transport and LogStore for handleReady that records, in
+// order, every send, every batch on the apply queue at the time of the Save,
+// and the Save itself.
+type eventLog struct {
+	n      *Node
+	events []string
+}
+
+func (e *eventLog) Send(msgs []raftpb.Message) {
+	var types []string
+	for _, m := range msgs {
+		types = append(types, m.Type.String())
+	}
+	e.events = append(e.events, "send "+strings.Join(types, ","))
+}
+
+func (e *eventLog) Save(raftpb.HardState, []raftpb.Entry, raftpb.Snapshot, bool) error {
+	e.events = append(e.events, queued(e.n)...)
+	e.events = append(e.events, "save")
+	return nil
+}
+
+func (e *eventLog) SaveSnapshot(raftpb.Snapshot, uint64) error { return nil }
+
+func (e *eventLog) Load() (raftpb.HardState, raftpb.Snapshot, []raftpb.Entry, error) {
+	return raftpb.HardState{}, raftpb.Snapshot{}, nil, nil
+}
+
+// run hands rd to a node with entries 1..10 on disk and returns what
+// happened, ending with the batch handleReady returned for after the Save.
+func runReady(t *testing.T, cfg Config, leading bool, rd raft.Ready) []string {
+	t.Helper()
+	n, _ := readyNode(t, 10)
+	e := &eventLog{n: n}
+	cfg.ID, cfg.Transport, cfg.Store = 1, e, e
+	n.cfg = cfg
+	n.leading = leading
+	late, err := n.handleReady(rd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := queued(n); len(got) != 0 {
+		t.Fatalf("pushed after the Save: %v", got)
+	}
+	if late.early {
+		t.Fatal("the batch for after the Save is marked early")
+	}
+	return append(e.events, fmt.Sprint("late", indexes(late.entries)))
+}
+
+// The send and apply order of one leader Ready under each combination of
+// RAFT_LEADER_SEND_FIRST and RAFT_EARLY_APPLY. The Ready writes entries 11
+// and 12 and commits 8..12, of which 8..10 are already on disk.
+func TestHandleReadyFlags(t *testing.T) {
+	rd := raft.Ready{
+		Messages:         msgs(raftpb.MsgApp, raftpb.MsgAppResp),
+		Entries:          entries(1, 11, 12),
+		CommittedEntries: entries(1, 8, 12),
+	}
+	for _, c := range []struct {
+		sendFirst, earlyApply bool
+		want                  []string
+	}{
+		{true, true, []string{"send MsgApp", "early[8 9 10]", "save", "send MsgAppResp", "late[11 12]"}},
+		{true, false, []string{"send MsgApp", "save", "send MsgAppResp", "late[8 9 10 11 12]"}},
+		{false, true, []string{"early[8 9 10]", "save", "send MsgApp,MsgAppResp", "late[11 12]"}},
+		{false, false, []string{"save", "send MsgApp,MsgAppResp", "late[8 9 10 11 12]"}},
+	} {
+		t.Run(fmt.Sprintf("RAFT_LEADER_SEND_FIRST=%v,RAFT_EARLY_APPLY=%v", c.sendFirst, c.earlyApply), func(t *testing.T) {
+			cfg := Config{DisableLeaderSendFirst: !c.sendFirst, DisableEarlyApply: !c.earlyApply}
+			if got := runReady(t, cfg, true, rd); !slices.Equal(got, c.want) {
+				t.Fatalf("order %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// With both changes off, every Ready is handled in the order main had:
+// Save, then one Send of all its messages in Raft's order, then one batch
+// of all its committed entries for after the Save. Nothing goes out or is
+// applied before the Save, whatever the Ready carries and whether or not
+// the node leads.
+func TestFlagsOffIsPersistSendApply(t *testing.T) {
+	leader := &raft.SoftState{Lead: 1, RaftState: raft.StateLeader}
+	follower := &raft.SoftState{Lead: 2, RaftState: raft.StateFollower}
+	confChange := entries(1, 9, 10)
+	confChange[1].Type = raftpb.EntryConfChange
+	snap := raftpb.Snapshot{Metadata: raftpb.SnapshotMetadata{Index: 20, Term: 1}}
+	all := msgs(raftpb.MsgApp, raftpb.MsgHeartbeat, raftpb.MsgSnap, raftpb.MsgAppResp, raftpb.MsgVoteResp, raftpb.MsgPreVoteResp)
+	for _, c := range []struct {
+		name    string
+		leading bool
+		rd      raft.Ready
+	}{
+		{"leader, new entries, persisted and new committed", true,
+			raft.Ready{Messages: all, Entries: entries(1, 11, 12), CommittedEntries: entries(1, 8, 12)}},
+		{"leader, only persisted entries committed", true,
+			raft.Ready{Messages: msgs(raftpb.MsgApp, raftpb.MsgHeartbeat), CommittedEntries: entries(1, 8, 10)}},
+		{"becomes leader in this Ready", false,
+			raft.Ready{SoftState: leader, HardState: raftpb.HardState{Term: 2, Vote: 1, Commit: 10}, Messages: msgs(raftpb.MsgApp), Entries: entries(2, 11, 11)}},
+		{"leader, commit index only", true,
+			raft.Ready{HardState: raftpb.HardState{Term: 1, Vote: 1, Commit: 10}, Messages: msgs(raftpb.MsgApp), CommittedEntries: entries(1, 9, 10)}},
+		{"steps down in this Ready", true,
+			raft.Ready{SoftState: follower, Messages: msgs(raftpb.MsgAppResp, raftpb.MsgApp), CommittedEntries: entries(1, 9, 10)}},
+		{"follower", false,
+			raft.Ready{Messages: msgs(raftpb.MsgAppResp, raftpb.MsgHeartbeatResp), Entries: entries(1, 11, 11), CommittedEntries: entries(1, 8, 11)}},
+		{"candidate", false,
+			raft.Ready{SoftState: &raft.SoftState{RaftState: raft.StateCandidate}, HardState: raftpb.HardState{Term: 2, Vote: 1}, Messages: msgs(raftpb.MsgVote)}},
+		{"rewrites a conflicting tail", false,
+			raft.Ready{CommittedEntries: entries(2, 8, 9), Entries: entries(2, 9, 10), Messages: msgs(raftpb.MsgAppResp)}},
+		{"configuration change", true,
+			raft.Ready{CommittedEntries: confChange, Entries: entries(1, 11, 11), Messages: msgs(raftpb.MsgApp)}},
+		{"snapshot to install", true,
+			raft.Ready{Snapshot: snap, CommittedEntries: entries(1, 21, 21), Entries: entries(1, 21, 21), Messages: msgs(raftpb.MsgApp)}},
+		{"nothing to send", true, raft.Ready{Entries: entries(1, 11, 11), CommittedEntries: entries(1, 8, 10)}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			want := []string{"save"}
+			if len(c.rd.Messages) > 0 {
+				e := &eventLog{}
+				e.Send(c.rd.Messages)
+				want = append(want, e.events...)
+			}
+			want = append(want, fmt.Sprint("late", indexes(c.rd.CommittedEntries)))
+			got := runReady(t, Config{DisableLeaderSendFirst: true, DisableEarlyApply: true}, c.leading, c.rd)
+			if !slices.Equal(got, want) {
+				t.Fatalf("order %q, want %q (persist, send, apply)", got, want)
+			}
+		})
+	}
+}

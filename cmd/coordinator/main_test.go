@@ -30,15 +30,20 @@ func TestConfigFromEnv(t *testing.T) {
 	if c.tick != 25*time.Millisecond || c.election != 10 || c.heartbeat != 1 || c.holdTTL != 5*time.Second || c.retention != 2*time.Minute {
 		t.Fatalf("defaults: %+v", c)
 	}
+	if !c.sendFirst || !c.earlyApply {
+		t.Fatalf("pipeline flags default to on: %+v", c)
+	}
 
 	t.Setenv("HOLD_TTL_MS", "1500")
 	t.Setenv("GC_RETENTION_MS", "60000")
 	t.Setenv("RAFT_TICK_MS", "50")
-	if c, err = configFromEnv(); err != nil || c.holdTTL != 1500*time.Millisecond || c.retention != time.Minute || c.tick != 50*time.Millisecond {
+	t.Setenv("RAFT_LEADER_SEND_FIRST", "false")
+	t.Setenv("RAFT_EARLY_APPLY", "0")
+	if c, err = configFromEnv(); err != nil || c.holdTTL != 1500*time.Millisecond || c.retention != time.Minute || c.tick != 50*time.Millisecond || c.sendFirst || c.earlyApply {
 		t.Fatalf("from env: %+v, %v", c, err)
 	}
 
-	for key, bad := range map[string]string{"HOLD_TTL_MS": "0", "GC_RETENTION_MS": "soon", "RAFT_TICK_MS": "-5"} {
+	for key, bad := range map[string]string{"HOLD_TTL_MS": "0", "GC_RETENTION_MS": "soon", "RAFT_TICK_MS": "-5", "RAFT_LEADER_SEND_FIRST": "maybe", "RAFT_EARLY_APPLY": "on"} {
 		t.Run(key, func(t *testing.T) {
 			t.Setenv(key, bad)
 			if _, err := configFromEnv(); err == nil || !strings.Contains(err.Error(), key) {
