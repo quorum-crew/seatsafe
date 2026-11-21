@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/quorum-crew/seatsafe/internal/linearize"
@@ -80,6 +81,16 @@ type Config struct {
 	// coming free. DefaultHoldDrain covers the default hold timing.
 	HoldDrain time.Duration
 
+	// Widen is how far the history check moves every call earlier and
+	// every return later, for histories merged from machines whose clocks
+	// differ (linearize.Options.Widen). 0 on one machine.
+	Widen time.Duration
+	// Resume continues a campaign that was stopped: the runs recorded in
+	// Out/runs.jsonl are kept and not run again. With it every run draws
+	// its fault from a random stream of its own (seed and run number), so a
+	// resumed campaign injects what an uninterrupted one would have.
+	Resume bool
+
 	Out        string // host directory for results
 	Title      string // first lines of summary.md
 	StopOnFail bool
@@ -142,6 +153,17 @@ type Result struct {
 	// every 100-300 ms (one docker exec per node), so they are approximate.
 	Failover time.Duration
 	Recovery time.Duration
+	// For an az-outage. Zone is the zone taken down. GroupFailover is, for
+	// every Raft group, the time from the outage until its remaining nodes
+	// agreed on a leader among themselves (close to 0 for a group whose
+	// leader was not in the zone; -1 if they never did while the zone was
+	// down); Failover is the longest of them. Availability is the fraction
+	// of the orders first sent during the outage that were answered, of
+	// OutageOrders such orders; -1 if unknown.
+	Zone          string                `json:",omitempty"`
+	GroupFailover map[int]time.Duration `json:",omitempty"`
+	Availability  float64
+	OutageOrders  int
 	// Elections is how many elections happened during the run, summed over
 	// the shards and the coordinator (Raft term increases); -1 if unknown.
 	// In a "none" run every one is unnecessary.
@@ -194,29 +216,47 @@ func Campaign(ctx context.Context, c *Cluster, cfg Config) ([]Result, error) {
 	if err := os.MkdirAll(cfg.Out, 0o755); err != nil {
 		return nil, err
 	}
-	csvFile, err := os.Create(filepath.Join(cfg.Out, "runs.csv"))
+	var results []Result
+	if cfg.Resume {
+		var err error
+		if results, err = ReadResults(cfg.Out); err != nil {
+			return nil, err
+		}
+		if len(results) > 0 {
+			cfg.Logf("resuming: %d runs are done, starting at run %d", len(results), len(results)+1)
+		}
+	}
+	csvFile, err := os.OpenFile(filepath.Join(cfg.Out, "runs.csv"), os.O_CREATE|os.O_WRONLY|appendOrTruncate(len(results) > 0), 0o644)
 	if err != nil {
 		return nil, err
 	}
+	jsonl, err := os.OpenFile(filepath.Join(cfg.Out, "runs.jsonl"), os.O_CREATE|os.O_WRONLY|appendOrTruncate(len(results) > 0), 0o644)
+	if err != nil {
+		return nil, err
+	}
+	defer jsonl.Close()
 	defer csvFile.Close()
 	w := csv.NewWriter(csvFile)
-	_ = w.Write([]string{"run", "verdict", "kind", "fault", "inject_at_s", "heal_at_s", "failover_s", "recovery_s", "elections", "client_p99_ms", "client_max_ms", "audit", "reason",
-		"target", "a_double_booked", "b_confirmed_still_free", "c_unexplained_taken", "d_confirmed_pre_booked", "e_cross_shard_half_booked", "e_taken_by_unconfirmed",
-		"unknown_orders", "bookings", "check_s", "check_detail", "free_mem_gb", "host_free_mem_gb", "stale_browses", "stale_browse_seats"})
+	if len(results) == 0 {
+		_ = w.Write(csvHeader)
+	}
 	w.Flush()
 
 	rnd := rand.New(rand.NewPCG(cfg.Seed, cfg.Seed^0x9e3779b97f4a7c15))
 	in := &Injector{C: c, Rand: rnd}
-	var results []Result
 	needReset := true
 	var lastEnd time.Time
-	for i := 1; i <= cfg.Runs && ctx.Err() == nil; i++ {
+	for i := len(results) + 1; i <= cfg.Runs && ctx.Err() == nil; i++ {
+		if cfg.Resume {
+			rnd = rand.New(rand.NewPCG(cfg.Seed, uint64(i)))
+			in.Rand = rnd
+		}
 		if cfg.ResetEvery > 0 && i > 1 && (i-1)%cfg.ResetEvery == 0 {
 			needReset = true
 		}
 		// A reset clears every hold; otherwise let the last run's holds be
 		// resolved before this run's baseline.
-		if wait := cfg.HoldDrain - time.Since(lastEnd); !needReset && i > 1 && wait > 0 {
+		if wait := cfg.HoldDrain - time.Since(lastEnd); !needReset && !lastEnd.IsZero() && wait > 0 {
 			cfg.Logf("run %d: waiting %s for the last run's holds to be resolved", i, wait.Round(100*time.Millisecond))
 			sleep(ctx, wait)
 		}
@@ -234,18 +274,12 @@ func Campaign(ctx context.Context, c *Cluster, cfg Config) ([]Result, error) {
 		}
 		results = append(results, r)
 		lastEnd = time.Now()
+		if b, err := json.Marshal(r); err == nil {
+			_, _ = jsonl.Write(append(b, '\n'))
+		}
 		cfg.Logf("run %d: %s  %s  failover %s  recovery %s  elections %d  client p99 %s max %s  bookings %s (%s)  %s  %s %s", i, r.Verdict, r.Fault,
 			secs(r.Failover), secs(r.Recovery), r.Elections, millis(r.P99), millis(r.Max), r.Linearizable, secs(r.CheckTime), r.staleLine(), r.Audit, r.Reason)
-		a := r.AuditRules
-		if a == nil {
-			a = &loadgen.Audit{DoubleBooked: -1, StillFree: -1, Unexplained: -1, PreBooked: -1, HalfBooked: -1, TakenByFailed: -1}
-		}
-		_ = w.Write([]string{strconv.Itoa(r.Run), r.Verdict, string(r.Kind), r.Fault,
-			secs(r.InjectAt), secs(r.HealAt), secs(r.Failover), secs(r.Recovery), strconv.Itoa(r.Elections),
-			millis(r.P99), millis(r.Max), r.Audit, r.Reason,
-			r.Target, strconv.Itoa(a.DoubleBooked), strconv.Itoa(a.StillFree), strconv.Itoa(a.Unexplained), strconv.Itoa(a.PreBooked), strconv.Itoa(a.HalfBooked), strconv.Itoa(a.TakenByFailed),
-			strconv.Itoa(r.Unknown()), r.Linearizable, secs(r.CheckTime), r.CheckDetail, gib(r.FreeMem), gib(r.HostFree),
-			strconv.Itoa(r.StaleBrowses), strings.Join(r.StaleSeats, " ")})
+		_ = w.Write(csvRow(r))
 		w.Flush()
 		_ = os.WriteFile(filepath.Join(cfg.Out, "summary.md"), []byte(cfg.Title+Summarize(results)), 0o644)
 		if (r.Verdict == VerdictFail || r.Verdict == VerdictIdempotency) && cfg.StopOnFail {
@@ -254,6 +288,61 @@ func Campaign(ctx context.Context, c *Cluster, cfg Config) ([]Result, error) {
 		}
 	}
 	return results, w.Error()
+}
+
+func appendOrTruncate(appendTo bool) int {
+	if appendTo {
+		return os.O_APPEND
+	}
+	return os.O_TRUNC
+}
+
+// ReadResults returns the results a campaign has recorded in dir/runs.jsonl,
+// one per finished run; none if the file is not there.
+func ReadResults(dir string) ([]Result, error) {
+	b, err := os.ReadFile(filepath.Join(dir, "runs.jsonl"))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var out []Result
+	for n, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var r Result
+		if err := json.Unmarshal([]byte(line), &r); err != nil {
+			return nil, fmt.Errorf("%s line %d: %w", filepath.Join(dir, "runs.jsonl"), n+1, err)
+		}
+		if r.Run != len(out)+1 {
+			return nil, fmt.Errorf("%s line %d: run %d, want run %d", filepath.Join(dir, "runs.jsonl"), n+1, r.Run, len(out)+1)
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+var csvHeader = []string{"run", "verdict", "kind", "fault", "inject_at_s", "heal_at_s", "failover_s", "recovery_s", "elections", "client_p99_ms", "client_max_ms", "audit", "reason",
+	"target", "a_double_booked", "b_confirmed_still_free", "c_unexplained_taken", "d_confirmed_pre_booked", "e_cross_shard_half_booked", "e_taken_by_unconfirmed",
+	"unknown_orders", "bookings", "check_s", "check_detail", "free_mem_gb", "host_free_mem_gb", "stale_browses", "stale_browse_seats", "zone", "availability"}
+
+func csvRow(r Result) []string {
+	a := r.AuditRules
+	if a == nil {
+		a = &loadgen.Audit{DoubleBooked: -1, StillFree: -1, Unexplained: -1, PreBooked: -1, HalfBooked: -1, TakenByFailed: -1}
+	}
+	availability := ""
+	if r.Availability >= 0 {
+		availability = strconv.FormatFloat(r.Availability, 'f', 4, 64)
+	}
+	return []string{strconv.Itoa(r.Run), r.Verdict, string(r.Kind), r.Fault,
+		secs(r.InjectAt), secs(r.HealAt), secs(r.Failover), secs(r.Recovery), strconv.Itoa(r.Elections),
+		millis(r.P99), millis(r.Max), r.Audit, r.Reason,
+		r.Target, strconv.Itoa(a.DoubleBooked), strconv.Itoa(a.StillFree), strconv.Itoa(a.Unexplained), strconv.Itoa(a.PreBooked), strconv.Itoa(a.HalfBooked), strconv.Itoa(a.TakenByFailed),
+		strconv.Itoa(r.Unknown()), r.Linearizable, secs(r.CheckTime), r.CheckDetail, gib(r.FreeMem), gib(r.HostFree),
+		strconv.Itoa(r.StaleBrowses), strings.Join(r.StaleSeats, " "), r.Zone, availability}
 }
 
 // guarded runs one run and turns a panic in it into a CRASH result.
@@ -269,7 +358,7 @@ func guarded(i int, run func() Result) (r Result) {
 
 // blank is a result with nothing measured.
 func blank(i int) Result {
-	return Result{Run: i, Target: "-", Linearizable: "-", StaleBrowses: -1, Failover: -1, Recovery: -1, Elections: -1, P99: -1, Max: -1, FreeMem: -1, HostFree: -1}
+	return Result{Run: i, Target: "-", Linearizable: "-", StaleBrowses: -1, Failover: -1, Recovery: -1, Elections: -1, P99: -1, Max: -1, FreeMem: -1, HostFree: -1, Availability: -1}
 }
 
 // prepareAndRun gets the cluster ready for run i (reset if asked for or
@@ -306,7 +395,7 @@ func prepareAndRun(ctx context.Context, c *Cluster, in *Injector, rnd *rand.Rand
 		}
 	}
 	free, hostFree := int64(-1), int64(-1)
-	if cfg.MinFreeMem > 0 {
+	if cfg.MinFreeMem > 0 && c.Remote == nil {
 		if h, err := HostFreeMem(ctx); err == nil {
 			hostFree = int64(h)
 		}
@@ -341,13 +430,16 @@ func runOnce(ctx context.Context, c *Cluster, in *Injector, rnd *rand.Rand, cfg 
 
 	// Load in the background.
 	name := c.Project + "-chaos-loadgen"
-	_, _ = c.Docker.Run(context.Background(), "rm", "-f", name)
+	if c.Remote == nil {
+		_, _ = c.Docker.Run(context.Background(), "rm", "-f", name)
+	}
 	args := []string{"run", "--rm", "--name", name, "--network", c.Network(),
-		"-v", deploy + ":/deploy:ro", "-v", abs + ":/out", cfg.Image,
-		"loadgen", "-target", "router:7000", "-shardmap", "/deploy/shardmap.json", "-seed-dir", "/deploy/seed",
+		"-v", deploy + ":/deploy:ro", "-v", abs + ":/out", cfg.Image, "loadgen"}
+	loadFrom := len(args)
+	args = append(args, "-target", "router:7000", "-shardmap", "/deploy/shardmap.json", "-seed-dir", "/deploy/seed",
 		"-out", "/out", "-label", fmt.Sprintf("chaos-%04d", i), "-mode", "open", "-workload", cfg.Workload,
 		"-rate", strconv.FormatFloat(cfg.Rate, 'f', -1, 64), "-warmup", "2s", "-duration", cfg.Duration.String(),
-		"-seed", strconv.FormatUint(cfg.Seed+uint64(i), 10), "-history", "-quiet"}
+		"-seed", strconv.FormatUint(cfg.Seed+uint64(i), 10), "-history", "-quiet")
 	if cfg.CrossShardFrac > 0 {
 		args = append(args, "-cross-shard-frac", strconv.FormatFloat(cfg.CrossShardFrac, 'f', -1, 64))
 	}
@@ -362,11 +454,17 @@ func runOnce(ctx context.Context, c *Cluster, in *Injector, rnd *rand.Rand, cfg 
 	loadDone := make(chan loadResult, 1)
 	start := time.Now()
 	go func() {
-		out, err := c.Docker.Run(ctx, args...)
+		var out string
+		var err error
+		if c.Remote != nil {
+			out, err = c.Remote.Load(ctx, dir, args[loadFrom:])
+		} else {
+			out, err = c.Docker.Run(ctx, args...)
+		}
 		loadDone <- loadResult{out, err}
 	}()
 	defer func() {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil && c.Remote == nil {
 			_, _ = c.Docker.Run(context.Background(), "rm", "-f", name)
 		}
 	}()
@@ -377,7 +475,7 @@ func runOnce(ctx context.Context, c *Cluster, in *Injector, rnd *rand.Rand, cfg 
 	r.InjectAt = time.Since(start)
 	f, err := in.InjectAt(ctx, step.Kind, step.Target)
 	if f != nil {
-		r.Fault, r.Target = f.String(), f.TargetName()
+		r.Fault, r.Target, r.Zone = f.String(), f.TargetName(), f.Zone
 		defer func() {
 			if f != nil {
 				_ = healRetry(context.Background(), f)
@@ -387,6 +485,7 @@ func runOnce(ctx context.Context, c *Cluster, in *Injector, rnd *rand.Rand, cfg 
 	if err != nil {
 		r.InjectErr = err.Error()
 	}
+	var outage [2]time.Time
 	if f != nil {
 		injected := time.Now()
 		holdFor := between(rnd, cfg.FaultFor)
@@ -400,9 +499,39 @@ func runOnce(ctx context.Context, c *Cluster, in *Injector, rnd *rand.Rand, cfg 
 			}
 			failover <- d
 		}()
+		// An outage of a zone: how long until each group's nodes outside
+		// the zone agree on a leader among themselves.
+		var perGroup map[int]time.Duration
+		var pg sync.WaitGroup
+		if err == nil && r.Kind == AZOutage {
+			perGroup = map[int]time.Duration{}
+			var mu sync.Mutex
+			for _, g := range GroupIDs() {
+				pg.Add(1)
+				go func() {
+					defer pg.Done()
+					d := waitFor(fctx, func() bool { return c.agreedLeader(fctx, g, f.Targets) != 0 }, injected)
+					mu.Lock()
+					perGroup[g] = d
+					mu.Unlock()
+				}()
+			}
+		}
 		sleep(ctx, holdFor)
 		stopFailover()
 		r.Failover = <-failover
+		pg.Wait()
+		if perGroup != nil {
+			r.GroupFailover = perGroup
+			for _, d := range perGroup {
+				if d < 0 {
+					r.Failover = -1
+					break
+				}
+				r.Failover = max(r.Failover, d)
+			}
+		}
+		outageFrom := injected
 
 		var target uint64
 		if inGroup {
@@ -413,6 +542,7 @@ func runOnce(ctx context.Context, c *Cluster, in *Injector, rnd *rand.Rand, cfg 
 		cancel()
 		healed := time.Now()
 		r.HealAt = time.Since(start)
+		outage = [2]time.Time{outageFrom, healed}
 		if herr != nil {
 			r.Reason = "heal failed: " + herr.Error()
 		} else if inGroup && r.Kind != RollingRestart {
@@ -444,10 +574,15 @@ func runOnce(ctx context.Context, c *Cluster, in *Injector, rnd *rand.Rand, cfg 
 		}
 	}
 
+	if r.Kind == AZOutage && !outage[0].IsZero() {
+		if answered, total, err := Availability(dir, outage[0], outage[1]); err == nil && total > 0 {
+			r.Availability, r.OutageOrders = float64(answered)/float64(total), total
+		}
+	}
 	var checkErr error
 	if cfg.Linearizable {
 		var hc HistoryCheck
-		hc, checkErr = CheckLinearizable(dir, cfg.CheckTimeout)
+		hc, checkErr = CheckHistory(dir, linearize.Options{Timeout: cfg.CheckTimeout, Widen: cfg.Widen})
 		r.Linearizable, r.CheckDetail, r.CheckTime = hc.Bookings, hc.Detail, hc.Took
 		r.StaleBrowses, r.StaleSeats = hc.StaleBrowses, hc.StaleSeats
 		r.Idempotency = hc.Idempotency
@@ -459,7 +594,13 @@ func runOnce(ctx context.Context, c *Cluster, in *Injector, rnd *rand.Rand, cfg 
 		// Keep the evidence: the next run may reset the cluster, which
 		// deletes the containers and their logs.
 		lctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-		if logs, err := c.compose(lctx, "logs", "--no-color", "--timestamps"); err == nil {
+		logs, err := "", error(nil)
+		if c.Remote != nil {
+			logs, err = c.Remote.Logs(lctx)
+		} else {
+			logs, err = c.compose(lctx, "logs", "--no-color", "--timestamps")
+		}
+		if err == nil {
 			_ = os.WriteFile(filepath.Join(dir, "cluster-logs.txt"), []byte(logs), 0o644)
 		}
 		cancel()
@@ -550,6 +691,12 @@ type HistoryCheck struct {
 // operations) into dir. When browses are stale it writes stale-browses.txt:
 // the seats, and the operations of the first of them.
 func CheckLinearizable(dir string, timeout time.Duration) (HistoryCheck, error) {
+	return CheckHistory(dir, linearize.Options{Timeout: timeout})
+}
+
+// CheckHistory is CheckLinearizable with every option of the check, such as
+// Widen for a history merged from several machines.
+func CheckHistory(dir string, opt linearize.Options) (HistoryCheck, error) {
 	start := time.Now()
 	hc := HistoryCheck{Bookings: "-", StaleBrowses: -1}
 	f, err := os.Open(filepath.Join(dir, "history.jsonl"))
@@ -573,7 +720,7 @@ func CheckLinearizable(dir string, timeout time.Duration) (HistoryCheck, error) 
 		}
 		_ = os.WriteFile(filepath.Join(dir, "idempotency.txt"), []byte(b.String()), 0o644)
 	}
-	rep := linearize.Check(h, linearize.Options{Timeout: timeout})
+	rep := linearize.Check(h, opt)
 	hc.Took = time.Since(start)
 	hc.Bookings = rep.Verdict()
 	hc.StaleBrowses, hc.StaleSeats, hc.BrowseUndecided = rep.StaleBrowses, rep.StaleSeats, len(rep.BrowseUndecided)
@@ -594,6 +741,22 @@ func CheckLinearizable(dir string, timeout time.Duration) (HistoryCheck, error) 
 		_ = os.WriteFile(filepath.Join(dir, "stale-browses.txt"), []byte(body), 0o644)
 	}
 	return hc, nil
+}
+
+// outageLine describes an az-outage run: the zone, every group's failover
+// and the availability during the outage.
+func (r Result) outageLine() string {
+	var groups []string
+	for _, g := range GroupIDs() {
+		if d, ok := r.GroupFailover[g]; ok {
+			groups = append(groups, fmt.Sprintf("%s %ss", GroupName(g), secs(d)))
+		}
+	}
+	availability := "unknown"
+	if r.Availability >= 0 {
+		availability = fmt.Sprintf("%.1f%% of %d orders answered", r.Availability*100, r.OutageOrders)
+	}
+	return fmt.Sprintf("zone %s down; failover per group: %s; availability during the outage: %s", r.Zone, strings.Join(groups, ", "), availability)
 }
 
 // staleLine is "stale browses: N (seats ...)", or "stale browses: -" if the
@@ -657,6 +820,9 @@ func writeFaultLog(dir string, r Result, bad []ShardHealth) {
 		fmt.Fprintf(&b, "inject error: %s\n", r.InjectErr)
 	}
 	fmt.Fprintf(&b, "failover: %ss\nrecovery: %ss (-1 = not measured)\n", secs(r.Failover), secs(r.Recovery))
+	if r.Kind == AZOutage {
+		fmt.Fprintf(&b, "%s\n", r.outageLine())
+	}
 	fmt.Fprintf(&b, "bookings: %s (%s, %ss)\n%s\n", r.Linearizable, r.CheckDetail, secs(r.CheckTime), r.staleLine())
 	for _, h := range bad {
 		fmt.Fprintf(&b, "not healed: %s: %s\n", GroupName(h.Shard), h.Err)
@@ -698,7 +864,7 @@ func Summarize(results []Result) string {
 		fmt.Fprintf(&b, "Stale browses (checked separately, reported, never a failure): %d in %d runs\n\n", stale, staleRuns)
 	}
 	fmt.Fprintf(&b, "| Fault | Runs | Pass | Fail | Skip | Failover, median | Failover, max | Recovery, median | Recovery, max | Elections per run | Client p99, median | Client max, median |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n")
-	for _, k := range append(slices.Clone(AllKinds), Partition, None) {
+	for _, k := range append(slices.Clone(AllKinds), Partition, AZOutage, None) {
 		var n, pass, fail, skip int
 		var fo, rec, p99, mx []float64
 		elections, counted := 0, 0
@@ -795,6 +961,17 @@ func Summarize(results []Result) string {
 	fmt.Fprintf(&b, "| **Total** | %d runs | | | %d/%d pass | %d | %d | %d | %d | %d+%d | %d pass, %d fail, %d timeout | %d in %d runs | %.2f s | %d | %d | %d PASS |\n",
 		len(results), auditPass, audits, tot.DoubleBooked, tot.StillFree, tot.Unexplained, tot.PreBooked, tot.HalfBooked, tot.TakenByFailed,
 		lin[linearize.Pass], lin[linearize.Fail], lin[linearize.Timeout], stale, staleRuns, checkTime.Seconds(), unknown, elections, count[VerdictPass])
+
+	outages := false
+	for _, r := range results {
+		if r.Kind == AZOutage && r.Zone != "" {
+			if !outages {
+				b.WriteString("\nZone outages (every SeatSafe container of one zone killed at once; a failover of -1 means the group had no leader while the zone was down):\n\n")
+				outages = true
+			}
+			fmt.Fprintf(&b, "- run %d: %s\n", r.Run, r.outageLine())
+		}
+	}
 
 	var fails []string
 	for _, r := range results {

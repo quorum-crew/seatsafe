@@ -31,6 +31,13 @@ const (
 	// isolate-leader does. Not part of "all".
 	Partition Kind = "partition"
 
+	// AZOutage kills every SeatSafe container of one availability zone at
+	// once and starts them again when the fault is healed. With one node of
+	// every group per zone, every group keeps its quorum. On the Compose
+	// cluster, which has no zones, zone N is node N of every group. Not
+	// part of "all".
+	AZOutage Kind = "az-outage"
+
 	// None injects nothing: a control run under the same load, to count
 	// elections nobody caused. Not part of "all".
 	None Kind = "none"
@@ -97,8 +104,8 @@ func ParseKinds(s string) ([]Kind, error) {
 	var out []Kind
 	for _, p := range strings.Split(s, ",") {
 		k := Kind(strings.TrimSpace(p))
-		if !slices.Contains(AllKinds, k) && k != None && k != Partition {
-			return nil, fmt.Errorf("unknown fault %q (known: %v, partition, none)", k, AllKinds)
+		if !slices.Contains(AllKinds, k) && k != None && k != Partition && k != AZOutage {
+			return nil, fmt.Errorf("unknown fault %q (known: %v, partition, az-outage, none)", k, AllKinds)
 		}
 		out = append(out, k)
 	}
@@ -113,6 +120,7 @@ type Fault struct {
 	Coordinator bool     // the fault is in the coordinator group
 	Targets     []string // compose services affected
 	Detail      string   // e.g. "delay 120ms±30ms"
+	Zone        string   // az-outage: the zone that was taken down
 
 	heal func(ctx context.Context) error
 }
@@ -175,6 +183,19 @@ func (in *Injector) InjectAt(ctx context.Context, kind Kind, target Target) (*Fa
 	if kind == None {
 		f.Shard = 0
 		return f, nil
+	}
+	if kind == AZOutage {
+		zones := in.C.zones()
+		names := sortedZones(zones)
+		if len(names) == 0 {
+			return nil, fmt.Errorf("the cluster has no availability zones")
+		}
+		f.Shard, f.Zone = 0, names[in.Rand.IntN(len(names))]
+		f.Targets, f.Detail = slices.Clone(zones[f.Zone]), "zone "+f.Zone
+		return f, in.kill(ctx, f, f.Targets...)
+	}
+	if in.C.Remote != nil && (kind == DelayShard || kind == RollingRestart) {
+		return nil, fmt.Errorf("fault %q is not available on a remote cluster", kind)
 	}
 	switch target {
 	case TargetShard, "":
@@ -267,6 +288,10 @@ func (in *Injector) InjectAt(ctx context.Context, kind Kind, target Target) (*Fa
 }
 
 func (in *Injector) kill(ctx context.Context, f *Fault, services ...string) error {
+	if r := in.C.Remote; r != nil {
+		f.heal = func(ctx context.Context) error { return r.Start(ctx, services) }
+		return r.Kill(ctx, services)
+	}
 	var containers []string
 	for _, s := range services {
 		containers = append(containers, in.C.Container(s))
@@ -280,6 +305,10 @@ func (in *Injector) kill(ctx context.Context, f *Fault, services ...string) erro
 }
 
 func (in *Injector) pause(ctx context.Context, f *Fault, svc string) error {
+	if r := in.C.Remote; r != nil {
+		f.heal = func(ctx context.Context) error { return r.Unpause(ctx, svc) }
+		return r.Pause(ctx, svc)
+	}
 	c := in.C.Container(svc)
 	f.heal = func(ctx context.Context) error {
 		_, err := in.C.Docker.Run(ctx, "unpause", c)
@@ -293,6 +322,10 @@ func (in *Injector) pause(ctx context.Context, f *Fault, svc string) error {
 }
 
 func (in *Injector) isolate(ctx context.Context, f *Fault, svc string) error {
+	if r := in.C.Remote; r != nil {
+		f.heal = func(ctx context.Context) error { return r.Rejoin(ctx, svc) }
+		return r.Partition(ctx, svc)
+	}
 	c, net := in.C.Container(svc), in.C.Network()
 	f.heal = func(ctx context.Context) error {
 		// The alias keeps the service name resolvable: peers dial shardN-nodeM.
