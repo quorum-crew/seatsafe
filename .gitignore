@@ -15,3 +15,10 @@ deploy/seed/*.json
 
 # Load generator output
 /results/
+
+# AWS deployment (deploy/aws): local Terraform state and secrets, generated inventory
+deploy/aws/terraform/.terraform/
+deploy/aws/terraform/*.tfstate
+deploy/aws/terraform/*.tfstate.*
+deploy/aws/terraform/terraform.tfvars
+deploy/aws/inventory.yaml

@@ -1,0 +1,50 @@
+#!/bin/bash
+# First boot of a SeatSafe host (Amazon Linux 2023). Logs: /var/log/cloud-init-output.log
+set -euxo pipefail
+
+hostnamectl set-hostname ${hostname}
+
+# Our ssh keys, for ec2-user (which has passwordless sudo on AL2023).
+install -d -m 700 -o ec2-user -g ec2-user /home/ec2-user/.ssh
+cat > /home/ec2-user/.ssh/authorized_keys <<'KEYS'
+%{ for k in ssh_keys ~}
+${trimspace(k)}
+%{ endfor ~}
+KEYS
+chown ec2-user:ec2-user /home/ec2-user/.ssh/authorized_keys
+chmod 600 /home/ec2-user/.ssh/authorized_keys
+
+# Docker, with ec2-user in the docker group. iptables for the chaos tool's
+# partition fault, tc for its delay fault.
+dnf install -y docker
+dnf install -y iptables-nft iproute-tc
+systemctl enable --now docker
+usermod -aG docker ec2-user
+
+%{ if data_disk ~}
+# The instance's local NVMe at /data: Raft log and snapshots. It is wiped
+# whenever the instance is stopped (not on reboot); nofail lets the host boot
+# anyway, and this script only runs on the first boot.
+dev=""
+for d in /dev/nvme*n1; do
+  if [ "$(cat /sys/block/$(basename "$d")/device/model 2>/dev/null | xargs)" = "Amazon EC2 NVMe Instance Storage" ]; then
+    dev=$d
+    break
+  fi
+done
+if [ -z "$dev" ]; then
+  echo "no NVMe instance storage found" >&2
+  exit 1
+fi
+mkfs.xfs -f "$dev"
+mkdir -p /data
+echo "$dev /data xfs defaults,noatime,nofail 0 2" >> /etc/fstab
+mount /data
+chown ec2-user:ec2-user /data
+%{ endif ~}
+
+# chronyd syncs to the Amazon Time Sync Service by default on AL2023; make
+# sure it runs, since the load generators' histories are compared across hosts.
+systemctl enable --now chronyd
+
+touch /var/lib/seatsafe-ready

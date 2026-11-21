@@ -1,0 +1,14 @@
+# Copy to terraform.tfvars (git-ignored) and fill in.
+
+# Our public IPs (curl -s https://checkip.amazonaws.com), as /32.
+admin_cidrs = ["203.0.113.7/32", "198.51.100.23/32"]
+
+# Contents of each of our .pub files. The first also becomes the EC2 key pair.
+ssh_public_keys = [
+  "ssh-ed25519 AAAA... kripal",
+  "ssh-ed25519 AAAA... mrudula",
+]
+
+# Optional: email alerts at 50/80/100% of the monthly budget.
+budget_email       = "you@example.com"
+budget_monthly_usd = 150
