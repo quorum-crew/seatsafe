@@ -148,6 +148,22 @@ default 120000), `ROUTER_COORD_ATTEMPT_MS` (router, default 1000). Metrics are
 `seatsafe_coordinator_*` on the coordinator nodes' `/metrics`;
 `seatsafe_coordinator_protocol_violations_total` must stay 0.
 
+## Raft loop settings
+
+Storage and coordinator nodes read two switches for the order in which the Raft loop handles a
+Ready (`internal/raftnode`, `handleReady`). Both default to `true`; set `false` to turn one off.
+
+- `RAFT_LEADER_SEND_FIRST`: a leader sends its appends and heartbeats before its own fsync, so
+  its followers write the entries at the same time. It still counts its own copy only after its
+  fsync.
+- `RAFT_EARLY_APPLY`: committed entries that are already on this node's disk are applied
+  without waiting for the fsync of the Ready that commits them.
+
+With both `false` every Ready is persisted, then sent, then applied, as before #50. Each node
+can set them on its own; either order is safe. They are meant for before/after measurements on
+one build: for the "before" side, set `RAFT_LEADER_SEND_FIRST=false RAFT_EARLY_APPLY=false` on
+every storage and coordinator node.
+
 ## Layout
 
 - `cmd/router`, `cmd/storage`, `cmd/coordinator`: entry points for each node type

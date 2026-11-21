@@ -76,10 +76,18 @@ type cluster struct {
 	durable bool
 	// Snapshot settings for every node (0 = raftnode's defaults).
 	snapEvery, catchUp uint64
-	nodes              map[uint64]*Node
-	sms                map[uint64]*logSM
-	dirs               map[uint64]string
-	stores             map[uint64]*raftstore.Pebble
+	// electionTicks is every node's election timeout in ticks (0 =
+	// raftnode's default).
+	electionTicks int
+	// wrapStore and wrapTransport, if set, wrap what a node is started with,
+	// so a test can hold up its Save or its Send. st is nil for a node that
+	// keeps its log in memory.
+	wrapStore     func(id uint64, st LogStore) LogStore
+	wrapTransport func(id uint64, tr Transport) Transport
+	nodes         map[uint64]*Node
+	sms           map[uint64]*logSM
+	dirs          map[uint64]string
+	stores        map[uint64]*raftstore.Pebble
 }
 
 // newCluster starts size nodes that keep their logs in memory only.
@@ -97,11 +105,18 @@ func startCluster(t *testing.T, size int, durable bool) *cluster {
 // they keep before a snapshot.
 func startClusterWith(t *testing.T, size int, durable bool, snapEvery, catchUp uint64) *cluster {
 	t.Helper()
+	return startClusterOpts(t, size, func(c *cluster) { c.durable, c.snapEvery, c.catchUp = durable, snapEvery, catchUp })
+}
+
+// startClusterOpts starts size nodes after opts has set the cluster up.
+func startClusterOpts(t *testing.T, size int, opts func(*cluster)) *cluster {
+	t.Helper()
 	c := &cluster{
-		t: t, net: NewNetwork(), durable: durable, snapEvery: snapEvery, catchUp: catchUp,
+		t: t, net: NewNetwork(),
 		nodes: map[uint64]*Node{}, sms: map[uint64]*logSM{},
 		dirs: map[uint64]string{}, stores: map[uint64]*raftstore.Pebble{},
 	}
+	opts(c)
 	for id := uint64(1); id <= uint64(size); id++ {
 		c.peers = append(c.peers, id)
 		c.dirs[id] = t.TempDir()
@@ -125,8 +140,11 @@ func (c *cluster) start(id uint64) {
 	c.t.Helper()
 	cfg := Config{
 		ID: id, Peers: c.peers, SM: &logSM{}, Transport: c.net,
-		TickInterval: 10 * time.Millisecond, Logger: quiet,
+		TickInterval: 10 * time.Millisecond, ElectionTicks: c.electionTicks, Logger: quiet,
 		SnapshotEntries: c.snapEvery, CatchUpEntries: c.catchUp,
+	}
+	if c.wrapTransport != nil {
+		cfg.Transport = c.wrapTransport(id, c.net)
 	}
 	if c.durable {
 		st, err := raftstore.Open(c.dirs[id])
@@ -135,6 +153,9 @@ func (c *cluster) start(id uint64) {
 		}
 		cfg.Store = st
 		c.stores[id] = st
+	}
+	if c.wrapStore != nil {
+		cfg.Store = c.wrapStore(id, cfg.Store)
 	}
 	n, err := Start(cfg)
 	if err != nil {

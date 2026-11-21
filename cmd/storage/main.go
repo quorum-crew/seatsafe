@@ -91,6 +91,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	pipe, err := pipelineFromEnv()
+	if err != nil {
+		return err
+	}
 	retentionMS, err := positiveIntEnv("GC_RETENTION_MS", int(shard.DefaultGCRetention/time.Millisecond))
 	if err != nil {
 		return err
@@ -102,6 +106,7 @@ func run() error {
 		ID: raftID, Peers: ids, SM: shard.Applier{SM: sm}, Transport: tr, Store: store,
 		TickInterval: timing.tick, ElectionTicks: timing.election, HeartbeatTicks: timing.heartbeat,
 		SnapshotEntries: uint64(snapEvery), CatchUpEntries: uint64(catchUp),
+		DisableLeaderSendFirst: !pipe.sendFirst, DisableEarlyApply: !pipe.earlyApply,
 	})
 	if err != nil {
 		return err
@@ -242,6 +247,36 @@ func raftTimingFromEnv() (raftTiming, error) {
 		return raftTiming{}, fmt.Errorf("RAFT_ELECTION_TICKS (%d) must be greater than RAFT_HEARTBEAT_TICKS (%d)", election, heartbeat)
 	}
 	return raftTiming{tick: time.Duration(tickMS) * time.Millisecond, election: election, heartbeat: heartbeat}, nil
+}
+
+// pipeline is which of the two Ready loop changes are on (raftnode.Config).
+type pipeline struct{ sendFirst, earlyApply bool }
+
+// pipelineFromEnv reads RAFT_LEADER_SEND_FIRST and RAFT_EARLY_APPLY, both on
+// by default. With both false the Raft loop persists, sends and applies in
+// that order for every Ready.
+func pipelineFromEnv() (pipeline, error) {
+	sendFirst, err := boolEnv("RAFT_LEADER_SEND_FIRST", true)
+	if err != nil {
+		return pipeline{}, err
+	}
+	earlyApply, err := boolEnv("RAFT_EARLY_APPLY", true)
+	if err != nil {
+		return pipeline{}, err
+	}
+	return pipeline{sendFirst: sendFirst, earlyApply: earlyApply}, nil
+}
+
+func boolEnv(key string, def bool) (bool, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("%s must be true or false, got %q", key, v)
+	}
+	return b, nil
 }
 
 func positiveIntEnv(key string, def int) (int, error) {

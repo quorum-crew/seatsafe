@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -84,6 +85,33 @@ func TestRaftTimingFromEnv(t *testing.T) {
 			t.Setenv(bad.key, bad.val)
 			if _, err := raftTimingFromEnv(); err == nil {
 				t.Fatalf("%s=%q was accepted", bad.key, bad.val)
+			}
+		})
+	}
+}
+
+func TestPipelineFromEnv(t *testing.T) {
+	got, err := pipelineFromEnv()
+	if err != nil || got != (pipeline{sendFirst: true, earlyApply: true}) {
+		t.Fatalf("defaults: %+v, %v", got, err)
+	}
+	t.Setenv("RAFT_LEADER_SEND_FIRST", "false")
+	if got, err = pipelineFromEnv(); err != nil || got != (pipeline{sendFirst: false, earlyApply: true}) {
+		t.Fatalf("send first off: %+v, %v", got, err)
+	}
+	t.Setenv("RAFT_LEADER_SEND_FIRST", "true")
+	t.Setenv("RAFT_EARLY_APPLY", "0")
+	if got, err = pipelineFromEnv(); err != nil || got != (pipeline{sendFirst: true, earlyApply: false}) {
+		t.Fatalf("early apply off: %+v, %v", got, err)
+	}
+	for _, bad := range []struct{ key, val string }{
+		{"RAFT_LEADER_SEND_FIRST", "maybe"},
+		{"RAFT_EARLY_APPLY", "on"},
+	} {
+		t.Run(bad.key+"="+bad.val, func(t *testing.T) {
+			t.Setenv(bad.key, bad.val)
+			if _, err := pipelineFromEnv(); err == nil || !strings.Contains(err.Error(), bad.key) {
+				t.Fatalf("%s=%q: %v", bad.key, bad.val, err)
 			}
 		})
 	}
